@@ -1,0 +1,168 @@
+module skiff.kernel
+
+// Tasks: a fixed table of them, each with its own stack and a priority, run by a preemptive scheduler.
+//
+// The highest-priority task that is ready runs. Tasks of equal priority take turns, one tick each: on
+// every tick the scheduler asks for a switch if another task of the running one's priority is ready.
+// A task that sleeps is not ready until the tick it asked to wake on. An idle task, at the lowest
+// priority, runs when nothing else is ready.
+//
+// The kernel never touches a register itself. A `Port`, which the arch package provides, builds a
+// task's first stack frame and performs the switch. The switch hands the running task's stack pointer
+// to `switch_context`, which saves it, chooses the next task and answers that one's stack pointer.
+
+// What the kernel needs from the processor to run tasks.
+trait Port
+    // Lay out `stack` so that the first switch to it starts `entry`, and answer the stack pointer to
+    // keep for the task.
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize
+
+    // Ask for a switch, to happen as soon as no interrupt handler is running.
+    request_switch(*self)
+
+    // Run the task whose stack pointer is `sp`. The caller's stack is never returned to.
+    start_first(*self, sp: usize) -> never
+
+    // Turn interrupts off, answering what `restore` needs to put them back as they were.
+    mask(*self) -> u32
+
+    restore(*self, state: u32)
+
+    // Wait for an interrupt; the idle task's whole body.
+    idle(*self)
+
+// How many tasks the table holds, the idle task included.
+const MAX_TASKS: usize = 8
+
+// The idle task's priority; every other task's must be higher.
+const IDLE_PRIORITY: u8 = 0
+
+enum TaskState
+    Ready
+    Sleeping
+
+struct Task
+    sp: usize           // saved while the task is not running
+    priority: u8
+    state: TaskState
+    wake: u32           // the tick a sleeping task becomes ready on
+
+// The table and the choices made over it. It holds no hardware state, so the host tests drive one
+// directly; the kernel keeps one of its own, `scheduler`.
+struct Scheduler
+    tasks: [MAX_TASKS]Task
+    count: usize
+    running: usize
+
+    // Add a task, ready to run, whose saved stack pointer is `sp`. Answers its index.
+    add(*self, sp: usize, priority: u8) -> usize
+        if self.count == MAX_TASKS then panic("skiff: the task table is full")
+        self.tasks[self.count] = Task(sp, priority, TaskState.Ready, 0)
+        self.count += 1
+        self.count - 1
+
+    // The task that should run now: the highest-priority ready one, and among several of that
+    // priority, the first after the running task in table order, so that they take turns. Answers the
+    // running task itself when nothing else qualifies, even if it is not ready; with an idle task in
+    // the table that cannot happen.
+    choose(*self) -> usize
+        var best = self.running
+        var found = false
+        for step in 1..self.count
+            val i = (self.running + step) % self.count
+            val t = self.tasks[i]
+            if t.state == TaskState.Ready && (!found || t.priority > self.tasks[best].priority)
+                best = i
+                found = true
+        best
+
+    // Start: choose the first task and answer its stack pointer.
+    first(*self) -> usize
+        self.running = self.count - 1
+        self.running = self.choose()
+        self.tasks[self.running].sp
+
+    // The switch: save the running task's stack pointer, choose the next and answer its.
+    switch(*self, sp: usize) -> usize
+        self.tasks[self.running].sp = sp
+        self.running = self.choose()
+        self.tasks[self.running].sp
+
+    // The running task sleeps from tick `now` until tick `now + ticks`.
+    sleep(*self, now: u32, ticks: u32)
+        val t = &self.tasks[self.running]
+        t.state = TaskState.Sleeping
+        t.wake = now + ticks
+
+    // Tick `now` has come: wake every task due by it, and answer whether a switch is wanted. One is
+    // when a ready task outranks the running one, when the running one is no longer ready, or when
+    // another ready task shares its priority and it is that task's turn.
+    tick(*self, now: u32) -> bool
+        for i in 0..<self.count
+            val t = &self.tasks[i]
+            if t.state == TaskState.Sleeping && i32(now - t.wake) >= 0 then t.state = TaskState.Ready
+        val running = self.tasks[self.running]
+        if running.state != TaskState.Ready then return true
+        for i in 0..<self.count
+            val t = self.tasks[i]
+            if i != self.running && t.state == TaskState.Ready && t.priority >= running.priority
+                return true
+        false
+
+// An empty table.
+empty_scheduler() -> Scheduler = Scheduler([Task(0, 0, TaskState.Ready, 0); MAX_TASKS], 0, 0)
+
+// Written as a constructor over literals, not through `empty_scheduler`, so that it is laid into the
+// image as data: a bare-metal image never runs initializers.
+private var scheduler: Scheduler = Scheduler([Task(0, 0, TaskState.Ready, 0); MAX_TASKS], 0, 0)
+
+// The port, once `run` has started the tasks; until then a tick switches nothing.
+private var port: Option[*Port] = None
+
+// Add a task that starts at `entry` on `stack`, with `priority` above `IDLE_PRIORITY`. Tasks are
+// added before `run`.
+spawn(p: *Port, stack: []u32, entry: *extern() -> never, priority: u8)
+    if priority == IDLE_PRIORITY then panic("skiff: a task's priority must be above the idle task's")
+    val _ = scheduler.add(p.new_context(stack, entry), priority)
+
+// Start the tasks, adding the idle task on `idle_stack`. Never returns. Interrupts are masked from
+// here until the first task runs, which starts with them unmasked.
+run(p: *Port, idle_stack: []u32) -> never
+    val _ = scheduler.add(p.new_context(idle_stack, &idle_task), IDLE_PRIORITY)
+    val _ = p.mask()
+    port = Some(p)
+    p.start_first(scheduler.first())
+
+private idle_task() -> never
+    loop
+        port match
+            Some(p) -> p.idle()
+            None -> ()
+
+// Called by the port's switch with the running task's stack pointer; answers the next task's.
+switch_context(sp: usize) -> usize = scheduler.switch(sp)
+
+// The running task gives up the processor to the next ready task of its priority, if there is one.
+yield_now()
+    port match
+        Some(p) ->
+            val state = p.mask()
+            p.request_switch()
+            p.restore(state)
+        None -> ()
+
+// The running task sleeps for `count` ticks.
+sleep(count: u32)
+    port match
+        Some(p) ->
+            val state = p.mask()
+            scheduler.sleep(ticks(), count)
+            p.request_switch()
+            p.restore(state)
+        None -> ()
+
+// After a tick: ask the port for a switch if the scheduler wants one.
+private[kernel] reschedule()
+    port match
+        Some(p) -> if scheduler.tick(ticks()) then p.request_switch()
+        None -> ()

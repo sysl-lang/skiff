@@ -10,6 +10,8 @@ module skiff.arch.armv7m
 //     handler for each one, a fault escalates to HardFault, and a HardFault with no vector locks the
 //     core up somewhere meaningless.
 //   - SysTick goes to `skiff_systick` (systick.sysl): the kernel's tick.
+//   - SVCall and PendSV go to `skiff_svc` and `skiff_pendsv` (context.sysl): starting the first task
+//     and switching tasks.
 //
 // **Reset** runs with no stack set up, before any sysl code, so it is assembly at the top of the file.
 // A function might save a register on the stack before its first instruction.
@@ -38,10 +40,10 @@ asm
         ".word 0"
         ".word 0"
         ".word 0"
-        ".word skiff_exception"     // SVCall
+        ".word skiff_svc"           // SVCall: starts the first task
         ".word skiff_exception"     // DebugMonitor
         ".word 0"
-        ".word skiff_exception"     // PendSV
+        ".word skiff_pendsv"        // PendSV: the task switch
         ".word skiff_systick"       // SysTick
         ".text"
     [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"

@@ -1,0 +1,41 @@
+module board
+
+import skiff.arch.armv7m
+import skiff.chip.mps2
+import skiff.kernel
+import skiff.kernel.Machine
+
+// The machine as the kernel sees it: the console is the chip's first UART, and the tick is SysTick on
+// the chip's clock.
+struct Board
+end Board
+
+impl Machine for Board
+    write(*self, bytes: []const u8) = mps2.write(bytes)
+    start_ticks(*self, hz: u32) = armv7m.systick_start(mps2.CLOCK_HZ / hz)
+    idle(*self) = armv7m.wait_for_interrupt()
+
+// Timer 0 interrupts through the NVIC within half a second (at 1 kHz it should take a millisecond).
+timer_interrupt(board: *Board)
+    mps2.timer0_start(mps2.CLOCK_HZ / 1000)
+    armv7m.enable_irq(mps2.TIMER0_IRQ)
+    val deadline = kernel.ticks() + kernel.TICK_HZ / 2
+    while mps2.timer0_fired() == 0
+        if kernel.ticks() > deadline
+            board.write("skiff: timer 0 never interrupted\n".bytes)
+            armv7m.halt(1)
+        board.idle()
+    armv7m.disable_irq(mps2.TIMER0_IRQ)
+    mps2.timer0_stop()
+    board.write("skiff: interrupt from timer 0\n".bytes)
+
+// A load from an address nothing answers: a precise BusFault, whose report names the address.
+private struct Reg
+    v: volatile u32
+
+bus_fault(board: *Board) -> never
+    board.write("skiff: provoking a bus fault\n".bytes)
+    val nowhere: *Reg = ptr_cast(0xF000_0000usize)
+    val _ = nowhere.v
+    board.write("skiff: the bus fault was not taken\n".bytes)
+    armv7m.halt(1)

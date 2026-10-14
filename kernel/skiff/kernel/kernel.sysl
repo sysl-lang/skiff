@@ -22,9 +22,10 @@ const TICK_HZ: u32 = 100
 // read-modify-write instruction is needed, which a Cortex-M0+ does not have.
 private var tick_count: Atomic[u32] = Atomic(0)
 
-// One tick, called by the machine's timer interrupt.
+// One tick, called by the machine's timer interrupt. Once tasks run, it may ask for a switch.
 tick()
     tick_count.store(tick_count.load(Ordering.Relaxed) + 1, Ordering.Release)
+    reschedule()
 
 // The ticks so far.
 ticks() -> u32 = tick_count.load(Ordering.Acquire)

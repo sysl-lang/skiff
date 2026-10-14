@@ -1,0 +1,142 @@
+module skiff.arch.armv7m
+
+import skiff.kernel
+import skiff.kernel.Port
+
+// Running tasks on an Armv7-M core: the kernel's `Port`.
+//
+// **Stacks.** Tasks run in thread mode on the process stack (PSP); exceptions run on the main stack
+// (MSP), so a task's stack holds only its own frames and its saved context. On exception entry the
+// processor pushes r0-r3, r12, lr, pc and xPSR onto the PSP, and s0-s15 and FPSCR as well when the task
+// has used the FPU. FPCCR.LSPEN, set at reset, makes that last part lazy: the space is reserved and the
+// registers are written only if the handler itself touches the FPU.
+//
+// **The switch is PendSV**, at the lowest priority, so it runs only when no other handler is active and
+// never interrupts one. It pushes the rest of the context below the processor's frame: r4-r11, the
+// EXC_RETURN value in lr, and s16-s31 when EXC_RETURN bit 4 is clear, which says the task has used the
+// FPU. It passes the PSP to `kernel.switch_context`, which answers the next task's, and unwinds that
+// task's context the same way. A task that has never used the FPU saves nothing for it.
+//
+// **The first task starts through SVC**: an exception return is the only way into thread mode on the
+// PSP with a task's xPSR and pc. The handler unwinds the task's context as PendSV would.
+//
+// **Masking is BASEPRI**, not PRIMASK: it holds off SysTick and PendSV, the handlers that touch the
+// kernel's state, and leaves faults, SVC and higher-priority interrupts alone. SVC with interrupts
+// masked by PRIMASK would escalate to HardFault.
+asm
+    [thumb]
+        ".syntax unified"
+        ".fpu fpv4-sp-d16"
+        ".text"
+        ".thumb_func"
+        ".globl skiff_pendsv"
+        "skiff_pendsv:"
+        "mrs r0, psp"
+        "isb"
+        "tst lr, #0x10"
+        "it eq"
+        "vstmdbeq r0!, {{s16-s31}}"
+        "stmdb r0!, {{r4-r11, lr}}"
+        "bl skiff_switch"
+        "ldmia r0!, {{r4-r11, lr}}"
+        "tst lr, #0x10"
+        "it eq"
+        "vldmiaeq r0!, {{s16-s31}}"
+        "msr psp, r0"
+        "isb"
+        "bx lr"
+        ".thumb_func"
+        ".globl skiff_svc"
+        "skiff_svc:"
+        "ldr r1, =_stack_top"
+        "msr msp, r1"
+        "ldmia r0!, {{r4-r11, lr}}"
+        "msr psp, r0"
+        "movs r1, #0"
+        "msr basepri, r1"
+        "isb"
+        "bx lr"
+        ".ltorg"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+
+@export("skiff_switch")
+switch_handler(sp: usize) -> usize = kernel.switch_context(sp)
+
+// The priority SysTick and PendSV run at: the lowest there is. Only the top bits a core implements are
+// kept, so 0xff reads back as its lowest level whatever that is.
+private const KERNEL_HANDLER_PRIORITY: u32 = 0xff
+
+// What `mask` raises BASEPRI to: high enough to hold off the kernel's handlers on a core with as few
+// as two priority bits, low enough to leave priority 0 (faults' level, SVC's, and the chip's urgent
+// interrupts) through.
+private const MASK_PRIORITY: u32 = 0x80
+
+// EXC_RETURN for thread mode on the PSP with no FPU state: what a new task's context says.
+private const EXC_RETURN_THREAD_PSP: u32 = 0xffff_fffd
+
+// xPSR with only the Thumb bit set, the only state a new task's frame needs.
+private const XPSR_THUMB: u32 = 1 << 24
+
+private const ICSR_PENDSVSET: u32 = 1 << 28
+
+// The core as the kernel's port.
+struct Cortex
+end Cortex
+
+impl Port for Cortex
+    // The frame a task starts from, from the top of its stack down: the eight words the processor
+    // pops on exception return (r0-r3, r12, lr, pc, xPSR), then the nine the switch pops (r4-r11 and
+    // EXC_RETURN). The top is kept 8-byte aligned, as the procedure call standard requires at a call.
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize
+        if stack.len < 32 then panic("skiff: a task stack under 32 words")
+        var top = stack.len & ~1usize
+        top -= 8
+        for i in top..<top + 6
+            stack[i] = 0
+        stack[top + 6] = u32(usize(entry)) & ~1u32      // pc, halfword aligned
+        stack[top + 7] = XPSR_THUMB
+        top -= 9
+        for i in top..<top + 8
+            stack[i] = 0
+        stack[top + 8] = EXC_RETURN_THREAD_PSP
+        usize(&stack[top])
+
+    request_switch(*self)
+        scb().icsr = ICSR_PENDSVSET
+
+    start_first(*self, sp: usize) -> never
+        scb().shpr3 = (scb().shpr3 & 0x0000_ffff) | (KERNEL_HANDLER_PRIORITY << 16) | (KERNEL_HANDLER_PRIORITY << 24)
+        asm
+            [thumb]
+                "dsb"
+                "isb"
+                "svc 0"
+                in sp : "r0"
+            [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+        loop
+            ()
+
+    // The operands name their registers because `reg` lets the compiler give `old` the register it
+    // loaded `level` into, and `mrs` would then overwrite `level` before `msr` reads it (FINDINGS 4).
+    mask(*self) -> u32
+        var old: u32 = 0
+        val level = MASK_PRIORITY
+        asm
+            [thumb]
+                "mrs {old}, basepri"
+                "msr basepri, {level}"
+                "isb"
+                out old : "r0"
+                in level : "r1"
+            [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+        old
+
+    restore(*self, state: u32)
+        asm
+            [thumb]
+                "msr basepri, {state}"
+                "isb"
+                in state : reg
+            [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+
+    idle(*self) = wait_for_interrupt()

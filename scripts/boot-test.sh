@@ -16,14 +16,22 @@ limit=${SKIFF_TIMEOUT:-10}
 scratch="$root/scratch"
 mkdir -p "$scratch"
 
-# The lines every boot must print, in this order. The run ends in a deliberate bus fault, so a boot
-# that passes stops with the fault status (armv7m.FAULT_STATUS), and its report must name the fault
-# and the address.
+# The lines every boot must print, in this order. The tasks' lines are explained in
+# boards/qemu-mps2/board/tasks.sysl. The run ends in a deliberate bus fault, so a boot that passes stops
+# with the fault status (armv7m.FAULT_STATUS), and its report must name the fault and the address.
 expected="skiff: hello
 skiff: tick 1
 skiff: tick 2
 skiff: tick 3
 skiff: interrupt from timer 0
+skiff: task A 1
+skiff: task B 1
+skiff: task A 2
+skiff: task B 2
+skiff: task A 3
+skiff: task B 3
+skiff: f32 registers survived the switches
+skiff: high priority task woke on its tick
 skiff: provoking a bus fault
 skiff: fault BusFault
 skiff: cfsr 0x00008200

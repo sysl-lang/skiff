@@ -2,7 +2,7 @@
 // the kernel that is generic over the machine is called from here as well.
 
 import skiff.kernel
-import skiff.kernel.Machine
+import skiff.kernel.{Machine, Port}
 
 struct Nothing
 end Nothing
@@ -12,9 +12,35 @@ impl Machine for Nothing
     start_ticks(*self, hz: u32) = ()
     idle(*self) = kernel.tick()
 
+// A port that switches nothing: enough to build the scheduler for every target.
+struct NoPort
+end NoPort
+
+impl Port for NoPort
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize = usize(&stack[0])
+    request_switch(*self) = ()
+    start_first(*self, sp: usize) -> never
+        loop
+            ()
+    mask(*self) -> u32 = 0
+    restore(*self, state: u32) = ()
+    idle(*self) = ()
+
+private task() -> never
+    kernel.yield_now()
+    kernel.sleep(1)
+    loop
+        ()
+
 @export("main")
 probe() -> i32
     var m = Nothing()
     kernel.write_dec(&m, 1)
     kernel.write_hex(&m, 1)
-    kernel.boot(&m)
+    val status = kernel.boot(&m)
+    if status != 0 then return status
+    var p = NoPort()
+    var stack: [32]u32 = [0; 32]
+    var idle: [32]u32 = [0; 32]
+    kernel.spawn(&p, stack, &task, 1)
+    kernel.run(&p, idle)

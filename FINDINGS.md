@@ -54,3 +54,100 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
   `__umoddi3`, `__moddi3`. The same treatment applies to the soft-double routines, so an `f64` program
   links on a Cortex-M.
 - **What skiff would otherwise do:** link Arm GNU's `libgcc.a`, or write the helpers itself.
+- **Status:** accepted by `sysl` for the release after alpha.12. Until it ships, the qemu-mps2 board
+  links Arm GNU's `libgcc.a` (`@link("gcc")`, with `-L` from `scripts/boot-test.sh`).
+
+## 3. A bare-metal program's file can hold no module storage
+
+- **What was being written:** milestone 2's board, whose tasks need storage of their own: their
+  stacks and the counters two tasks meet on.
+- **Shortest input:** a program of one headerless file that runs no statements. Its entry is an
+  exported function, as a bare-metal image's is.
+
+  ```sysl
+  private var kept: [2]u32 = [0, 0]
+
+  private bump() -> u32 = kept[0]
+
+  @export("main")
+  probe() -> i32 = i32(bump())
+  ```
+
+  ```
+  error: 'bump' is declared inside a function body, so nothing outside can name it and there is
+  nothing for a visibility modifier to restrict
+  ```
+
+  So the file is treated as a body, its `var` as a local and `bump` as a nested function. But writing
+  `private static var kept` to make the storage the module's is refused for the opposite reason:
+
+  ```
+  error: 'static' says a declaration belongs to the module rather than to the body of the file the
+  program starts in — and this file has no such body, so everything it declares is the module's already
+  ```
+
+  Neither spelling compiles, and a `module` header is refused because the file sits at the project
+  root.
+- **What the reference says:** `reference/modules.md` says both things.
+  - Line 1420: "a headerless file carrying no statements, everything is the module's already and the
+    modifier is refused".
+  - Lines 1459-1460: "a single headerless file of bindings is still a body".
+
+  The two checks implement one sentence each. A build whose entry is not `main` (`targets.*.entry`)
+  never runs a body, so its storage can only be the module's, as for `build-c` and `build-lib` (line
+  1467).
+- **Proposed fix:** one ruling for the file, used by both checks. Where the build's entry is not
+  `main`, or the file runs no statement, the file is not a body: `var` is the module's and `static` is
+  refused, as the `static` diagnostic already says. The first error's anchor is also wrong: it names
+  `bump` but points at the `var`, which in the board was 12 lines away.
+- **What skiff did:** the board's code that needs storage moved into its own module directory
+  (`boards/qemu-mps2/board/`), where `var` is plainly the module's. That layout stands on its own, so
+  nothing changes when this is fixed.
+
+## 4. An `asm` output may be given the register an input is in
+
+- **What was being written:** milestone 2's interrupt mask, which reads BASEPRI and then writes it.
+
+  ```sysl
+  mask(*self) -> u32
+      var old: u32 = 0
+      val level = MASK_PRIORITY
+      asm
+          [thumb]
+              "mrs {old}, basepri"
+              "msr basepri, {level}"
+              out old : reg
+              in level : reg
+  ```
+
+  compiles to `movs r0, #128; mrs r0, BASEPRI; msr BASEPRI, r0`. The read overwrote `level`, so the
+  mask wrote back what was there and masked nothing. The boot test still passed. It was found only
+  because a control that should have failed did not.
+- **Shortest input**, on the host (aarch64):
+
+  ```sysl
+  seven_plus(level: int) -> int
+      var old: int = 0
+      asm
+          [aarch64]
+              "mov {old}, #7"
+              "add {old}, {old}, {level}"
+              in level : reg
+              out old : reg
+          [x86_64, riscv64, riscv32, thumb, craft, wasm32] unavailable "aarch64 only"
+      old
+
+  print(seven_plus(1))
+  ```
+
+  It prints `14`; it should print `8`.
+- **What the reference says:** `reference/inline-assembly.md` § What the compiler owns: "The
+  constraint string, which you never write, because a constraint that disagrees with the instruction
+  text is not detectable by reading either one." The compiler writes `=r` for an output. LLVM reads
+  that as "written only after every input is read", so it may share a register with one. Nothing
+  in sysl can say otherwise, and nothing in the text says the output is written last.
+- **Proposed fix:** emit every output as early-clobber (`=&r`). It is the conservative direction the
+  page already takes for memory and the flags, and it costs at most a register per output. A test
+  pins `seven_plus(1) == 8`.
+- **What skiff does until then:** `mask` names its registers (`out old : "r0"`, `in level : "r1"`), with
+  a comment pointing here. Remove that once the fix ships.

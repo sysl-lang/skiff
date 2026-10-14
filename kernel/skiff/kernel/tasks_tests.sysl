@@ -1,0 +1,70 @@
+module skiff.kernel
+@tests
+
+// The scheduler's choices, on the host. Each test builds its own table; a task's "stack pointer" is a
+// number naming it, so a switch can be read off what `switch` answers.
+
+// A table holding an idle task (index 0, sp 100) and then a task per entry of `priorities`, the n-th
+// with sp 101, 102, …
+private table(priorities: []const u8) -> Scheduler
+    var s = empty_scheduler()
+    val _ = s.add(100, IDLE_PRIORITY)
+    for p in priorities
+        val _ = s.add(100 + s.count, p)
+    s
+
+@test("the highest-priority task runs first, whatever its place in the table")
+first_is_highest()
+    var s = table([1, 3, 2])
+    assert_eq(s.first(), 102)
+
+@test("tasks of equal priority take turns on each tick, and the idle task never gets one")
+equal_priorities_take_turns()
+    var s = table([1, 1])
+    assert_eq(s.first(), 101)
+    assert(s.tick(1), "a tick with another task of the same priority ready asks for a switch")
+    assert_eq(s.switch(101), 102)
+    assert(s.tick(2), "and the next tick asks again")
+    assert_eq(s.switch(102), 101)
+
+@test("a task alone at the top priority keeps the processor across ticks")
+alone_keeps_running()
+    var s = table([1, 2])
+    assert_eq(s.first(), 102)
+    assert(!s.tick(1), "no switch with nothing of equal or higher priority ready")
+
+@test("a sleeping task gives way, the idle task runs when nothing else can, and it wakes on its tick")
+sleep_and_wake()
+    var s = table([1])
+    assert_eq(s.first(), 101)
+    s.sleep(10, 5)
+    assert_eq(s.switch(101), 100)
+    assert(!s.tick(14), "not due before tick 15")
+    assert(s.tick(15), "due on tick 15, and it outranks the idle task")
+    assert_eq(s.switch(100), 101)
+
+@test("a woken high-priority task preempts a lower one that never yields")
+woken_preempts()
+    var s = table([1, 3])
+    assert_eq(s.first(), 102)
+    s.sleep(0, 2)
+    assert_eq(s.switch(102), 101)
+    assert(!s.tick(1), "the low task runs alone")
+    assert(s.tick(2), "the high task is due")
+    assert_eq(s.switch(101), 102)
+
+@test("waking compares ticks modulo 2^32, so a wake time past the counter's wrap still comes")
+wake_across_wrap()
+    var s = table([1])
+    assert_eq(s.first(), 101)
+    s.sleep(0xffff_fffe, 4)
+    assert_eq(s.switch(101), 100)
+    assert(!s.tick(0xffff_ffff), "not due yet")
+    assert(!s.tick(1), "nor one tick before")
+    assert(s.tick(2), "due on tick 2, after the wrap")
+
+@test("a full table refuses another task", should_trap: "skiff: the task table is full")
+full_table()
+    var s = table([1, 1, 1, 1, 1, 1, 1])
+    assert_eq(s.count, MAX_TASKS)
+    val _ = s.add(108, 1)

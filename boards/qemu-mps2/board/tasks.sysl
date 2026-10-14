@@ -1,0 +1,127 @@
+module board
+
+import sysl.sync.Atomic
+import skiff.arch.armv7m
+import skiff.kernel
+import skiff.kernel.Machine
+
+// The tasks the boot test runs, and what each shows.
+//   - A and B share priority 1 and never yield: each prints a line and then waits for the next tick.
+//     They alternate only because the tick takes turns between them. After three lines each, A
+//     sleeps for good and B spins for good, never giving up the processor of its own accord.
+//   - P1 and P2, at priority 2, sleep for 15 ticks and then preempt B. Each fills s16-s31 with its own
+//     values and switches to the other, which does the same, before checking its own are intact. So
+//     the switch must save the FPU registers a task uses.
+//   - H, at priority 3, sleeps for 30 ticks, must be running on the very tick it is due although B
+//     never yields, and then provokes the bus fault that ends the run, from a task's stack.
+
+private var cortex: armv7m.Cortex = armv7m.Cortex()
+
+private var stack_a: [256]u32 = [0; 256]
+private var stack_b: [256]u32 = [0; 256]
+private var stack_p1: [256]u32 = [0; 256]
+private var stack_p2: [256]u32 = [0; 256]
+private var stack_h: [256]u32 = [0; 256]
+private var stack_idle: [128]u32 = [0; 128]
+
+// Spawn the tasks and run them; the run ends in H's bus fault.
+run_tasks() -> never
+    kernel.spawn(&cortex, stack_a, &task_a, 1)
+    kernel.spawn(&cortex, stack_b, &task_b, 1)
+    kernel.spawn(&cortex, stack_p1, &task_p1, 2)
+    kernel.spawn(&cortex, stack_p2, &task_p2, 2)
+    kernel.spawn(&cortex, stack_h, &task_h, 3)
+    kernel.run(&cortex, stack_idle)
+
+private task_a() -> never = take_turns("skiff: task A ", false)
+private task_b() -> never = take_turns("skiff: task B ", true)
+
+// Three lines, each followed by a wait for the next tick, then sleep or spin for good.
+private take_turns(label: string, spin: bool) -> never
+    var board = Board()
+    for n in 1u32..3
+        board.write(label.bytes)
+        kernel.write_dec(&board, n)
+        board.write("\n".bytes)
+        val t = kernel.ticks()
+        while kernel.ticks() == t
+            ()
+    loop
+        if !spin then kernel.sleep(1_000_000)
+
+// FPU registers through switches: `skiff_fp_probe` (below) writes `base`, `base + 1`, … into s16-s31,
+// calls `skiff_fp_meet`, and answers how many of the sixteen still hold their value.
+extern "skiff_fp_probe" fp_probe(base: u32) -> u32
+
+private var arrived: Atomic[u32] = Atomic(0)
+private var finished: Atomic[u32] = Atomic(0)
+private var kept: Atomic[u32] = Atomic(0)
+
+// Both tasks meet here with their registers filled. Each yields at least once, and the first to
+// arrive keeps yielding until the second has, so each is switched out while the other's values are
+// in the registers.
+@export("skiff_fp_meet")
+fp_meet()
+    val _ = arrived.add(1)
+    kernel.yield_now()
+    while arrived.load() < 2
+        kernel.yield_now()
+
+private task_p1() -> never = fp_task(0x1000)
+private task_p2() -> never = fp_task(0x2000)
+
+// The second task to finish reports for both.
+private fp_task(base: u32) -> never
+    kernel.sleep(15)
+    val _ = kept.add(fp_probe(base))
+    if finished.add(1) == 1
+        var board = Board()
+        if kept.load() == 32
+            board.write("skiff: f32 registers survived the switches\n".bytes)
+        else
+            board.write("skiff: f32 registers kept: ".bytes)
+            kernel.write_dec(&board, kept.load())
+            board.write(" of 32\n".bytes)
+    loop
+        kernel.sleep(1_000_000)
+
+private task_h() -> never
+    var board = Board()
+    val due = kernel.ticks() + 30
+    kernel.sleep(30)
+    if kernel.ticks() == due
+        board.write("skiff: high priority task woke on its tick\n".bytes)
+    else
+        board.write("skiff: high priority task woke on tick +".bytes)
+        kernel.write_dec(&board, kernel.ticks() - due + 30)
+        board.write("\n".bytes)
+    bus_fault(&board)
+
+// s16-s31 are callee-saved, so the probe saves the caller's values and puts them back at the end.
+asm
+    [thumb]
+        ".syntax unified"
+        ".fpu fpv4-sp-d16"
+        ".text"
+        ".thumb_func"
+        ".globl skiff_fp_probe"
+        "skiff_fp_probe:"
+        "push {{r4, lr}}"
+        "vpush {{s16-s31}}"
+        "mov r4, r0"
+        ".irp n, 16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31"
+        "vmov s\\n, r0"
+        "adds r0, #1"
+        ".endr"
+        "bl skiff_fp_meet"
+        "movs r0, #0"
+        ".irp n, 16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31"
+        "vmov r1, s\\n"
+        "cmp r1, r4"
+        "it eq"
+        "addeq r0, #1"
+        "adds r4, #1"
+        ".endr"
+        "vpop {{s16-s31}}"
+        "pop {{r4, pc}}"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the probe is Armv7-M assembly"
