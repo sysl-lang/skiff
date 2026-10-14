@@ -1,7 +1,7 @@
 # skiff — roadmap
 
 skiff is a small real-time operating system for microcontrollers without an MMU, written in sysl. Its
-first machine is the STM32H747, two cores in one chip: a Cortex-M7 at 480 MHz and a Cortex-M4 at
+kernel is portable; its first machine is the STM32H747, two cores in one chip: a Cortex-M7 at 480 MHz and a Cortex-M4 at
 240 MHz. keel is its larger sibling: a Unix-like kernel for aarch64 with processes and address spaces.
 skiff is the other kind of system, built for a microcontroller: tasks compiled into one image, static
 memory, deterministic latency.
@@ -38,15 +38,45 @@ The H747's cores are **asymmetric**, so there is no shared run queue.
   address set by option bytes.
 - **Their memory views disagree:** the M7's data cache does not see what the M4 writes.
 
-So skiff is **one kernel built twice**, and the two images talk by message passing:
+So skiff is **one kernel built twice**, and the two images talk by message passing.
+
+## Layers: the kernel knows no chip (decided 2026-10-13)
+
+The STM32H747 is the first machine, not the design. skiff is three layers of packages, and a
+dependency only ever points down the list:
 
 ```
 skiff/
-  kernel/   the shared kernel package: tasks, timers, synchronisation, IPC, the board traits
-  m7/       program: the M7's main, link script (flash bank 1, 0x0800_0000), its drivers
-  m4/       program: the M4's main, link script (flash bank 2, 0x0810_0000), its drivers
-  boards/   one module per machine: memory map, clocks, console, the IPC hardware
+  kernel/          the portable kernel: the scheduler, tasks, timers, synchronisation, IPC rings, pools,
+                   and the traits below. Knows no architecture, chip or board.
+  arch/armv7m/     one package per CPU family: context switch (PendSV), SysTick, the NVIC, fault decoding,
+  arch/armv8m/     the MPU, the FPU context, atomics. armv6m (M0+) and riscv32 later, as boards need them.
+  chips/stm32h747/ one package per chip: clocks, the interrupt numbers, the memory map, the IPC hardware
+  chips/mps2/      (HSEM / MHU), drivers for its peripherals. Built on the generated register packages.
+  boards/h747i-disco/  one program per board and core: pins, the codec, the link script, main
+  boards/qemu-an500/ …
 ```
+
+- **The kernel is written against traits**, and an arch or chip package implements them:
+  - `Port`: switch context, start the first task, mask interrupts, an atomic compare-and-swap, sleep
+    until an interrupt;
+  - `Clock`: a monotonic time and one-shot wake-up;
+  - `Protection`: an MPU's regions, or nothing;
+  - `Doorbell` + `HardwareLock`: the other core.
+  The kernel never names a register, an IRQ number or an address.
+- **Drivers are not in the kernel either.** They are written against the traits other packages use
+  (a block device for KFS and FAT, a serial stream, an audio stream). Chip packages implement them.
+- **The rule is checked, not trusted.** Every gate:
+  - runs `sysl test kernel` on the host, which only works because the kernel has no hardware in it;
+  - builds the kernel package for `thumbv6m`, `thumbv7em`, `thumb-freestanding` (v8-M) and
+    `riscv32-freestanding`, including the families that have no port yet.
+
+  A chip-specific import into `kernel/` fails the gate on the first build that cannot see that chip.
+- **Bringing up a new microcontroller** means writing a chip package plus a board program, and an
+  arch package only when the CPU family is new. QEMU's mps2 machines are themselves a second "chip",
+  so the portable boundary is exercised from milestone 0, before the H747 is involved.
+- Should the layers prove useful outside skiff, `kernel/` can be split into its own repo the way KFS
+  is leaving keel.
 
 - **The M7 boots first.** It sets up clocks and shared memory, then releases the M4.
 - **IPC** uses single-producer, single-consumer rings in a shared SRAM region:
