@@ -1,0 +1,119 @@
+module skiff.board.pair
+
+import sysl.sync.Atomic
+import skiff.arch.armv7m
+import skiff.chip.an521
+import skiff.kernel
+import skiff.kernel.{FOREVER, Flags, Link, Machine, Ring, Semaphore}
+
+// Two cores, each running its own copy of the kernel, linked through memory both reach.
+//
+// **Memory.** Core 0's image is at 0x1000_0000 and core 1's at 0x1020_0000, both in SSRAM1, each with
+// its own data and stack. The links are at 0x3000_0000, in the SSE-200's internal SRAM, which neither
+// image's link script hands out: a ring each way, laid out by the kernel's `Ring`.
+//
+// **Start-up.** Core 0 starts alone. It empties both rings, then releases core 1, which starts at its
+// own vector table. Each core prints on a UART of its own, so their lines never interleave.
+//
+// **The boot test.** On each core a sender task sends 1 to `COUNT` to the other core as fast as the
+// ring allows, while a receiver task takes the other core's messages and checks every one arrives once
+// and in order. Each receiver reports on its own console. Core 1's sender then sends `DONE`, and core 0,
+// once its own receiver has finished too, stops the machine.
+
+// The machine as each core's kernel sees it: its own UART, SysTick on the shared clock.
+struct Board
+end Board
+
+impl Machine for Board
+    write(*self, bytes: []const u8) = an521.write(an521.core_id(), bytes)
+    start_ticks(*self, hz: u32) = armv7m.systick_start(an521.CLOCK_HZ / hz)
+    idle(*self) = armv7m.wait_for_interrupt()
+
+// Where core 1's image, and so its vector table, starts.
+const CORE1_IMAGE: usize = 0x1020_0000
+
+// The rings between the cores, in memory both reach.
+struct Shared
+    to_core1: Ring[u32, 64]
+    to_core0: Ring[u32, 64]
+
+private const SHARED: usize = 0x3000_0000
+private shared() -> *Shared = ptr_cast(SHARED)
+
+// How many messages each core sends the other, and the message that follows them from core 1.
+const COUNT: u32 = 10000
+const DONE: u32 = 0
+
+// Empty both rings: core 0, before it releases core 1.
+reset_links()
+    shared().to_core1.reset()
+    shared().to_core0.reset()
+
+private var bell: an521.Bell = an521.Bell(0)
+// This core's end of the link. Which ring is which depends on the core, so `open_link` builds it.
+private var link: Link[u32, 64]
+
+// Build this core's end of the link the right way round, and let the doorbell interrupt in.
+open_link()
+    val me = an521.core_id()
+    bell.to = 1 - me
+    val s = shared()
+    link = if me == 0 then Link(&s.to_core1, &s.to_core0, &bell, Flags(0)) else Link(&s.to_core0, &s.to_core1, &bell, Flags(0))
+    armv7m.set_irq_priority(an521.MHU0_IRQ, 0xc0)
+    armv7m.enable_irq(an521.MHU0_IRQ)
+
+@export("skiff_an521_doorbell")
+doorbell() = link.rung()
+
+private var cortex: armv7m.Cortex = armv7m.Cortex()
+private var stack_sender: [512]u32 = [0; 512]
+private var stack_receiver: [512]u32 = [0; 512]
+private var stack_idle: [128]u32 = [0; 128]
+private var received: Semaphore = Semaphore(0, 1)
+
+// Run this core's sender and receiver.
+run_link_test() -> never
+    kernel.spawn(&cortex, stack_sender, &sender, 1, "sender")
+    kernel.spawn(&cortex, stack_receiver, &receiver, 1, "receiver")
+    kernel.run(&cortex, stack_idle)
+
+private sender() -> never
+    for n in 1u32..COUNT
+        val _ = link.send(n, FOREVER)
+    if an521.core_id() == 1
+        val _ = received.take(FOREVER)
+        val _ = link.send(DONE, FOREVER)
+    kernel.sleep_forever()
+
+// The next message, asking again until there is one without ever waiting.
+private poll() -> Option[u32]
+    loop
+        val got = link.receive(0)
+        if got.is_some() then return got
+
+private receiver() -> never
+    var board = Board()
+    val me = an521.core_id()
+    var in_order: u32 = 0
+    for want in 1u32..COUNT
+        // The first half polls, so that the receiver sits right behind the sender and reads each slot
+        // as soon as `tail` says it is there; the second half waits on the doorbell.
+        val got = if want <= COUNT / 2 then poll() else link.receive(FOREVER)
+        got match
+            Some(n) -> if n == want then in_order += 1
+            None -> ()
+    board.write("skiff: core ".bytes)
+    kernel.write_dec(&board, me)
+    board.write(" received ".bytes)
+    kernel.write_dec(&board, in_order)
+    board.write(" of ".bytes)
+    kernel.write_dec(&board, COUNT)
+    board.write(" messages in order\n".bytes)
+    val _ = received.give()
+    if me == 0
+        if link.receive(FOREVER) == Some(DONE)
+            board.write("skiff: core 1 finished\n".bytes)
+            armv7m.halt(0)
+        board.write("skiff: core 1 sent more than it should\n".bytes)
+        armv7m.halt(1)
+    kernel.sleep_forever()

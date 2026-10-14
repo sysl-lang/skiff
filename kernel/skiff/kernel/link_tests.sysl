@@ -1,0 +1,115 @@
+module skiff.kernel
+@tests
+
+import sysl.sync.Atomic
+
+// Rings and links on the host, with one side played by the test. Two cores at once are the board's.
+
+private empty_ring() -> Ring[u32, 4]
+    var r: Ring[u32, 4] = Ring(Atomic(0), Atomic(0), [0; 4])
+    r.reset()
+    r
+
+@test("a ring keeps order, refuses when full and answers None when empty")
+ring_order()
+    var r = empty_ring()
+    assert(r.pop().is_none(), "empty")
+    for n in 1u32..4
+        assert(r.push(n) != None, "room")
+    assert(r.push(5) == None, "full")
+    assert_eq(r.waiting(), 4)
+    for n in 1u32..4
+        r.pop() match
+            Some(p) -> assert_eq(p.item, n)
+            None -> assert(false, "a message")
+    assert(r.pop().is_none(), "empty again")
+
+@test("a ring's indices wrap at 2^32 without losing a message")
+ring_wraps()
+    var r = empty_ring()
+    r.head.store(0xffff_fffe)
+    r.tail.store(0xffff_fffe)
+    for n in 1u32..4
+        assert(r.push(n) != None, "room across the wrap")
+    assert(r.push(9) == None, "full across the wrap")
+    assert_eq(r.tail.load(), 2)
+    for n in 1u32..4
+        r.pop() match
+            Some(p) -> assert_eq(p.item, n)
+            None -> assert(false, "a message across the wrap")
+
+@test("a push asks for the bell only when the consumer had taken everything before it")
+ring_push_wakes()
+    var r = empty_ring()
+    assert(r.push(1) == Some(true), "the first message to an empty ring")
+    assert(r.push(2) == Some(false), "a second while the first waits")
+    val _ = r.pop()
+    assert(r.push(3) == Some(false), "the consumer has not taken message 2")
+    val _ = r.pop()
+    val _ = r.pop()
+    assert(r.push(4) == Some(true), "the consumer has taken everything")
+
+@test("a pop asks for the bell only when it makes room in a full ring")
+ring_pop_wakes()
+    var r = empty_ring()
+    for n in 1u32..4
+        val _ = r.push(n)
+    r.pop() match
+        Some(p) -> assert(p.ring, "the ring was full")
+        None -> assert(false, "a message")
+    r.pop() match
+        Some(p) -> assert(!p.ring, "there was room already")
+        None -> assert(false, "a message")
+
+// A doorbell that counts its rings.
+struct Counter
+    rings: u32
+
+impl Doorbell for Counter
+    ring(*self) = self.rings += 1
+
+@test("a link sends and receives through its rings, ringing only when the other side may wait")
+link_rings()
+    setup_one_task()
+    var out = empty_ring()
+    var inbox = empty_ring()
+    var bell = Counter(0)
+    var link: Link[u32, 4] = Link(&out, &inbox, &bell, Flags(0))
+    assert(link.send(7, 0), "sent")
+    assert(link.send(8, 0), "sent")
+    assert_eq(bell.rings, 1)
+    assert_eq(out.waiting(), 2)
+    assert(link.receive(0) == None, "nothing from the other side")
+    for n in 1u32..4
+        val _ = inbox.push(n)
+    assert(link.receive(0) == Some(1), "the oldest")
+    assert_eq(bell.rings, 2)
+    assert(link.receive(0) == Some(2), "the next")
+    assert_eq(bell.rings, 2)
+
+@test("a link refuses at once when its ring is full and there is no wait")
+link_full()
+    setup_one_task()
+    var out = empty_ring()
+    var inbox = empty_ring()
+    var bell = Counter(0)
+    var link: Link[u32, 4] = Link(&out, &inbox, &bell, Flags(0))
+    for n in 1u32..4
+        assert(link.send(n, 0), "room")
+    assert(!link.send(5, 0), "full")
+
+@test("a doorbell sets both of a link's flags")
+link_rung()
+    setup_one_task()
+    var out = empty_ring()
+    var inbox = empty_ring()
+    var bell = Counter(0)
+    var link: Link[u32, 4] = Link(&out, &inbox, &bell, Flags(0))
+    link.rung()
+    assert_eq(link.events.bits, 0b11)
+
+// The kernel's table with one task, running.
+private setup_one_task()
+    scheduler = empty_scheduler()
+    val _ = scheduler.add(0, 1)
+    scheduler.running = 0

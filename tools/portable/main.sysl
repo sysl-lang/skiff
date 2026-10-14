@@ -2,7 +2,8 @@
 // the kernel that is generic over the machine is called from here as well.
 
 import skiff.kernel
-import skiff.kernel.{Flags, Heap, Machine, Mutex, NO_OWNER, Pool, Port, Protection, Queue, Semaphore}
+import sysl.sync.Atomic
+import skiff.kernel.{Doorbell, Flags, Heap, Link, Machine, Mutex, NO_OWNER, Pool, Port, Protection, Queue, Ring, Semaphore}
 
 struct Nothing
 end Nothing
@@ -36,6 +37,18 @@ impl Protection for NoGuard
 struct Block
     a: u32
 
+// A doorbell to nobody.
+struct NoBell
+end NoBell
+
+impl Doorbell for NoBell
+    ring(*self) = ()
+
+private var ring_out: Ring[u32, 4] = Ring(Atomic(0), Atomic(0), [0; 4])
+private var ring_in: Ring[u32, 4] = Ring(Atomic(0), Atomic(0), [0; 4])
+private var bell: NoBell = NoBell()
+private var link: Link[u32, 4]
+
 private var pool: Pool[Block, 2] = Pool([Block(0); 2], [false; 2], 2)
 private var heap: Heap = Heap(0, 0)
 private var arena: [64]u8 = [0; 64]
@@ -64,6 +77,10 @@ private task() -> never
         Some(b) -> heap.release(b)
         None -> ()
     val _ = pool.available() + heap.largest()
+    val _ = link.send(1, 1)
+    val _ = link.receive(1)
+    link.rung()
+    val _ = ring_out.waiting()
     if kernel.stopped(kernel.running_task().index) then kernel.stop_running()
     kernel.sleep_forever()
 
@@ -79,6 +96,9 @@ probe() -> i32
     var idle: [32]u32 = [0; 32]
     var g = NoGuard()
     heap.init(arena)
+    ring_out.reset()
+    ring_in.reset()
+    link = Link(&ring_out, &ring_in, &bell, Flags(0))
     kernel.spawn(&p, stack, &task, 1, "task")
     kernel.protect(&g)
     kernel.run(&p, idle)

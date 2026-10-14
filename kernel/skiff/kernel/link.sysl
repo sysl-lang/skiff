@@ -1,0 +1,113 @@
+module skiff.kernel
+
+import sysl.sync.Atomic
+
+// Links between cores: messages through memory both cores can reach, and a doorbell interrupt that tells
+// the other core to look.
+//
+// **A `Ring` carries messages one way**, from one producer to one consumer. Each side writes only its
+// own index — the producer `tail`, the consumer `head` — and reads the other's, so no lock is needed.
+// The indices run freely and wrap at 2^32, which is why `N` must be a power of two. Every access to
+// them is sequentially consistent, which also orders the slot written before `tail` moves and the slot
+// read before `head` moves.
+//
+// **The doorbell is rung only when the other side may be waiting.** A consumer waits only after finding
+// the ring empty, so a producer that has just added a message rings if, once the message is published,
+// the consumer had taken everything before it. Had the consumer not, it is still running: it reads
+// `tail` again after taking the earlier message, and sees the new one. The same holds the other way for
+// a producer waiting on a full ring. Both depend on the index written being ordered before the index
+// read on each side, which sequential consistency gives.
+//
+// **A `Link` is one core's end**: the ring it sends on, the ring it receives on, and the doorbell to
+// the other core. The board's doorbell interrupt calls `rung`, which wakes whatever on this core waits
+// on the link. Both rings live in memory both cores see, at an address both boards agree on; the
+// layout is this file's, so both images, built from the same source, agree on it too.
+
+// What the kernel needs to tell another core to look at a link.
+trait Doorbell
+    ring(*self)
+
+struct Ring[T, const N: usize]
+    head: Atomic[u32]   // the next slot to read; written by the consumer only
+    tail: Atomic[u32]   // the next slot to write; written by the producer only
+    slots: [N]T
+
+    // Empty the ring. Only while neither side uses it: before the other core starts.
+    reset(*self)
+        @assert((N & (N - 1)) == 0 && N > 0, "a ring's length is a power of two")
+        self.head.store(0)
+        self.tail.store(0)
+
+    // Add `item`, as the producer. Answers `None` if the ring is full, or whether the consumer may be
+    // waiting for it and should be rung.
+    push(*self, item: T) -> Option[bool]
+        val t = self.tail.load()
+        if t - self.head.load() == u32(N) then return None
+        self.slots[usize(t % u32(N))] = item
+        self.tail.store(t + 1)
+        Some(self.head.load() == t)
+
+    // Take the oldest message, as the consumer, or `None` if there is none. `rung` says whether the
+    // producer may be waiting for the space and should be rung.
+    pop(*self) -> Option[Popped[T]]
+        val h = self.head.load()
+        if h == self.tail.load() then return None
+        val item = self.slots[usize(h % u32(N))]
+        self.head.store(h + 1)
+        Some(Popped(item, self.tail.load() == h + u32(N)))
+
+    // How many messages are waiting.
+    waiting(*self) -> u32 = self.tail.load() - self.head.load()
+
+// A message taken from a ring, and whether the producer should be rung.
+struct Popped[T]
+    item: T
+    ring: bool
+
+// The bits a link's flags carry: a message has arrived, or space has appeared, since a waiter last
+// looked. Either may be stale; a waiter looks again.
+private const ARRIVED: u32 = 1 << 0
+private const SPACE: u32 = 1 << 1
+
+// One core's end of a link.
+struct Link[T, const N: usize]
+    out: *Ring[T, N]
+    inbox: *Ring[T, N]
+    bell: *Doorbell
+    events: Flags
+
+    // Send `item`, waiting up to `timeout` ticks while the ring is full. Answers whether it was sent.
+    send(*self, item: T, timeout: u32) -> bool
+        val deadline = ticks() + timeout
+        loop
+            self.out.push(item) match
+                Some(wake) ->
+                    if wake then self.bell.ring()
+                    return true
+                None -> ()
+            val left = remaining(deadline, timeout)
+            if left == 0 then return false
+            val _ = self.events.wait(SPACE, false, left)
+
+    // The oldest message from the other core, waiting up to `timeout` ticks for one.
+    receive(*self, timeout: u32) -> Option[T]
+        val deadline = ticks() + timeout
+        loop
+            self.inbox.pop() match
+                Some(p) ->
+                    if p.ring then self.bell.ring()
+                    return Some(p.item)
+                None -> ()
+            val left = remaining(deadline, timeout)
+            if left == 0 then return None
+            val _ = self.events.wait(ARRIVED, false, left)
+
+    // The other core rang: from this core's doorbell interrupt.
+    rung(*self) = self.events.set(ARRIVED | SPACE)
+
+// What is left of a wait of `timeout` ticks that ends at `deadline`: `FOREVER` stays so, and 0 means the
+// time is up.
+private remaining(deadline: u32, timeout: u32) -> u32
+    if timeout == FOREVER then return FOREVER
+    val left = i32(deadline - ticks())
+    if left > 0 then u32(left) else 0

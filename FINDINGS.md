@@ -198,3 +198,51 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
   module `val` whose own initializer folds, with a check against a `val` that names itself.
 - **What skiff does until then:** the kernel's `scheduler` writes the empty row out in full instead of
   naming `NO_TASK`, with a comment pointing here. Remove that once the fix ships.
+
+## 6. A trait object made from module storage's address, and `Some` of an address, are not constant data
+
+- **What was being written:** milestone 5's link between the AN521's cores. A core's end, a
+  `Link[u32, 64]`, names its doorbell as a `*Doorbell`, and the first draft declared it whole as module
+  storage: `Link(null, null, &bell, Flags(0))`.
+- **The shortest input**, built for `thumbv7em-freestanding` with entry `_start` from a program that
+  calls `fold.read()`:
+
+  ```sysl
+  module lib.fold
+
+  trait Ring
+      ring(*self) -> u32
+
+  struct Bell
+      to: u32
+
+  impl Ring for Bell
+      ring(*self) -> u32 = self.to
+
+  private var bell: Bell = Bell(1)
+  private var target: u32 = 7
+
+  private var null_pointer: *u32 = null               // folds
+  private var address_of: *u32 = &target              // folds
+  private var trait_object: *Ring = &bell             // does not
+  private var some_address: Option[*u32] = Some(&target)  // does not
+
+  read() -> u32 = …                                   // reads all four
+  ```
+
+  ```
+  error: 'start' starts the image and reaches 'lib.fold.some_address', 'lib.fold.trait_object', which is
+  module storage an initializer fills before the program's own statements run. …
+  ```
+- **What the reference says:** ffi.md § "What constant data is" makes the address of module storage
+  constant data (a relocation the linker fills in) and a variant carrying nothing constant data. It is
+  silent on a trait object built from such an address and on a variant carrying one. Both are made only
+  of link-time constants: an address and a vtable's address, or a tag and an address. C lays down
+  `static struct link l = { 0, 0, &bell_ops, &bell }` without a constructor.
+- **Proposed fix:** extend constant data to a `*Trait` coerced from a constant address (the address plus
+  the impl's vtable symbol), and to a variant whose payload is constant data. Tests: the probe above
+  builds for `thumbv7em-freestanding`, and both variables sit in `.data` with relocations.
+- **What skiff does:** nothing in place of it is a contortion. The link's rings differ by core, so the
+  board builds the whole `Link` at start-up anyway, into storage declared with no initializer (which
+  starts at its type's zero, modules.md). The finding stands for the next program whose wiring is known
+  at build time.

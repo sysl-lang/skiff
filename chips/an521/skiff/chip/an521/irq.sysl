@@ -1,0 +1,21 @@
+module skiff.chip.an521
+
+// The AN521's interrupts: the half of the vector table after the architecture's sixteen system words,
+// one word per interrupt. The SSE-200 numbers its own interrupts 0-31 and the board's follow; QEMU
+// models 92 in all, so the table has 96. Every interrupt skiff does not handle goes to the arch
+// package's `skiff_exception`, which reports it with its number.
+
+const IRQ_COUNT: u32 = 96
+
+asm
+    [thumb]
+        ".section .vectors.irq, \"a\""
+        ".rept 6"
+        ".word skiff_exception"
+        ".endr"
+        ".word skiff_an521_mhu0"       // 6: MHU0, the doorbell between the cores
+        ".rept 89"
+        ".word skiff_exception"
+        ".endr"
+        ".text"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.an521 is an Arm chip"

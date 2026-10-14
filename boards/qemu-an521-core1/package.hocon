@@ -1,0 +1,20 @@
+// skiff on QEMU's MPS2 AN521, core 1: core 0 releases it once the links are empty.
+
+package {
+  name    = "qemu-an521-core1"
+  version = "0.0.1"
+}
+
+dependencies {
+  kernel { workspace = true }
+  armv7m { workspace = true }
+  an521 { workspace = true }
+  qemu-an521 { workspace = true }
+}
+
+targets {
+  thumb-freestanding {
+    linker_script = "link.ld"
+    entry         = "_start"
+  }
+}

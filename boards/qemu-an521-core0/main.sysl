@@ -1,0 +1,45 @@
+// skiff on QEMU's MPS2 AN521, core 0: the kernel over the armv7m arch package and the an521 chip. It
+// boots, empties the links, releases core 1 and runs the link test (skiff.board.pair), which stops the
+// machine once both cores have received everything.
+
+// Arm GNU's libgcc supplies the 64-bit divide the standard library's number formatting calls, until the
+// library supplies it itself (FINDINGS 2).
+@link("gcc")
+
+import skiff.arch.armv7m
+import skiff.chip.an521
+import skiff.kernel
+import skiff.board.pair
+import skiff.board.pair.Board
+
+@export("skiff_main")
+skiff_main() -> never
+    armv7m.init()
+    an521.console_init(0)
+    var b = Board()
+    val status = kernel.boot(&b)
+    if status != 0 then armv7m.halt(status)
+    pair.reset_links()
+    pair.open_link()
+    an521.release_core1(pair.CORE1_IMAGE)
+    pair.run_link_test()
+
+@export("putchar")
+putchar(c: int) -> int
+    an521.put_byte(0, u8(c & 0xff))
+    c
+
+@export("exit")
+board_exit(code: int) -> never
+    armv7m.halt(i32(code))
+
+@export("skiff_task_fault")
+task_fault(f: *armv7m.Fault, task: *kernel.TaskInfo)
+    var b = Board()
+    armv7m.report_task_fault(f, task, &b)
+
+@export("skiff_fault")
+fault(f: *armv7m.Fault) -> never
+    var b = Board()
+    armv7m.report(f, &b)
+    armv7m.halt(armv7m.FAULT_STATUS)

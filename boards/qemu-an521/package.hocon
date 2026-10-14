@@ -1,0 +1,14 @@
+// What QEMU's MPS2 AN521 board programs share: one for each Cortex-M33 core, built from the same source
+// (qemu-an521-core0 and qemu-an521-core1). The memory both cores see, the links between them and the
+// tasks the boot test runs are here; each program adds only its own start-up.
+
+package {
+  name    = "qemu-an521"
+  version = "0.0.1"
+}
+
+dependencies {
+  kernel { workspace = true }
+  armv7m { workspace = true }
+  an521 { workspace = true }
+}

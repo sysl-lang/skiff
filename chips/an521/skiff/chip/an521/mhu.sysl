@@ -1,0 +1,54 @@
+module skiff.chip.an521
+
+import skiff.kernel.Doorbell
+
+// The SSE-200's first message handling unit (MHU0, Secure alias 0x5000_3000): a doorbell each way
+// between the two cores. Writing a core's SET register raises interrupt `MHU0_IRQ` on that core, and the
+// interrupt stays raised until that core writes its CLR register.
+//
+// The interrupt handler clears this core's doorbell and calls the board's `skiff_an521_doorbell`. It
+// learns which core it is running on from the SSE-200's CPUID register, which answers each core its
+// own number.
+
+private struct Mhu
+    cpu0_stat: volatile u32     // 0x00
+    cpu0_set: volatile u32      // 0x04
+    cpu0_clr: volatile u32      // 0x08
+    reserved: volatile u32      // 0x0c
+    cpu1_stat: volatile u32     // 0x10
+    cpu1_set: volatile u32      // 0x14
+    cpu1_clr: volatile u32      // 0x18
+
+@assert(offsetof(Mhu, cpu1_clr) == 0x18, "CPU1INTR_CLR is at 0x18")
+
+private const MHU0: usize = 0x5000_3000
+private mhu() -> *Mhu = ptr_cast(MHU0)
+
+private struct Word
+    v: volatile u32
+
+private const CPUID: usize = 0x5001_F000
+
+// The number of the core running this: 0 or 1.
+core_id() -> u32
+    val id: *Word = ptr_cast(CPUID)
+    id.v & 1
+
+// MHU0's interrupt, the same number on both cores.
+const MHU0_IRQ: u32 = 6
+
+// The doorbell to core `to`: the kernel's `Doorbell` for a link to it.
+struct Bell
+    to: u32
+
+impl Doorbell for Bell
+    ring(*self)
+        if self.to == 0 then mhu().cpu0_set = 1 else mhu().cpu1_set = 1
+
+// The board's handler for a doorbell rung at this core.
+extern "skiff_an521_doorbell" board_doorbell()
+
+@export("skiff_an521_mhu0")
+mhu0_handler()
+    if core_id() == 0 then mhu().cpu0_clr = 1 else mhu().cpu1_clr = 1
+    board_doorbell()
