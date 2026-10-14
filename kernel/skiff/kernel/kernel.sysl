@@ -1,0 +1,12 @@
+module skiff.kernel
+
+// The kernel's view of the machine under it. An arch package, a chip package and a board program
+// together implement it; the kernel itself knows nothing about the hardware beyond what this trait says.
+trait Machine
+    // Write `bytes` to the console, waiting for room as long as it takes.
+    write(*self, bytes: []const u8)
+
+// Bring the kernel up on `m` and answer the status the machine should stop with: 0 for success.
+boot[M: Machine](m: *M) -> i32
+    m.write("skiff: hello\n".bytes)
+    0

@@ -1,0 +1,20 @@
+// skiff on QEMU's MPS2 AN500 (Cortex-M7) and AN386 (Cortex-M4): one image runs on both, since the two
+// share a memory map and the M4's instruction set and FPU are a subset of the M7's.
+
+package {
+  name    = "qemu-mps2"
+  version = "0.0.1"
+}
+
+dependencies {
+  kernel { workspace = true }
+  armv7m { workspace = true }
+  mps2 { workspace = true }
+}
+
+targets {
+  thumbv7em-freestanding {
+    linker_script = "link.ld"
+    entry         = "_start"
+  }
+}

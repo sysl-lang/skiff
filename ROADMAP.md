@@ -124,7 +124,7 @@ is run by hand until a flashing-and-serial harness exists.
 
 | # | Milestone | Done when |
 |---|---|---|
-| 0 | Boot, UART, exit: vector table, reset handler, `.data`/`.bss`, the CMSDK UART | `skiff: hello` on `mps2-an500` and `mps2-an386`, QEMU exits 0 |
+| 0 | Boot, UART, exit: vector table, reset handler, `.data`/`.bss`, the CMSDK UART | `skiff: hello` on `mps2-an500` and `mps2-an386`, QEMU exits 0 ✅ |
 | 1 | Exceptions and interrupts: NVIC, SysTick, fault handlers that report CFSR/HFSR/MMFAR | `skiff: tick 3`, and a deliberate bus fault is reported, not hung on |
 | 2 | Tasks: static task table, PendSV context switch, preemptive priority scheduler, FPU context with lazy stacking | two tasks at one priority interleave on the tick; a higher-priority task preempts at once; FP registers survive a switch |
 | 3 | Synchronisation: mutex with priority inheritance, semaphores, message queues, event flags; timeouts; giving from an interrupt | a priority-inversion scenario completes in bounded time; a timed wait times out; interrupt-to-task latency measured |

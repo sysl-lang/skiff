@@ -1,0 +1,20 @@
+// skiff on QEMU's MPS2 AN500 and AN386: the kernel over the armv7m arch package and the mps2 chip.
+
+import skiff.arch.armv7m
+import skiff.chip.mps2
+import skiff.kernel
+import skiff.kernel.Machine
+
+// The machine as the kernel sees it: the console is the chip's first UART.
+struct Board
+end Board
+
+impl Machine for Board
+    write(*self, bytes: []const u8) = mps2.write(bytes)
+
+// Called by the arch package's reset handler once there is a stack and `.bss` is zero.
+@export("skiff_main")
+skiff_main() -> never
+    mps2.console_init()
+    var board = Board()
+    armv7m.halt(kernel.boot(&board))

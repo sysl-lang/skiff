@@ -1,0 +1,25 @@
+module skiff.kernel
+@tests
+
+// The kernel on the host, with a machine that only records what it was asked to do. Every boot test on a
+// board checks the same thing through a real console.
+
+// A console that keeps what was written to it.
+private struct Recorder
+    bytes: [64]u8
+    count: usize
+
+impl Machine for Recorder
+    write(*self, bytes: []const u8)
+        for b in bytes
+            self.bytes[self.count] = b
+            self.count += 1
+
+@test("boot greets through the machine's console and answers success")
+boot_greets()
+    var r = Recorder([0; 64], 0)
+    assert_eq(boot(&r), 0)
+    val want = "skiff: hello\n".bytes
+    assert_eq(r.count, want.len)
+    for i in 0..<want.len
+        assert_eq(r.bytes[i], want[i])

@@ -1,0 +1,7 @@
+// Armv7-M and Armv7E-M (Cortex-M3, M4, M7): the vector table's system half, the reset handler, fault
+// handling, and stopping the machine.
+
+package {
+  name    = "armv7m"
+  version = "0.0.1"
+}

@@ -1,0 +1,103 @@
+module skiff.arch.armv7m
+
+// Reset, the vector table, faults and stopping, for every Armv7-M core.
+//
+// **The vector table.** Its first sixteen words are the architecture's: the initial stack pointer, the
+// reset handler, then the system exceptions. The chip's interrupts follow, and they belong to the chip
+// package. Every fault is sent to `skiff_fault` for now. Without a handler for each one, a fault
+// escalates to HardFault, and a HardFault with no vector locks the core up somewhere meaningless.
+//
+// **Reset** runs with no stack set up, before any sysl code, so it is assembly at the top of the file.
+// A function might save a register on the stack before its first instruction.
+//   - It sets the stack pointer itself. QEMU enters at the ELF's entry point and does not load SP from
+//     the table.
+//   - It grants the FPU (CPACR CP10/CP11 full access) before anything can use it. A hard-float build may
+//     use VFP registers anywhere, and a Cortex-M denies them until this write. On a core with no FPU the
+//     bits ignore writes.
+//   - It zeroes `.bss`, which on a bare machine nobody else does.
+//   - It calls `skiff_main`, which the board program exports.
+//
+// `.word _start`, not `_start + 1`: the linker already sets the Thumb bit on a `.thumb_func` symbol.
+// The section is opened in the assembly with its `"a"` flag: without the flag the linker treats the
+// table as non-allocated and places `.text` over it at address zero.
+asm
+    [thumb]
+        ".section .vectors, \"a\""
+        ".word _stack_top"
+        ".word _start"
+        ".word skiff_fault"         // NMI
+        ".word skiff_fault"         // HardFault
+        ".word skiff_fault"         // MemManage
+        ".word skiff_fault"         // BusFault
+        ".word skiff_fault"         // UsageFault
+        ".word 0"
+        ".word 0"
+        ".word 0"
+        ".word 0"
+        ".word skiff_fault"         // SVCall
+        ".word skiff_fault"         // DebugMonitor
+        ".word 0"
+        ".word skiff_fault"         // PendSV
+        ".word skiff_fault"         // SysTick
+        ".text"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+
+asm
+    [thumb]
+        ".syntax unified"
+        ".text"
+        ".thumb_func"
+        ".globl _start"
+        "_start:"
+        "ldr sp, =_stack_top"
+        "ldr r0, =0xE000ED88"
+        "ldr r1, [r0]"
+        "orr r1, r1, #(0xF << 20)"
+        "str r1, [r0]"
+        "dsb"
+        "isb"
+        "ldr r0, =__bss_start"
+        "ldr r1, =__bss_end"
+        "movs r2, #0"
+        "1: cmp r0, r1"
+        "beq 2f"
+        "str r2, [r0], #4"
+        "b 1b"
+        "2: bl skiff_main"
+        "3: b 3b"
+        ".thumb_func"
+        ".globl skiff_fault"
+        "skiff_fault:"
+        "ldr r1, =skiff_fault_exit"
+        "movs r0, #0x20"
+        "bkpt 0xab"
+        "4: b 4b"
+        ".ltorg"
+        ".section .rodata"
+        ".align 2"
+        "skiff_fault_exit:"
+        ".word 0x20026"
+        ".word 99"
+        ".text"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+
+// The status a fault stops the machine with. Nothing else uses it, so a test that reads it knows the
+// board faulted rather than finished.
+const FAULT_STATUS: i32 = 99
+
+// Stop the machine with `code`, through Arm semihosting: a debugger, or QEMU with semihosting on, ends
+// the run with that status. SYS_EXIT_EXTENDED (0x20) carries the code. Plain SYS_EXIT (0x18) on AArch32
+// always reports zero. ADP_Stopped_ApplicationExit (0x20026) says the program ran to completion.
+// With no debugger attached, `bkpt` is a fault, and the fault handler stops the same way.
+halt(code: i32) -> never
+    var block: [2]u32 = [0x20026, u32(code)]
+    val op: u32 = 0x20
+    val at = usize(&block)
+    asm
+        [thumb]
+            "bkpt 0xab"
+            in op : "r0"
+            in at : "r1"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+    loop
+        ()

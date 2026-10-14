@@ -1,0 +1,7 @@
+// Arm's MPS2 FPGA boards as QEMU models them: the AN500 (Cortex-M7) and the AN386 (Cortex-M4) share one
+// memory map, so one chip package serves both.
+
+package {
+  name    = "mps2"
+  version = "0.0.1"
+}
