@@ -39,9 +39,13 @@ timer0_stop()
 // Times timer 0 has interrupted since `timer0_start`.
 timer0_fired() -> u32 = fired.load(Ordering.Acquire)
 
+// What the board does on each of timer 0's interrupts, called from the handler. The board exports it.
+extern "skiff_mps2_timer0_event" board_timer0_event()
+
 // Timer 0's interrupt. Its request stays raised until it is cleared here, so a handler that forgot would
 // be entered again the moment it returned.
 @export("skiff_mps2_timer0")
 timer0_handler()
     timer0().intclear = 1
     fired.store(fired.load(Ordering.Relaxed) + 1, Ordering.Release)
+    board_timer0_event()

@@ -15,6 +15,12 @@ systick_start(cycles: u32)
     t.cvr = 0
     t.csr = CSR_ENABLE | CSR_TICKINT | CSR_CLKSOURCE
 
+// Where SysTick is in the current tick: it counts down from `systick_period() - 1` to 0. Two readings
+// within one tick differ by the cycles between them.
+systick_now() -> u32 = systick().cvr
+
+systick_period() -> u32 = systick().rvr + 1
+
 // The SysTick exception. The processor has already saved the caller-saved registers, so an ordinary
 // function is a correct handler.
 @export("skiff_systick")

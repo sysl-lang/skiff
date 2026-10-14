@@ -4,7 +4,8 @@ module skiff.kernel
 //
 // The highest-priority task that is ready runs. Tasks of equal priority take turns, one tick each: on
 // every tick the scheduler asks for a switch if another task of the running one's priority is ready.
-// A task that sleeps is not ready until the tick it asked to wake on. An idle task, at the lowest
+// A task that is blocked — sleeping, or waiting on a semaphore, a mutex, a queue or flags (sync.sysl) —
+// is not ready until what it waits for happens or its timeout's tick comes. An idle task, at the lowest
 // priority, runs when nothing else is ready.
 //
 // The kernel never touches a register itself. A `Port`, which the arch package provides, builds a
@@ -23,7 +24,8 @@ trait Port
     // Run the task whose stack pointer is `sp`. The caller's stack is never returned to.
     start_first(*self, sp: usize) -> never
 
-    // Turn interrupts off, answering what `restore` needs to put them back as they were.
+    // Hold off every interrupt that may use the kernel, answering what `restore` needs to put things
+    // back as they were. It nests: an inner pair restores what the outer one masked.
     mask(*self) -> u32
 
     restore(*self, state: u32)
@@ -32,20 +34,34 @@ trait Port
     idle(*self)
 
 // How many tasks the table holds, the idle task included.
-const MAX_TASKS: usize = 8
+const MAX_TASKS: usize = 16
 
 // The idle task's priority; every other task's must be higher.
 const IDLE_PRIORITY: u8 = 0
 
+// A timeout that never comes. Any other timeout is a number of ticks, and 0 means "do not wait".
+const FOREVER: u32 = 0xffff_ffff
+
 enum TaskState
     Ready
-    Sleeping
+    Blocked
 
 struct Task
     sp: usize           // saved while the task is not running
-    priority: u8
+    priority: u8        // what the scheduler compares: `base`, or higher while it holds a mutex wanted
+    base: u8            // the priority it was given
     state: TaskState
-    wake: u32           // the tick a sleeping task becomes ready on
+    on: usize           // the address of what a blocked task waits on; 0 while it only sleeps
+    timed: bool         // whether a blocked task's wait ends at `wake`
+    wake: u32           // the tick a timed wait ends on
+    timed_out: bool     // whether its last wait ended at `wake` rather than by being woken
+    held: u8            // mutexes it holds
+    want: u32           // the flags a task blocked on a `Flags` waits for
+    want_all: bool      // …all of them, rather than any
+    got: u32            // the flags that ended its wait
+
+// An unused row of the table.
+val NO_TASK: Task = Task(0, 0, 0, TaskState.Ready, 0, false, 0, false, 0, 0, false, 0)
 
 // The table and the choices made over it. It holds no hardware state, so the host tests drive one
 // directly; the kernel keeps one of its own, `scheduler`.
@@ -57,7 +73,11 @@ struct Scheduler
     // Add a task, ready to run, whose saved stack pointer is `sp`. Answers its index.
     add(*self, sp: usize, priority: u8) -> usize
         if self.count == MAX_TASKS then panic("skiff: the task table is full")
-        self.tasks[self.count] = Task(sp, priority, TaskState.Ready, 0)
+        var t = NO_TASK
+        t.sp = sp
+        t.priority = priority
+        t.base = priority
+        self.tasks[self.count] = t
         self.count += 1
         self.count - 1
 
@@ -88,19 +108,67 @@ struct Scheduler
         self.running = self.choose()
         self.tasks[self.running].sp
 
-    // The running task sleeps from tick `now` until tick `now + ticks`.
-    sleep(*self, now: u32, ticks: u32)
+    // The running task blocks from tick `now` on `on` (0 for nothing: a sleep), until it is woken or,
+    // unless `timeout` is `FOREVER`, until tick `now + timeout`.
+    block(*self, now: u32, on: usize, timeout: u32)
         val t = &self.tasks[self.running]
-        t.state = TaskState.Sleeping
-        t.wake = now + ticks
+        t.state = TaskState.Blocked
+        t.on = on
+        t.timed = timeout != FOREVER
+        t.wake = now + timeout
+        t.timed_out = false
 
-    // Tick `now` has come: wake every task due by it, and answer whether a switch is wanted. One is
-    // when a ready task outranks the running one, when the running one is no longer ready, or when
+    // The running task sleeps from tick `now` until tick `now + ticks`.
+    sleep(*self, now: u32, ticks: u32) = self.block(now, 0, ticks)
+
+    // The highest-priority task blocked on `on`, the first in table order among equals.
+    waiter(*self, on: usize) -> Option[usize]
+        var best: Option[usize] = None
+        for i in 0..<self.count
+            if self.blocked_on(i, on)
+                best = best match
+                    Some(b) -> if self.tasks[i].priority > self.tasks[b].priority then Some(i) else Some(b)
+                    None -> Some(i)
+        best
+
+    // Whether task `i` is blocked on `on`.
+    blocked_on(*self, i: usize, on: usize) -> bool
+        self.tasks[i].state == TaskState.Blocked && self.tasks[i].on == on && on != 0
+
+    // Make blocked task `i` ready: what it waited for has happened.
+    wake(*self, i: usize)
+        val t = &self.tasks[i]
+        t.state = TaskState.Ready
+        t.on = 0
+        t.timed_out = false
+
+    // Whether task `i` should preempt the running one.
+    outranks_running(*self, i: usize) -> bool = self.tasks[i].priority > self.tasks[self.running].priority
+
+    // Task `owner` holds something a task of `priority` waits for: it runs at that priority at least,
+    // so that no task between the two can keep it from finishing.
+    inherit(*self, owner: usize, priority: u8)
+        if self.tasks[owner].priority < priority then self.tasks[owner].priority = priority
+
+    // Task `i` takes or gives up a mutex. It keeps any inherited priority until it holds none, so it
+    // never drops below a task still waiting on one of them.
+    took_mutex(*self, i: usize) = self.tasks[i].held += 1
+
+    gave_mutex(*self, i: usize)
+        val t = &self.tasks[i]
+        t.held -= 1
+        if t.held == 0 then t.priority = t.base
+
+    // Tick `now` has come: end every timed wait due by it, and answer whether a switch is wanted. One
+    // is when a ready task outranks the running one, when the running one is no longer ready, or when
     // another ready task shares its priority and it is that task's turn.
     tick(*self, now: u32) -> bool
         for i in 0..<self.count
             val t = &self.tasks[i]
-            if t.state == TaskState.Sleeping && i32(now - t.wake) >= 0 then t.state = TaskState.Ready
+            if t.state == TaskState.Blocked && t.timed && i32(now - t.wake) >= 0
+                t.state = TaskState.Ready
+                t.timed_out = t.on != 0
+                t.on = 0
         val running = self.tasks[self.running]
         if running.state != TaskState.Ready then return true
         for i in 0..<self.count
@@ -110,13 +178,15 @@ struct Scheduler
         false
 
 // An empty table.
-empty_scheduler() -> Scheduler = Scheduler([Task(0, 0, TaskState.Ready, 0); MAX_TASKS], 0, 0)
+empty_scheduler() -> Scheduler = Scheduler([NO_TASK; MAX_TASKS], 0, 0)
 
 // Written as a constructor over literals, not through `empty_scheduler`, so that it is laid into the
-// image as data: a bare-metal image never runs initializers.
-private var scheduler: Scheduler = Scheduler([Task(0, 0, TaskState.Ready, 0); MAX_TASKS], 0, 0)
+// image as data: a bare-metal image never runs initializers. The row is spelled out rather than named
+// as `NO_TASK`, because naming a `val` keeps the initializer from being laid in as data (FINDINGS 5).
+private[kernel] var scheduler: Scheduler =
+    Scheduler([Task(0, 0, 0, TaskState.Ready, 0, false, 0, false, 0, 0, false, 0); MAX_TASKS], 0, 0)
 
-// The port, once `run` has started the tasks; until then a tick switches nothing.
+// The port, once `run` has started the tasks; until then a tick switches nothing and nothing blocks.
 private var port: Option[*Port] = None
 
 // Add a task that starts at `entry` on `stack`, with `priority` above `IDLE_PRIORITY`. Tasks are
@@ -142,27 +212,65 @@ private idle_task() -> never
 // Called by the port's switch with the running task's stack pointer; answers the next task's.
 switch_context(sp: usize) -> usize = scheduler.switch(sp)
 
-// The running task gives up the processor to the next ready task of its priority, if there is one.
-yield_now()
+// Hold off the interrupts that use the kernel, from a task or from an interrupt handler. Before `run`
+// there are no tasks to protect and nothing is masked.
+private[kernel] enter() -> u32 = port match
+    Some(p) -> p.mask()
+    None -> 0
+
+private[kernel] leave(state: u32)
     port match
-        Some(p) ->
-            val state = p.mask()
-            p.request_switch()
-            p.restore(state)
+        Some(p) -> p.restore(state)
         None -> ()
 
-// The running task sleeps for `count` ticks.
-sleep(count: u32)
+// Whether `run` has started the tasks.
+private started() -> bool = port match
+    Some(_) -> true
+    None -> false
+
+// Ask for a switch, if tasks are running.
+private[kernel] request_switch()
     port match
-        Some(p) ->
-            val state = p.mask()
-            scheduler.sleep(ticks(), count)
-            p.request_switch()
-            p.restore(state)
+        Some(p) -> p.request_switch()
         None -> ()
+
+// Wake blocked task `i`, switching to it as soon as allowed if it outranks the running task.
+private[kernel] wake_task(i: usize)
+    scheduler.wake(i)
+    if scheduler.outranks_running(i) then request_switch()
+
+// Block the running task on `on` for up to `timeout` ticks and switch away. The caller has called
+// `enter`, and `state` is what it answered; this leaves. Answers once the task runs again: true if it
+// was woken, false if the timeout came first.
+private[kernel] wait(state: u32, on: usize, timeout: u32) -> bool
+    if !started() then panic("skiff: a wait before the tasks run")
+    scheduler.block(ticks(), on, timeout)
+    request_switch()
+    leave(state)
+    !scheduler.tasks[scheduler.running].timed_out
+
+// The running task gives up the processor to the next ready task of its priority, if there is one.
+yield_now()
+    val state = enter()
+    request_switch()
+    leave(state)
+
+// The running task sleeps for `count` ticks, or for good with `FOREVER`.
+sleep(count: u32)
+    val state = enter()
+    val _ = wait(state, 0, count)
+
+// The running task sleeps until tick `tick`, and does not sleep at all if that tick has come. Ticks
+// compare modulo 2^32, so `tick` may be up to 2^31 - 1 ticks ahead.
+sleep_until(tick: u32)
+    val left = i32(tick - ticks())
+    if left > 0 then sleep(u32(left))
+
+// The running task stops for good: what a task with no more to do ends in, since a task never returns.
+sleep_forever() -> never
+    loop
+        sleep(FOREVER)
 
 // After a tick: ask the port for a switch if the scheduler wants one.
 private[kernel] reschedule()
-    port match
-        Some(p) -> if scheduler.tick(ticks()) then p.request_switch()
-        None -> ()
+    if started() && scheduler.tick(ticks()) then request_switch()

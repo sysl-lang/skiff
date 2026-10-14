@@ -32,6 +32,11 @@ skiff: task A 3
 skiff: task B 3
 skiff: f32 registers survived the switches
 skiff: high priority task woke on its tick
+skiff: the high task had the mutex before the middle task finished
+skiff: a timed wait timed out after 5 ticks
+skiff: timer 0's interrupt woke a waiting task
+skiff: a queue of two carried 1 to 5 in order
+skiff: event flags woke the task on both bits
 skiff: provoking a bus fault
 skiff: fault BusFault
 skiff: cfsr 0x00008200

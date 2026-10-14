@@ -5,15 +5,17 @@ import skiff.arch.armv7m
 import skiff.kernel
 import skiff.kernel.Machine
 
-// The tasks the boot test runs, and what each shows.
+// The tasks the boot test runs, and what each shows. Each scenario starts at its own tick, counted from
+// when the tasks start, so that one has finished before the next begins; the synchronisation scenarios,
+// from tick 45 on, are in waits.sysl.
 //   - A and B share priority 1 and never yield: each prints a line and then waits for the next tick.
 //     They alternate only because the tick takes turns between them. After three lines each, A
-//     sleeps for good and B spins for good, never giving up the processor of its own accord.
+//     sleeps for good and B spins until tick 40, never giving up the processor of its own accord.
 //   - P1 and P2, at priority 2, sleep for 15 ticks and then preempt B. Each fills s16-s31 with its own
 //     values and switches to the other, which does the same, before checking its own are intact. So
 //     the switch must save the FPU registers a task uses.
-//   - H, at priority 3, sleeps for 30 ticks, must be running on the very tick it is due although B
-//     never yields, and then provokes the bus fault that ends the run, from a task's stack.
+//   - H, at priority 3, sleeps for 30 ticks and must be running on the very tick it is due, although B
+//     never yields.
 
 private var cortex: armv7m.Cortex = armv7m.Cortex()
 
@@ -24,21 +26,29 @@ private var stack_p2: [256]u32 = [0; 256]
 private var stack_h: [256]u32 = [0; 256]
 private var stack_idle: [128]u32 = [0; 128]
 
-// Spawn the tasks and run them; the run ends in H's bus fault.
+// The tick the tasks start on: every scenario's starting tick counts from it, so that each starts when
+// it should whatever order the tasks first ran in.
+private[board] var epoch: u32 = 0
+
+// Spawn the tasks and run them; the run ends in a bus fault, in the last scenario.
 run_tasks() -> never
+    epoch = kernel.ticks()
     kernel.spawn(&cortex, stack_a, &task_a, 1)
     kernel.spawn(&cortex, stack_b, &task_b, 1)
     kernel.spawn(&cortex, stack_p1, &task_p1, 2)
     kernel.spawn(&cortex, stack_p2, &task_p2, 2)
     kernel.spawn(&cortex, stack_h, &task_h, 3)
+    spawn_waits(&cortex)
     kernel.run(&cortex, stack_idle)
 
 private task_a() -> never = take_turns("skiff: task A ", false)
 private task_b() -> never = take_turns("skiff: task B ", true)
 
-// Three lines, each followed by a wait for the next tick, then sleep or spin for good.
+// Three lines, each followed by a wait for the next tick, then sleep for good, or spin until tick 40
+// first.
 private take_turns(label: string, spin: bool) -> never
     var board = Board()
+    val start = kernel.ticks()
     for n in 1u32..3
         board.write(label.bytes)
         kernel.write_dec(&board, n)
@@ -46,8 +56,10 @@ private take_turns(label: string, spin: bool) -> never
         val t = kernel.ticks()
         while kernel.ticks() == t
             ()
-    loop
-        if !spin then kernel.sleep(1_000_000)
+    if spin
+        while kernel.ticks() - start < 40
+            ()
+    kernel.sleep_forever()
 
 // FPU registers through switches: `skiff_fp_probe` (below) writes `base`, `base + 1`, … into s16-s31,
 // calls `skiff_fp_meet`, and answers how many of the sixteen still hold their value.
@@ -82,8 +94,7 @@ private fp_task(base: u32) -> never
             board.write("skiff: f32 registers kept: ".bytes)
             kernel.write_dec(&board, kept.load())
             board.write(" of 32\n".bytes)
-    loop
-        kernel.sleep(1_000_000)
+    kernel.sleep_forever()
 
 private task_h() -> never
     var board = Board()
@@ -95,7 +106,7 @@ private task_h() -> never
         board.write("skiff: high priority task woke on tick +".bytes)
         kernel.write_dec(&board, kernel.ticks() - due + 30)
         board.write("\n".bytes)
-    bus_fault(&board)
+    kernel.sleep_forever()
 
 // s16-s31 are callee-saved, so the probe saves the caller's values and puts them back at the end.
 asm

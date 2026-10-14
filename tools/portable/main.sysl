@@ -2,7 +2,7 @@
 // the kernel that is generic over the machine is called from here as well.
 
 import skiff.kernel
-import skiff.kernel.{Machine, Port}
+import skiff.kernel.{Flags, Machine, Mutex, NO_OWNER, Port, Queue, Semaphore}
 
 struct Nothing
 end Nothing
@@ -26,11 +26,24 @@ impl Port for NoPort
     restore(*self, state: u32) = ()
     idle(*self) = ()
 
+private var sem: Semaphore = Semaphore(0, 1)
+private var mutex: Mutex = Mutex(NO_OWNER)
+private var queue: Queue[u32, 2] = Queue([0, 0], 0, 0)
+private var flags: Flags = Flags(0)
+
 private task() -> never
     kernel.yield_now()
     kernel.sleep(1)
-    loop
-        ()
+    kernel.sleep_until(5)
+    val _ = sem.give()
+    val _ = sem.take(1)
+    if mutex.lock(kernel.FOREVER) then mutex.unlock()
+    val _ = queue.send(1, 0)
+    val _ = queue.receive(1)
+    flags.set(1)
+    flags.clear(1)
+    val _ = flags.wait(1, true, 1)
+    kernel.sleep_forever()
 
 @export("main")
 probe() -> i32

@@ -66,6 +66,18 @@ enable_irq(irq: u32)
     nvic_reg(NVIC_ICPR, irq).v = nvic_bit(irq)
     nvic_reg(NVIC_ISER, irq).v = nvic_bit(irq)
 
+// The NVIC's priority registers: one byte per interrupt, of which a core implements only the top bits.
+private[armv7m]struct Byte
+    v: volatile u8
+
+private[armv7m]const NVIC_IPR: usize = 0xE000_E400
+
+// Give interrupt `irq` `priority`, where 0 is the most urgent. A handler that calls the kernel must run
+// at a priority `Cortex.mask` holds off: 0x80 or numerically higher.
+set_irq_priority(irq: u32, priority: u8)
+    val b: *Byte = ptr_cast(NVIC_IPR + usize(irq))
+    b.v = priority
+
 // Stop interrupt `irq` from being taken; a request stays pending until it is enabled or cleared.
 disable_irq(irq: u32)
     nvic_reg(NVIC_ICER, irq).v = nvic_bit(irq)

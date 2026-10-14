@@ -1,0 +1,176 @@
+module board
+
+import sysl.sync.Atomic
+import skiff.arch.armv7m
+import skiff.chip.mps2
+import skiff.kernel
+import skiff.kernel.{Flags, FOREVER, Machine, Mutex, NO_OWNER, Queue, Semaphore}
+
+// The synchronisation scenarios, each starting at its own tick after tasks.sysl's have finished.
+//   - Tick 45, priority inheritance. Low (priority 1) locks a mutex and works for 5 ticks. High (3)
+//     wants it at tick 47, and Middle (2) starts 20 ticks of work at tick 48. With inheritance Low
+//     runs at High's priority until it unlocks, so High has the mutex before Middle finishes. Without
+//     it, Middle keeps Low, and so High, waiting the whole 20 ticks.
+//   - Tick 70, a timed wait on a semaphore nobody gives, which must end after exactly 5 ticks. Then
+//     timer 0's interrupt gives a semaphore a task waits on, and the cycles from the interrupt to the
+//     task are measured.
+//   - Tick 90, a queue of two that a producer sends 1 to 5 through, waiting whenever it is full.
+//   - Tick 100, event flags: a task waits for two bits that another sets two ticks apart, and must
+//     wake on the second, not the first. It then provokes the bus fault that ends the run.
+
+private var stack_low: [256]u32 = [0; 256]
+private var stack_mid: [256]u32 = [0; 256]
+private var stack_high: [256]u32 = [0; 256]
+private var stack_timer: [256]u32 = [0; 256]
+private var stack_producer: [256]u32 = [0; 256]
+private var stack_consumer: [256]u32 = [0; 256]
+private var stack_flag_wait: [256]u32 = [0; 256]
+private var stack_flag_set: [256]u32 = [0; 256]
+
+spawn_waits(cortex: *armv7m.Cortex)
+    kernel.spawn(cortex, stack_low, &task_low, 1)
+    kernel.spawn(cortex, stack_mid, &task_mid, 2)
+    kernel.spawn(cortex, stack_high, &task_high, 3)
+    kernel.spawn(cortex, stack_timer, &task_timer, 3)
+    kernel.spawn(cortex, stack_producer, &task_producer, 2)
+    kernel.spawn(cortex, stack_consumer, &task_consumer, 2)
+    kernel.spawn(cortex, stack_flag_wait, &task_flag_wait, 3)
+    kernel.spawn(cortex, stack_flag_set, &task_flag_set, 2)
+
+// Work for `ticks` ticks without blocking or yielding.
+private busy(ticks: u32)
+    val start = kernel.ticks()
+    while kernel.ticks() - start < ticks
+        ()
+
+private say(line: string)
+    var board = Board()
+    board.write(line.bytes)
+
+// Priority inheritance.
+
+private var shared: Mutex = Mutex(NO_OWNER)
+private var middle_done: Atomic[u32] = Atomic(0)
+
+private task_low() -> never
+    kernel.sleep_until(epoch + 45)
+    val _ = shared.lock(FOREVER)
+    busy(5)
+    shared.unlock()
+    kernel.sleep_forever()
+
+private task_mid() -> never
+    kernel.sleep_until(epoch + 48)
+    busy(20)
+    middle_done.store(1)
+    kernel.sleep_forever()
+
+private task_high() -> never
+    kernel.sleep_until(epoch + 47)
+    val _ = shared.lock(FOREVER)
+    if middle_done.load() == 0
+        say("skiff: the high task had the mutex before the middle task finished\n")
+    else
+        say("skiff: priority inversion: the middle task finished first\n")
+    shared.unlock()
+    kernel.sleep_forever()
+
+// A timed wait, and a task woken by an interrupt.
+
+private var never_given: Semaphore = Semaphore(0, 1)
+private var from_timer: Semaphore = Semaphore(0, 1)
+private var armed: Atomic[u32] = Atomic(0)
+private var interrupt_at: Atomic[u32] = Atomic(0)
+
+// Timer 0's interrupt, once the scenario arms it: note where SysTick was, and give the semaphore.
+@export("skiff_mps2_timer0_event")
+timer0_event()
+    if armed.load() != 0
+        interrupt_at.store(armv7m.systick_now())
+        val _ = from_timer.give()
+
+private task_timer() -> never
+    var board = Board()
+    kernel.sleep_until(epoch + 70)
+    val start = kernel.ticks()
+    val taken = never_given.take(5)
+    val waited = kernel.ticks() - start
+    if !taken && waited == 5
+        say("skiff: a timed wait timed out after 5 ticks\n")
+    else
+        board.write("skiff: a timed wait ended after ".bytes)
+        kernel.write_dec(&board, waited)
+        board.write(" ticks\n".bytes)
+
+    kernel.sleep(5)
+    armv7m.set_irq_priority(mps2.TIMER0_IRQ, 0xc0)
+    armed.store(1)
+    mps2.timer0_start(mps2.CLOCK_HZ / 1000)
+    armv7m.enable_irq(mps2.TIMER0_IRQ)
+    val woken = from_timer.take(50)
+    val now = armv7m.systick_now()
+    armv7m.disable_irq(mps2.TIMER0_IRQ)
+    mps2.timer0_stop()
+    armed.store(0)
+    if woken
+        say("skiff: timer 0's interrupt woke a waiting task\n")
+        // SysTick counts down, and wraps at its period.
+        val at = interrupt_at.load()
+        val cycles = if at >= now then at - now else at + armv7m.systick_period() - now
+        board.write("skiff: interrupt to task in ".bytes)
+        kernel.write_dec(&board, cycles)
+        board.write(" cycles\n".bytes)
+    else
+        say("skiff: timer 0's interrupt never woke the task\n")
+    kernel.sleep_forever()
+
+// A queue.
+
+private var numbers: Queue[u32, 2] = Queue([0, 0], 0, 0)
+
+private task_producer() -> never
+    kernel.sleep_until(epoch + 90)
+    for n in 1u32..5
+        val _ = numbers.send(n, FOREVER)
+    kernel.sleep_forever()
+
+private task_consumer() -> never
+    kernel.sleep_until(epoch + 90)
+    var in_order = true
+    for want in 1u32..5
+        numbers.receive(FOREVER) match
+            Some(n) -> if n != want then in_order = false
+            None -> in_order = false
+    if in_order
+        say("skiff: a queue of two carried 1 to 5 in order\n")
+    else
+        say("skiff: the queue lost its order\n")
+    kernel.sleep_forever()
+
+// Event flags.
+
+private var events: Flags = Flags(0)
+private var step: Atomic[u32] = Atomic(0)
+
+private task_flag_wait() -> never
+    var board = Board()
+    kernel.sleep_until(epoch + 100)
+    val got = events.wait(0b11, true, 50)
+    if got == 0b11 && step.load() == 2
+        say("skiff: event flags woke the task on both bits\n")
+    else
+        board.write("skiff: event flags answered ".bytes)
+        kernel.write_hex(&board, got)
+        board.write(" at step ".bytes)
+        kernel.write_dec(&board, step.load())
+        board.write("\n".bytes)
+    bus_fault(&board)
+
+private task_flag_set() -> never
+    kernel.sleep_until(epoch + 101)
+    step.store(1)
+    events.set(0b01)
+    kernel.sleep(2)
+    step.store(2)
+    events.set(0b10)
+    kernel.sleep_forever()

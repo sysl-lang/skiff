@@ -100,6 +100,8 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
   `main`, or the file runs no statement, the file is not a body: `var` is the module's and `static` is
   refused, as the `static` diagnostic already says. The first error's anchor is also wrong: it names
   `bump` but points at the `var`, which in the board was 12 lines away.
+- **Status:** accepted by `sysl` as a bug for the release after alpha.12. Both checks will follow one
+  ruling, and the reference will be reconciled.
 - **What skiff did:** the board's code that needs storage moved into its own module directory
   (`boards/qemu-mps2/board/`), where `var` is plainly the module's. That layout stands on its own, so
   nothing changes when this is fixed.
@@ -149,5 +151,48 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
 - **Proposed fix:** emit every output as early-clobber (`=&r`). It is the conservative direction the
   page already takes for memory and the flags, and it costs at most a register per output. A test
   pins `seven_plus(1) == 8`.
+- **Status:** accepted by `sysl` as a bug for the release after alpha.12. Every output will be emitted
+  early-clobber, an `inout` will keep its tied operand, and tests will pin `seven_plus(1) == 8` and the
+  BASEPRI disassembly on thumb.
 - **What skiff does until then:** `mask` names its registers (`out old : "r0"`, `in level : "r1"`), with
   a comment pointing here. Remove that once the fix ships.
+
+## 5. Naming a constant `val` keeps an initializer from being laid in as data
+
+- **What was being written:** milestone 3's task table. A task row grew to twelve fields, and an empty
+  one is needed both for the kernel's table and wherever a row is reset.
+- **The first wall:** `const NO_TASK: Task = Task(…)` is refused: "a constant is a scalar, and Task is
+  storage — write 'NO_TASK' as a 'val', which is laid into the object file as constant data".
+- **The second wall:** the `val` it asks for cannot be named in another module's storage on bare metal.
+
+  ```sysl
+  module lib.fold
+
+  struct P
+      a: u32
+
+  val ZERO: P = P(0)
+
+  private var table: [4]P = [ZERO; 4]
+
+  read() -> u32 = table[0].a
+  ```
+
+  built for `thumbv7em-freestanding` with entry `_start`, from a program that calls `fold.read()`:
+
+  ```
+  error: 'start' starts the image and reaches 'lib.fold.table', which is module storage an initializer
+  fills before the program's own statements run. … or make the initializer constant data, which is
+  laid straight into the image
+  ```
+
+  `[P(0); 4]` in its place builds.
+- **What the reference and the compiler say:** the diagnostic for `const` calls a `val` over a
+  constructor "constant data", and the diagnostic for the table asks for an initializer that is
+  constant data. An initializer made only of constant data is one. So the table's initializer should
+  fold whether its element is written out or named.
+- **Proposed fix:** when the folder meets a module `val` whose own initializer folds, it substitutes
+  that value, just as it already does for a `const`. A test: the probe above builds for
+  `thumbv7em-freestanding`, and the image holds the table in `.data`/`.bss` with no initializer call.
+- **What skiff does until then:** the kernel's `scheduler` writes the empty row out in full instead of
+  naming `NO_TASK`, with a comment pointing here. Remove that once the fix ships.

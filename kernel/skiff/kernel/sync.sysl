@@ -1,0 +1,192 @@
+module skiff.kernel
+
+// What tasks wait on: semaphores, mutexes, queues and event flags.
+//
+// Each is a plain struct in the program's storage, written as a constructor over constants so that a
+// bare-metal image lays it in as data (`Semaphore(0, 1)`, `Mutex(NO_OWNER)`, `Queue([0; 4], 0, 0)`,
+// `Flags(0)`). A blocked task records the object's address, so the kernel needs no table of objects.
+//
+// Every wait takes a timeout in ticks: `FOREVER`, 0 for "only if it can be had now", or a count. A
+// wait that times out answers false (or `None`, or 0) and leaves the object as it was.
+//
+// `give`, `send` with a timeout of 0, and `set` may be called from an interrupt handler whose priority
+// the port masks (on Armv7-M, 0x80 or numerically higher); the rest wait, so only a task may call
+// them.
+
+// The address a task blocks on while waiting for `object`, offset by `which` for an object with more
+// than one reason to wait.
+private wait_key[T](object: *T, which: usize) -> usize = usize(object) + which
+
+// Wake the highest-priority task blocked on `on`, if any.
+private wake_one(on: usize)
+    scheduler.waiter(on) match
+        Some(i) -> wake_task(i)
+        None -> ()
+
+// The ticks left until `deadline`, 0 once it has passed. `FOREVER` stays `FOREVER`.
+private remaining(timeout: u32, deadline: u32) -> u32
+    if timeout == FOREVER then return FOREVER
+    val left = i32(deadline - ticks())
+    if left > 0 then u32(left) else 0
+
+// A counting semaphore, from 0 up to `max`.
+struct Semaphore
+    count: u32
+    max: u32
+
+    // Take one, waiting up to `timeout` ticks for one to be given. Answers whether it was taken.
+    take(*self, timeout: u32) -> bool
+        val state = enter()
+        if self.count > 0
+            self.count -= 1
+            leave(state)
+            return true
+        if timeout == 0
+            leave(state)
+            return false
+        // A `give` hands its unit straight to the woken task, so waking is taking.
+        wait(state, wait_key(self, 0), timeout)
+
+    // Give one: to the highest-priority waiting task if there is one, else to the count. Answers
+    // false, giving nothing, when the count is already at `max`.
+    give(*self) -> bool
+        val state = enter()
+        var given = true
+        scheduler.waiter(wait_key(self, 0)) match
+            Some(i) -> wake_task(i)
+            None ->
+                if self.count < self.max then self.count += 1 else given = false
+        leave(state)
+        given
+
+// The `owner` of a mutex nobody holds.
+const NO_OWNER: usize = 0xffff_ffff
+
+// A mutex with priority inheritance: while a task waits on it, its owner runs at the waiter's priority
+// at least, so a task of middling priority cannot keep the owner, and with it the waiter, from running.
+// The owner keeps the raised priority until it holds no mutex. Inheritance goes one level: an owner
+// that is itself waiting on another mutex does not pass the priority on.
+struct Mutex
+    owner: usize        // the owning task's index, or NO_OWNER
+
+    // Lock it, waiting up to `timeout` ticks. Answers whether it is now held. A task may not lock a
+    // mutex it already holds.
+    lock(*self, timeout: u32) -> bool
+        val state = enter()
+        val me = scheduler.running
+        if self.owner == NO_OWNER
+            self.owner = me
+            scheduler.took_mutex(me)
+            leave(state)
+            return true
+        if self.owner == me then panic("skiff: a task locked a mutex it already holds")
+        if timeout == 0
+            leave(state)
+            return false
+        scheduler.inherit(self.owner, scheduler.tasks[me].priority)
+        // `unlock` makes the woken task the owner, so waking is locking.
+        wait(state, wait_key(self, 0), timeout)
+
+    // Unlock it, handing it to the highest-priority waiting task if there is one. Only the owner may.
+    unlock(*self)
+        val state = enter()
+        val me = scheduler.running
+        if self.owner != me then panic("skiff: a task unlocked a mutex it does not hold")
+        scheduler.gave_mutex(me)
+        scheduler.waiter(wait_key(self, 0)) match
+            Some(i) ->
+                self.owner = i
+                scheduler.took_mutex(i)
+                scheduler.wake(i)
+                // The new owner inherits from whoever still waits.
+                scheduler.waiter(wait_key(self, 0)) match
+                    Some(w) -> scheduler.inherit(i, scheduler.tasks[w].priority)
+                    None -> ()
+                if scheduler.outranks_running(i) then request_switch()
+            None -> self.owner = NO_OWNER
+        leave(state)
+
+// A queue of up to `N` items of `T`, first in first out. A sender waits while it is full and a
+// receiver while it is empty.
+struct Queue[T, const N: usize]
+    items: [N]T
+    head: usize         // the oldest item's index
+    len: usize
+
+    // Add `item`, waiting up to `timeout` ticks for room. Answers whether it was added.
+    send(*self, item: T, timeout: u32) -> bool
+        val deadline = ticks() + timeout
+        loop
+            val state = enter()
+            if self.len < N
+                self.items[(self.head + self.len) % N] = item
+                self.len += 1
+                wake_one(wait_key(self, 0))
+                leave(state)
+                return true
+            val left = remaining(timeout, deadline)
+            if left == 0
+                leave(state)
+                return false
+            if !wait(state, wait_key(self, 1), left) then return false
+
+    // Take the oldest item, waiting up to `timeout` ticks for one.
+    receive(*self, timeout: u32) -> Option[T]
+        val deadline = ticks() + timeout
+        loop
+            val state = enter()
+            if self.len > 0
+                val item = self.items[self.head]
+                self.head = (self.head + 1) % N
+                self.len -= 1
+                wake_one(wait_key(self, 1))
+                leave(state)
+                return Some(item)
+            val left = remaining(timeout, deadline)
+            if left == 0
+                leave(state)
+                return None
+            if !wait(state, wait_key(self, 0), left) then return None
+
+// Event flags: 32 bits that tasks wait on, any or all of a set of them. The bits that end a wait are
+// cleared as they do, so each event is seen once.
+struct Flags
+    bits: u32
+
+    // Set `bits`, waking every task whose wait they complete, highest priority first in table order.
+    set(*self, bits: u32)
+        val state = enter()
+        self.bits = self.bits | bits
+        for i in 0..<scheduler.count
+            if scheduler.blocked_on(i, wait_key(self, 0))
+                val t = &scheduler.tasks[i]
+                val hit = self.bits & t.want
+                if (t.want_all && hit == t.want) || (!t.want_all && hit != 0)
+                    t.got = hit
+                    self.bits = self.bits & ~hit
+                    wake_task(i)
+        leave(state)
+
+    // Clear `bits` without waking anyone.
+    clear(*self, bits: u32)
+        val state = enter()
+        self.bits = self.bits & ~bits
+        leave(state)
+
+    // Wait up to `timeout` ticks for any of `want` to be set, or for all of them with `all`. Answers
+    // the bits that ended the wait, now cleared, or 0 if the timeout came first.
+    wait(*self, want: u32, all: bool, timeout: u32) -> u32
+        val state = enter()
+        val hit = self.bits & want
+        if (all && hit == want) || (!all && hit != 0)
+            self.bits = self.bits & ~hit
+            leave(state)
+            return hit
+        if timeout == 0
+            leave(state)
+            return 0
+        val t = &scheduler.tasks[scheduler.running]
+        t.want = want
+        t.want_all = all
+        t.got = 0
+        if wait(state, wait_key(self, 0), timeout) then scheduler.tasks[scheduler.running].got else 0

@@ -1,0 +1,135 @@
+module skiff.kernel
+@tests
+
+// The objects on the host, with no tasks running: every path that does not block. A blocked task is
+// set up by hand in the kernel's own table, so that what a `give` or an `unlock` does to it can be read
+// back. Waiting itself needs a real switch, and the board's boot test checks it.
+
+// The kernel's table, emptied, with a task per entry of `priorities`; task 0 runs.
+private setup(priorities: []const u8)
+    scheduler = empty_scheduler()
+    for p in priorities
+        val _ = scheduler.add(0, p)
+    scheduler.running = 0
+
+// Task `i` blocks on `on` for good; task 0 runs again.
+private block_as(i: usize, on: usize)
+    scheduler.running = i
+    scheduler.block(0, on, FOREVER)
+    scheduler.running = 0
+
+@test("a semaphore counts up to its maximum, and take with no wait answers at once")
+semaphore_counts()
+    setup([1])
+    var s = Semaphore(0, 2)
+    assert(!s.take(0), "nothing to take")
+    assert(s.give(), "one")
+    assert(s.give(), "two")
+    assert(!s.give(), "not past the maximum")
+    assert(s.take(0), "take one")
+    assert(s.take(0), "take two")
+    assert(!s.take(0), "empty again")
+
+@test("give hands its unit to a waiting task instead of the count")
+semaphore_hands_over()
+    setup([1, 2])
+    var s = Semaphore(0, 1)
+    block_as(1, usize(&s))
+    assert(s.give(), "given")
+    assert(scheduler.tasks[1].state == TaskState.Ready, "the waiter is ready")
+    assert(!scheduler.tasks[1].timed_out, "and was woken, not timed out")
+    assert_eq(s.count, 0)
+
+@test("a mutex is locked by the running task, and another task cannot have it without waiting")
+mutex_owner()
+    setup([1, 1])
+    var m = Mutex(NO_OWNER)
+    assert(m.lock(0), "free")
+    assert_eq(m.owner, 0)
+    assert_eq(scheduler.tasks[0].held, 1)
+    scheduler.running = 1
+    assert(!m.lock(0), "held by task 0")
+    scheduler.running = 0
+    m.unlock()
+    assert_eq(m.owner, NO_OWNER)
+    assert_eq(scheduler.tasks[0].held, 0)
+
+@test("unlock hands the mutex to the highest waiter, which inherits from the one still waiting")
+mutex_hands_over()
+    setup([1, 2, 3])
+    var m = Mutex(NO_OWNER)
+    assert(m.lock(0), "task 0 locks")
+    block_as(1, usize(&m))
+    block_as(2, usize(&m))
+    scheduler.inherit(0, 3)
+    m.unlock()
+    assert_eq(m.owner, 2)
+    assert_eq(scheduler.tasks[0].priority, 1)
+    assert(scheduler.tasks[2].state == TaskState.Ready, "the new owner is ready")
+    assert(scheduler.tasks[1].state == TaskState.Blocked, "the other still waits")
+    assert_eq(scheduler.tasks[2].priority, 3)
+    assert_eq(scheduler.tasks[2].held, 1)
+
+@test("unlocking a mutex another task holds is refused", should_trap: "skiff: a task unlocked a mutex it does not hold")
+mutex_not_owner()
+    setup([1, 1])
+    var m = Mutex(1)
+    m.unlock()
+
+@test("locking a mutex twice is refused", should_trap: "skiff: a task locked a mutex it already holds")
+mutex_twice()
+    setup([1])
+    var m = Mutex(NO_OWNER)
+    assert(m.lock(0), "locked")
+    val _ = m.lock(0)
+
+@test("a queue keeps order across the wrap, and refuses at once when full or empty with no wait")
+queue_ring()
+    setup([1])
+    var q: Queue[u32, 2] = Queue([0, 0], 0, 0)
+    assert(q.receive(0) == None, "empty")
+    assert(q.send(1, 0), "1")
+    assert(q.send(2, 0), "2")
+    assert(!q.send(3, 0), "full")
+    assert(q.receive(0) == Some(1), "1 out")
+    assert(q.send(3, 0), "3 in, wrapping")
+    assert(q.receive(0) == Some(2), "2 out")
+    assert(q.receive(0) == Some(3), "3 out")
+    assert(q.receive(0) == None, "empty again")
+
+@test("a send wakes a receiver, and a receive wakes a sender")
+queue_wakes()
+    setup([1, 2, 2])
+    var q: Queue[u32, 1] = Queue([0], 0, 0)
+    block_as(1, usize(&q))
+    assert(q.send(7, 0), "sent")
+    assert(scheduler.tasks[1].state == TaskState.Ready, "the receiver is ready")
+    block_as(2, usize(&q) + 1)
+    assert(q.receive(0) == Some(7), "received")
+    assert(scheduler.tasks[2].state == TaskState.Ready, "the sender is ready")
+
+@test("flags answer at once when the bits are there, any or all, and clear what they answer")
+flags_now()
+    setup([1])
+    var f = Flags(0)
+    f.set(0b01)
+    assert_eq(f.wait(0b11, true, 0), 0)
+    assert_eq(f.wait(0b11, false, 0), 0b01)
+    assert_eq(f.bits, 0)
+    f.set(0b110)
+    f.clear(0b100)
+    assert_eq(f.wait(0b111, false, 0), 0b010)
+
+@test("set wakes a task only once its whole wait is met, and clears only that task's bits")
+flags_wake()
+    setup([1, 2])
+    var f = Flags(0)
+    scheduler.tasks[1].want = 0b11
+    scheduler.tasks[1].want_all = true
+    block_as(1, usize(&f))
+    f.set(0b001)
+    assert(scheduler.tasks[1].state == TaskState.Blocked, "one bit of two")
+    f.set(0b110)
+    assert(scheduler.tasks[1].state == TaskState.Ready, "both bits")
+    assert_eq(scheduler.tasks[1].got, 0b011)
+    assert_eq(f.bits, 0b100)
