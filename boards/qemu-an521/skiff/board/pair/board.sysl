@@ -2,6 +2,7 @@ module skiff.board.pair
 
 import sysl.sync.Atomic
 import skiff.arch.armv7m
+import skiff.arch.armv8m
 import skiff.chip.an521
 import skiff.kernel
 import skiff.kernel.{FOREVER, Flags, Link, Machine, Ring, Semaphore}
@@ -66,16 +67,37 @@ open_link()
 doorbell() = link.rung()
 
 private var cortex: armv7m.Cortex = armv7m.Cortex()
+private var limit: armv8m.StackLimit = armv8m.StackLimit()
 private var stack_sender: [512]u32 = [0; 512]
 private var stack_receiver: [512]u32 = [0; 512]
+private var stack_deep: [128]u32 = [0; 128]
 private var stack_idle: [128]u32 = [0; 128]
 private var received: Semaphore = Semaphore(0, 1)
 
-// Run this core's sender and receiver.
+// Run this core's sender and receiver, with every stack held to its limit, and a task that overflows
+// its stack at once: the limit stops it, and the link test must still finish.
 run_link_test() -> never
     kernel.spawn(&cortex, stack_sender, &sender, 1, "sender")
     kernel.spawn(&cortex, stack_receiver, &receiver, 1, "receiver")
+    kernel.spawn(&cortex, stack_deep, &deep, 2, "deep")
+    kernel.protect(&limit)
     kernel.run(&cortex, stack_idle)
+
+// Push r0-r7 again and again, until the stack crosses its limit.
+extern "skiff_overflow" overflow() -> never
+
+private deep() -> never = overflow()
+
+asm
+    [thumb]
+        ".syntax unified"
+        ".text"
+        ".thumb_func"
+        ".globl skiff_overflow"
+        "skiff_overflow:"
+        "1: push {{r0-r7}}"
+        "b 1b"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the probe is Armv7-M assembly"
 
 private sender() -> never
     for n in 1u32..COUNT

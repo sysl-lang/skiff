@@ -13,9 +13,10 @@ import skiff.kernel.{Machine, write_hex}
 // **Most faults stop the machine**: the board reports through its console and halts, because only the
 // board knows what its console is.
 //
-// **A MemManage fault in a task stops only that task.** The MPU raised it (mpu.sysl), so the task broke
-// its protection — overflowed its stack or followed a null pointer — and nothing outside it has been
-// written. The board reports it naming the task, the kernel stops the task, and `fault_entry` answers a
+// **A MemManage fault in a task stops only that task**, and so does a UsageFault for a stack crossing
+// its limit (STKOF, which an Armv8-M core raises against PSPLIM: skiff.arch.armv8m). The MPU or the
+// limit raised it, so the task broke its protection — overflowed its stack or followed a null pointer —
+// and nothing outside it has been written. The board reports it naming the task, the kernel stops the task, and `fault_entry` answers a
 // new process stack: a fresh frame at the top of the stopped task's stack, since its own may be the very
 // memory that faulted. The entry returns into thread mode on that stack with BASEPRI cleared, and the
 // switch the kernel asked for happens at once, before the frame is ever unstacked: PendSV tail-chains
@@ -57,10 +58,11 @@ struct Fault
 // The board's fault handler: report `f` and stop. The board exports it under this name.
 extern "skiff_fault" board_fault(f: *Fault) -> never
 
-// The board's report of a task the MPU stopped, which returns. The board exports it under this name.
+// The board's report of a task its protection stopped, which returns. The board exports it under this name.
 extern "skiff_task_fault" board_task_fault(f: *Fault, task: *kernel.TaskInfo)
 
 private const MEMMANAGE: u32 = 4
+private const USAGEFAULT: u32 = 6
 private const EXC_RETURN_PSP: u32 = 1 << 2
 
 // FPCCR, whose LSPACT bit says a lazy save of the faulting task's FPU registers is still owed, to the
@@ -72,10 +74,13 @@ private const FPCCR_LSPACT: u32 = 1 << 0
 @export("skiff_fault_entry")
 fault_entry(frame: *u32, exception: u32, exc_return: u32) -> usize
     val s = scb()
-    if exception == MEMMANAGE && (exc_return & EXC_RETURN_PSP) != 0 && protection_on()
+    val guarded = exception == MEMMANAGE && protection_on()
+    val limited = exception == USAGEFAULT && (s.cfsr & CFSR_STKOF) != 0
+    if (exc_return & EXC_RETURN_PSP) != 0 && (guarded || limited)
         var task = kernel.running_task()
-        // A frame the processor could not push lies in the guard, and reading it would fault again.
-        val readable = usize(frame) >= stack_guard(task.stack) + STACK_GUARD_BYTES
+        // A frame the processor could not push lies in the guard, and reading it would fault again; one
+        // that would have crossed a stack limit was never pushed at all.
+        val readable = !limited && usize(frame) >= stack_guard(task.stack) + STACK_GUARD_BYTES
         var f = Fault(exception, if readable then frame[6] else 0, if readable then frame[5] else 0, s.cfsr, s.hfsr, s.mmfar, s.bfar)
         s.cfsr = s.cfsr       // the status bits clear when written with ones
         board_task_fault(&f, &task)
@@ -101,11 +106,11 @@ private stopped_task() -> never
     loop
         ()
 
-// Whether `f`, a MemManage fault in `task`, is its stack overflowing: the processor could not push a
-// frame, or the address that faulted is in the stack's guard.
+// Whether `f`, a fault that stopped `task`, is its stack overflowing: the stack crossed its limit, the
+// processor could not push a frame, or the address that faulted is in the stack's guard.
 stack_overflow(f: *Fault, task: *kernel.TaskInfo) -> bool
     val g = stack_guard(task.stack)
-    (f.cfsr & CFSR_MSTKERR) != 0 || ((f.cfsr & CFSR_MMARVALID) != 0 && f.mmfar >= u32(g) && f.mmfar < u32(g + STACK_GUARD_BYTES))
+    (f.cfsr & (CFSR_STKOF | CFSR_MSTKERR)) != 0 || ((f.cfsr & CFSR_MMARVALID) != 0 && f.mmfar >= u32(g) && f.mmfar < u32(g + STACK_GUARD_BYTES))
 
 // Write a task the MPU stopped to `m`'s console: `skiff: task <name> overflowed its stack`, or
 // `skiff: task <name> broke its memory protection`, then the fault's registers.

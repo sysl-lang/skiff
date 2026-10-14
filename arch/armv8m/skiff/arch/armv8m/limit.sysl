@@ -1,0 +1,35 @@
+module skiff.arch.armv8m
+
+import skiff.kernel.Protection
+
+// Stack limits as the kernel's `Protection`.
+//
+// An Armv8-M Mainline core checks every push to the process stack against PSPLIM: a push, or an
+// exception frame, that would put the stack pointer below it is not made, and the core raises a
+// UsageFault with STKOF instead. So the limit guards a stack whatever size of frame crosses it, needs no
+// MPU region and loses no memory to alignment. The kernel names the running task's stack on every
+// switch and the limit moves with it; the arch package's fault handler then stops the task that crossed
+// it (armv7m faults.sysl).
+//
+// **The limit sits `SWITCH_RESERVE` bytes above the stack's base.** The switch saves the rest of a
+// task's context below its stack pointer through an ordinary register, which the limit does not check:
+// r4-r11 and EXC_RETURN, and s16-s31 for a task that has used the FPU (armv7m context.sysl), 100 bytes
+// at most. A task stopped at its limit still leaves room for that. PSPLIM ignores its low three bits,
+// so the limit is rounded up to eight bytes.
+struct StackLimit
+end StackLimit
+
+// The most the switch writes below a task's stack pointer, rounded up to eight bytes.
+const SWITCH_RESERVE: usize = 104
+
+impl Protection for StackLimit
+    guard(*self, base: usize, bytes: usize)
+        val at = ((base + 7) & ~7usize) + SWITCH_RESERVE
+        if at >= base + bytes then panic("skiff: a task stack too small for its limit")
+        val limit = u32(at)
+        asm
+            [thumb]
+                "msr psplim, {limit}"
+                "isb"
+                in limit : reg
+            [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv8m is for Armv8-M cores"

@@ -1,0 +1,13 @@
+// Armv8-M Mainline (Cortex-M33, M35P, M55): what it adds to Armv7-M. Everything the two share — reset,
+// the vector table, the context switch, SysTick, the NVIC, fault reports — is the armv7m package's, which
+// a Mainline core runs unchanged; this package holds only what differs.
+
+package {
+  name    = "armv8m"
+  version = "0.0.1"
+}
+
+dependencies {
+  kernel { workspace = true }
+  armv7m { workspace = true }
+}

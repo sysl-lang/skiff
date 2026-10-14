@@ -35,6 +35,7 @@ private[armv7m]const SHCSR_USGFAULTENA: u32 = 1 << 18
 private[armv7m]const CFSR_MSTKERR: u32 = 1 << 4      // a MemManage fault pushing an exception frame
 private[armv7m]const CFSR_MMARVALID: u32 = 1 << 7
 private[armv7m]const CFSR_BFARVALID: u32 = 1 << 15
+private[armv7m]const CFSR_STKOF: u32 = 1 << 20       // Armv8-M: a stack crossed its limit register
 
 private[armv7m]struct SysTick
     csr: volatile u32           // 0xE000_E010 control and status

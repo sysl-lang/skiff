@@ -242,6 +242,9 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
 - **Proposed fix:** extend constant data to a `*Trait` coerced from a constant address (the address plus
   the impl's vtable symbol), and to a variant whose payload is constant data. Tests: the probe above
   builds for `thumbv7em-freestanding`, and both variables sit in `.data` with relocations.
+- **Status:** accepted by `sysl` as a bug for the release after alpha.12. Each part already folds (an
+  address of module storage, a variant with a payload since alpha.12), so the whole must too. It goes
+  in the same fix as finding 5, and ffi.md's "What constant data is" will name both forms.
 - **What skiff does:** nothing in place of it is a contortion. The link's rings differ by core, so the
   board builds the whole `Link` at start-up anyway, into storage declared with no initializer (which
   starts at its type's zero, modules.md). The finding stands for the next program whose wiring is known

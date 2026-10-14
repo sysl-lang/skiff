@@ -52,10 +52,12 @@ skiff: bfar 0xf0000000"
 # stops the machine with status 0 once both have received everything.
 an521_core0_expected="skiff: hello
 skiff: tick 3
+skiff: task deep overflowed its stack
 skiff: core 0 received 10000 of 10000 messages in order
 skiff: core 1 finished"
 an521_core1_expected="skiff: hello
 skiff: tick 3
+skiff: task deep overflowed its stack
 skiff: core 1 received 10000 of 10000 messages in order"
 
 failed=0

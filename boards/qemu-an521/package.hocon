@@ -10,5 +10,6 @@ package {
 dependencies {
   kernel { workspace = true }
   armv7m { workspace = true }
+  armv8m { workspace = true }
   an521 { workspace = true }
 }
