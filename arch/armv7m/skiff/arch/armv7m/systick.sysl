@@ -1,0 +1,22 @@
+module skiff.arch.armv7m
+
+import skiff.kernel
+
+// The kernel's tick on an Armv7-M core: SysTick, counting down on the processor clock and interrupting
+// each time it reaches zero.
+
+// Interrupt every `cycles` processor cycles from now on. SysTick's reload register holds 24 bits, so a
+// tick may be at most 2^24 cycles long (about 0.7 s at 25 MHz).
+systick_start(cycles: u32)
+    if cycles == 0 || cycles > 0x100_0000 then panic("skiff: a SysTick period outside 1 to 2^24 cycles")
+    val t = systick()
+    t.csr = 0
+    t.rvr = cycles - 1
+    t.cvr = 0
+    t.csr = CSR_ENABLE | CSR_TICKINT | CSR_CLKSOURCE
+
+// The SysTick exception. The processor has already saved the caller-saved registers, so an ordinary
+// function is a correct handler.
+@export("skiff_systick")
+systick_handler()
+    kernel.tick()

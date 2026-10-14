@@ -1,12 +1,45 @@
 module skiff.kernel
 
+import sysl.sync.{Atomic, Ordering}
+
 // The kernel's view of the machine under it. An arch package, a chip package and a board program
 // together implement it; the kernel itself knows nothing about the hardware beyond what this trait says.
 trait Machine
     // Write `bytes` to the console, waiting for room as long as it takes.
     write(*self, bytes: []const u8)
 
-// Bring the kernel up on `m` and answer the status the machine should stop with: 0 for success.
+    // Start the kernel's tick: from now on `tick()` is called `hz` times a second, from an interrupt.
+    start_ticks(*self, hz: u32)
+
+    // Wait until an interrupt has been taken. It may return early, so a caller re-checks what it waits
+    // for.
+    idle(*self)
+
+// How many times a second the kernel's tick comes.
+const TICK_HZ: u32 = 100
+
+// The ticks since `start_ticks`. Only the tick interrupt writes it, so a load and a store suffice: no
+// read-modify-write instruction is needed, which a Cortex-M0+ does not have.
+private var tick_count: Atomic[u32] = Atomic(0)
+
+// One tick, called by the machine's timer interrupt.
+tick()
+    tick_count.store(tick_count.load(Ordering.Relaxed) + 1, Ordering.Release)
+
+// The ticks so far.
+ticks() -> u32 = tick_count.load(Ordering.Acquire)
+
+// Bring the kernel up on `m`: greet, start the tick and see three ticks arrive. Answers the status the
+// machine should stop with: 0 for success.
 boot[M: Machine](m: *M) -> i32
     m.write("skiff: hello\n".bytes)
+    m.start_ticks(TICK_HZ)
+    var seen: u32 = 0
+    while seen < 3
+        m.idle()
+        while seen < 3 && seen < ticks()
+            seen += 1
+            m.write("skiff: tick ".bytes)
+            write_dec(m, seen)
+            m.write("\n".bytes)
     0

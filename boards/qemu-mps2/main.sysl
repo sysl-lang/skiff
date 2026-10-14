@@ -1,20 +1,81 @@
 // skiff on QEMU's MPS2 AN500 and AN386: the kernel over the armv7m arch package and the mps2 chip.
+//
+// After the kernel's boot, the board checks the parts of its hardware the kernel does not use yet: an
+// interrupt from the chip's own timer through the NVIC, and then a deliberate bus fault, which must be
+// reported and stop the machine with `armv7m.FAULT_STATUS`. So a passing run ends in that status, not 0.
+
+// Arm GNU's libgcc supplies the 64-bit divide the standard library's number formatting calls
+// (`__aeabi_uldivmod`), until the library supplies it itself (FINDINGS 2). The boot test puts the
+// toolchain's directory for this core and float ABI on LIBRARY_PATH.
+@link("gcc")
 
 import skiff.arch.armv7m
 import skiff.chip.mps2
 import skiff.kernel
 import skiff.kernel.Machine
 
-// The machine as the kernel sees it: the console is the chip's first UART.
+// The machine as the kernel sees it: the console is the chip's first UART, and the tick is SysTick on
+// the chip's clock.
 struct Board
 end Board
 
 impl Machine for Board
     write(*self, bytes: []const u8) = mps2.write(bytes)
+    start_ticks(*self, hz: u32) = armv7m.systick_start(mps2.CLOCK_HZ / hz)
+    idle(*self) = armv7m.wait_for_interrupt()
 
 // Called by the arch package's reset handler once there is a stack and `.bss` is zero.
 @export("skiff_main")
 skiff_main() -> never
+    armv7m.init()
     mps2.console_init()
     var board = Board()
-    armv7m.halt(kernel.boot(&board))
+    val status = kernel.boot(&board)
+    if status != 0 then armv7m.halt(status)
+    timer_interrupt(&board)
+    bus_fault(&board)
+
+// Timer 0 interrupts through the NVIC within half a second (at 1 kHz it should take a millisecond).
+private timer_interrupt(board: *Board)
+    mps2.timer0_start(mps2.CLOCK_HZ / 1000)
+    armv7m.enable_irq(mps2.TIMER0_IRQ)
+    val deadline = kernel.ticks() + kernel.TICK_HZ / 2
+    while mps2.timer0_fired() == 0
+        if kernel.ticks() > deadline
+            board.write("skiff: timer 0 never interrupted\n".bytes)
+            armv7m.halt(1)
+        board.idle()
+    armv7m.disable_irq(mps2.TIMER0_IRQ)
+    mps2.timer0_stop()
+    board.write("skiff: interrupt from timer 0\n".bytes)
+
+// A load from an address nothing answers: a precise BusFault, whose report names the address.
+private struct Reg
+    v: volatile u32
+
+private bus_fault(board: *Board) -> never
+    board.write("skiff: provoking a bus fault\n".bytes)
+    val nowhere: *Reg = ptr_cast(0xF000_0000usize)
+    val _ = nowhere.v
+    board.write("skiff: the bus fault was not taken\n".bytes)
+    armv7m.halt(1)
+
+// The standard library's `print` writes through C's `putchar`, and a freestanding image has no C library
+// to supply it, so the console does.
+@export("putchar")
+putchar(c: int) -> int
+    mps2.put_byte(u8(c & 0xff))
+    c
+
+// The standard library's `exit`, which `panic` ends in after printing its message: stop the machine
+// with that status.
+@export("exit")
+board_exit(code: int) -> never
+    armv7m.halt(i32(code))
+
+// The arch package's fault handler hands the fault here: report it on the console and stop.
+@export("skiff_fault")
+fault(f: *armv7m.Fault) -> never
+    var board = Board()
+    armv7m.report(f, &board)
+    armv7m.halt(armv7m.FAULT_STATUS)

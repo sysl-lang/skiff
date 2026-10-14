@@ -1,0 +1,47 @@
+module skiff.chip.mps2
+
+import sysl.sync.{Atomic, Ordering}
+
+// CMSDK APB timer 0, at 0x4000_0000 on interrupt 8: a 32-bit down-counter on the 25 MHz system clock
+// that interrupts each time it reaches zero and reloads.
+
+// The processor and peripheral clock of the AN500 and the AN386, as QEMU models them.
+const CLOCK_HZ: u32 = 25_000_000
+
+private struct Timer
+    ctrl: volatile u32          // 0x00 bit 0 enable, bit 3 interrupt enable
+    value: volatile u32         // 0x04
+    reload: volatile u32        // 0x08
+    intclear: volatile u32      // 0x0c read: interrupt status; write 1: clear
+
+private const TIMER0: usize = 0x4000_0000
+private const CTRL_ENABLE: u32 = 1 << 0
+private const CTRL_IRQ: u32 = 1 << 3
+
+private timer0() -> *Timer = ptr_cast(TIMER0)
+
+// Times timer 0 has interrupted since it was started. Only its handler writes it.
+private var fired: Atomic[u32] = Atomic(0)
+
+// Interrupt every `cycles` clock cycles from now on. The NVIC must let `TIMER0_IRQ` through as well.
+timer0_start(cycles: u32)
+    val t = timer0()
+    t.ctrl = 0
+    fired.store(0, Ordering.Release)
+    t.reload = cycles
+    t.value = cycles
+    t.intclear = 1
+    t.ctrl = CTRL_ENABLE | CTRL_IRQ
+
+timer0_stop()
+    timer0().ctrl = 0
+
+// Times timer 0 has interrupted since `timer0_start`.
+timer0_fired() -> u32 = fired.load(Ordering.Acquire)
+
+// Timer 0's interrupt. Its request stays raised until it is cleared here, so a handler that forgot would
+// be entered again the moment it returned.
+@export("skiff_mps2_timer0")
+timer0_handler()
+    timer0().intclear = 1
+    fired.store(fired.load(Ordering.Relaxed) + 1, Ordering.Release)

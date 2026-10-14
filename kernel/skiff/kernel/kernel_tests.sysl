@@ -1,13 +1,15 @@
 module skiff.kernel
 @tests
 
-// The kernel on the host, with a machine that only records what it was asked to do. Every boot test on a
-// board checks the same thing through a real console.
+// The kernel on the host, over a machine that records what it was asked to do. Its "interrupt" is
+// `idle` calling `tick()`, which is what a timer interrupt waking `wfi` amounts to. Every boot test on a
+// board checks the same things through a real console and a real timer.
 
-// A console that keeps what was written to it.
 private struct Recorder
-    bytes: [64]u8
+    bytes: [256]u8
     count: usize
+    hz: u32         // what start_ticks was asked for; 0 until then
+    idles: u32
 
 impl Machine for Recorder
     write(*self, bytes: []const u8)
@@ -15,11 +17,45 @@ impl Machine for Recorder
             self.bytes[self.count] = b
             self.count += 1
 
-@test("boot greets through the machine's console and answers success")
-boot_greets()
-    var r = Recorder([0; 64], 0)
+    start_ticks(*self, hz: u32)
+        self.hz = hz
+
+    idle(*self)
+        self.idles += 1
+        if self.hz != 0 then tick()
+
+private recorder() -> Recorder = Recorder([0; 256], 0, 0, 0)
+
+// Whether `r` recorded exactly `want`.
+private recorded(r: *Recorder, want: string) -> bool
+    val w = want.bytes
+    if r.count != w.len then return false
+    for i in 0..<w.len
+        if r.bytes[i] != w[i] then return false
+    true
+
+@test("boot greets, starts the tick at TICK_HZ, and counts three ticks as they come")
+boot_counts_three_ticks()
+    var r = recorder()
     assert_eq(boot(&r), 0)
-    val want = "skiff: hello\n".bytes
-    assert_eq(r.count, want.len)
-    for i in 0..<want.len
-        assert_eq(r.bytes[i], want[i])
+    assert_eq(r.hz, TICK_HZ)
+    assert(recorded(&r, "skiff: hello\nskiff: tick 1\nskiff: tick 2\nskiff: tick 3\n"),
+           "the console did not hold the greeting and three ticks")
+    assert_eq(r.idles, 3)
+
+@test("write_dec writes zero, one digit, and the largest u32")
+dec_digits()
+    var r = recorder()
+    write_dec(&r, 0)
+    write_dec(&r, 7)
+    write_dec(&r, 4294967295)
+    assert(recorded(&r, "074294967295"), "decimal digits")
+
+@test("write_hex writes eight digits whatever the value")
+hex_digits()
+    var r = recorder()
+    write_hex(&r, 0)
+    write_hex(&r, 0xf000_0000)
+    write_hex(&r, 0x0000_8200)
+    write_hex(&r, 0xdead_beef)
+    assert(recorded(&r, "0x000000000xf00000000x000082000xdeadbeef"), "hexadecimal digits")

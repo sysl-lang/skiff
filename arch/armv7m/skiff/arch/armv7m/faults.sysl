@@ -1,0 +1,84 @@
+module skiff.arch.armv7m
+
+import skiff.kernel.{Machine, write_hex}
+
+// Faults, and any exception skiff has no handler for yet, reported rather than hung on.
+//
+// `skiff_exception` is the vector table's entry for all of them. On entry the processor has pushed
+// r0-r3, r12, lr, pc and xPSR onto whichever stack was in use, and lr holds EXC_RETURN, whose bit 2
+// says which stack that was. The entry passes that frame and the exception number (IPSR) to
+// `fault_entry`. The exception's own registers (CFSR, HFSR and the two fault addresses) are read there.
+// The board then reports through its console and stops the machine, because only the board knows what
+// its console is.
+asm
+    [thumb]
+        ".syntax unified"
+        ".text"
+        ".thumb_func"
+        ".globl skiff_exception"
+        "skiff_exception:"
+        "tst lr, #4"
+        "ite eq"
+        "mrseq r0, msp"
+        "mrsne r0, psp"
+        "mrs r1, ipsr"
+        "b skiff_fault_entry"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+
+// What a fault left behind.
+struct Fault
+    exception: u32      // the exception number: 3 HardFault, 4 MemManage, 5 BusFault, 6 UsageFault
+    pc: u32             // where it was taken
+    lr: u32
+    cfsr: u32
+    hfsr: u32
+    mmfar: u32
+    bfar: u32
+
+// The board's fault handler: report `f` and stop. The board exports it under this name.
+extern "skiff_fault" board_fault(f: *Fault) -> never
+
+@export("skiff_fault_entry")
+fault_entry(frame: *u32, exception: u32) -> never
+    val s = scb()
+    var f = Fault(exception, frame[6], frame[5], s.cfsr, s.hfsr, s.mmfar, s.bfar)
+    board_fault(&f)
+
+// The exception's name, or "" for a number with none here.
+private exception_name(n: u32) -> string = n match
+    2 -> "NMI"
+    3 -> "HardFault"
+    4 -> "MemManage"
+    5 -> "BusFault"
+    6 -> "UsageFault"
+    11 -> "SVCall"
+    12 -> "DebugMonitor"
+    14 -> "PendSV"
+    _ -> ""
+
+// Write `f` to `m`'s console, one fact per line. A fault address is written only when CFSR says it is
+// valid.
+report[M: Machine](f: *Fault, m: *M)
+    val name = exception_name(f.exception)
+    if name.len > 0
+        m.write("skiff: fault ".bytes)
+        m.write(name.bytes)
+        m.write("\n".bytes)
+    else
+        m.write("skiff: unexpected exception ".bytes)
+        write_hex(m, f.exception)
+        m.write("\n".bytes)
+    labelled(m, "cfsr", f.cfsr)
+    labelled(m, "hfsr", f.hfsr)
+    if (f.cfsr & CFSR_MMARVALID) != 0 then labelled(m, "mmfar", f.mmfar)
+    if (f.cfsr & CFSR_BFARVALID) != 0 then labelled(m, "bfar", f.bfar)
+    labelled(m, "pc", f.pc)
+    labelled(m, "lr", f.lr)
+
+// One line: `skiff: <label> 0x<value>`.
+private labelled[M: Machine](m: *M, label: string, value: u32)
+    m.write("skiff: ".bytes)
+    m.write(label.bytes)
+    m.write(" ".bytes)
+    write_hex(m, value)
+    m.write("\n".bytes)

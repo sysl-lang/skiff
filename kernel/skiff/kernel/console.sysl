@@ -1,0 +1,28 @@
+module skiff.kernel
+
+// Numbers written to a machine's console, with no allocation: for boot messages and for fault reports,
+// which run when nothing else can be trusted.
+
+// Write `n` in decimal.
+write_dec[M: Machine](m: *M, n: u32)
+    var digits: [10]u8 = [0; 10]
+    var v = n
+    var i: usize = 10
+    loop
+        i -= 1
+        digits[i] = u8('0') + u8(v % 10)
+        v /= 10
+        if v == 0 then break
+    m.write(digits[i..<10])
+
+// Write `n` as `0x` and eight hexadecimal digits: how a register or an address is read.
+write_hex[M: Machine](m: *M, n: u32)
+    var digits: [10]u8 = [0; 10]
+    digits[0] = u8('0')
+    digits[1] = u8('x')
+    var shift: u32 = 28
+    for k in 2..<10
+        val d = u8((n >> shift) & 0xf)
+        digits[k] = if d < 10 then u8('0') + d else u8('a') + d - 10
+        if shift > 0 then shift -= 4
+    m.write(digits[0..<10])

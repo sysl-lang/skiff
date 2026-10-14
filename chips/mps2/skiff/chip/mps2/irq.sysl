@@ -1,0 +1,23 @@
+module skiff.chip.mps2
+
+// The MPS2's interrupts: the half of the vector table after the architecture's sixteen system words,
+// one word per interrupt in the chip's numbering. The board's link script places `.vectors.irq`
+// straight after the arch package's `.vectors`. Every interrupt skiff does not handle goes to the
+// arch package's `skiff_exception`, which reports it with its number rather than running off into
+// whatever follows a short table.
+
+const IRQ_COUNT: u32 = 32
+const TIMER0_IRQ: u32 = 8
+
+asm
+    [thumb]
+        ".section .vectors.irq, \"a\""
+        ".rept 8"
+        ".word skiff_exception"
+        ".endr"
+        ".word skiff_mps2_timer0"      // 8: CMSDK timer 0
+        ".rept 23"
+        ".word skiff_exception"
+        ".endr"
+        ".text"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.mps2 is an Arm chip"

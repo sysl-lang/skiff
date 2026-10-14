@@ -10,7 +10,8 @@ MEMORY {
 }
 
 SECTIONS {
-  .vectors : { KEEP(*(.vectors)) } > CODE
+  /* The architecture's sixteen words, then the chip's interrupts, in that order. */
+  .vectors : { KEEP(*(.vectors)) KEEP(*(.vectors.irq)) } > CODE
   .text    : { *(.text*) *(.rodata*) } > CODE
   .data    : { *(.data*) } > CODE
 

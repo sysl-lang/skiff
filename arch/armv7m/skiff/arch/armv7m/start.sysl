@@ -1,11 +1,15 @@
 module skiff.arch.armv7m
 
-// Reset, the vector table, faults and stopping, for every Armv7-M core.
+// Reset, the vector table's system half, and stopping, for every Armv7-M core.
 //
 // **The vector table.** Its first sixteen words are the architecture's: the initial stack pointer, the
-// reset handler, then the system exceptions. The chip's interrupts follow, and they belong to the chip
-// package. Every fault is sent to `skiff_fault` for now. Without a handler for each one, a fault
-// escalates to HardFault, and a HardFault with no vector locks the core up somewhere meaningless.
+// reset handler, then the system exceptions. The chip's interrupts follow in `.vectors.irq`, which
+// belongs to the chip package; the board's link script puts that section straight after this one.
+//   - Every fault and every system exception skiff does not use yet goes to `skiff_exception`
+//     (faults.sysl). It reads the exception number from IPSR, so one entry serves them all. Without a
+//     handler for each one, a fault escalates to HardFault, and a HardFault with no vector locks the
+//     core up somewhere meaningless.
+//   - SysTick goes to `skiff_systick` (systick.sysl): the kernel's tick.
 //
 // **Reset** runs with no stack set up, before any sysl code, so it is assembly at the top of the file.
 // A function might save a register on the stack before its first instruction.
@@ -18,27 +22,27 @@ module skiff.arch.armv7m
 //   - It calls `skiff_main`, which the board program exports.
 //
 // `.word _start`, not `_start + 1`: the linker already sets the Thumb bit on a `.thumb_func` symbol.
-// The section is opened in the assembly with its `"a"` flag: without the flag the linker treats the
-// table as non-allocated and places `.text` over it at address zero.
+// The section is opened in the assembly with its `"a"` flag: the assembler takes a section's flags from
+// its name, `.vectors` gets none, and an unallocated table has `.text` linked over it at address zero.
 asm
     [thumb]
         ".section .vectors, \"a\""
         ".word _stack_top"
         ".word _start"
-        ".word skiff_fault"         // NMI
-        ".word skiff_fault"         // HardFault
-        ".word skiff_fault"         // MemManage
-        ".word skiff_fault"         // BusFault
-        ".word skiff_fault"         // UsageFault
+        ".word skiff_exception"     // NMI
+        ".word skiff_exception"     // HardFault
+        ".word skiff_exception"     // MemManage
+        ".word skiff_exception"     // BusFault
+        ".word skiff_exception"     // UsageFault
         ".word 0"
         ".word 0"
         ".word 0"
         ".word 0"
-        ".word skiff_fault"         // SVCall
-        ".word skiff_fault"         // DebugMonitor
+        ".word skiff_exception"     // SVCall
+        ".word skiff_exception"     // DebugMonitor
         ".word 0"
-        ".word skiff_fault"         // PendSV
-        ".word skiff_fault"         // SysTick
+        ".word skiff_exception"     // PendSV
+        ".word skiff_systick"       // SysTick
         ".text"
     [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
 
@@ -65,30 +69,21 @@ asm
         "b 1b"
         "2: bl skiff_main"
         "3: b 3b"
-        ".thumb_func"
-        ".globl skiff_fault"
-        "skiff_fault:"
-        "ldr r1, =skiff_fault_exit"
-        "movs r0, #0x20"
-        "bkpt 0xab"
-        "4: b 4b"
         ".ltorg"
-        ".section .rodata"
-        ".align 2"
-        "skiff_fault_exit:"
-        ".word 0x20026"
-        ".word 99"
-        ".text"
     [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
 
 // The status a fault stops the machine with. Nothing else uses it, so a test that reads it knows the
 // board faulted rather than finished.
 const FAULT_STATUS: i32 = 99
 
+// Make the core ready for the kernel: MemManage, BusFault and UsageFault each get their own handler
+// instead of escalating to HardFault, so a report names the fault that happened.
+init()
+    scb().shcsr = scb().shcsr | SHCSR_MEMFAULTENA | SHCSR_BUSFAULTENA | SHCSR_USGFAULTENA
+
 // Stop the machine with `code`, through Arm semihosting: a debugger, or QEMU with semihosting on, ends
 // the run with that status. SYS_EXIT_EXTENDED (0x20) carries the code. Plain SYS_EXIT (0x18) on AArch32
 // always reports zero. ADP_Stopped_ApplicationExit (0x20026) says the program ran to completion.
-// With no debugger attached, `bkpt` is a fault, and the fault handler stops the same way.
 halt(code: i32) -> never
     var block: [2]u32 = [0x20026, u32(code)]
     val op: u32 = 0x20
@@ -101,3 +96,10 @@ halt(code: i32) -> never
         [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
     loop
         ()
+
+// Sleep until an interrupt is pending. It returns at once if one already is, so a caller that checks
+// its condition and then waits loses no wake-up.
+wait_for_interrupt()
+    asm
+        [thumb] "wfi"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"

@@ -1,8 +1,8 @@
 #!/bin/sh
 # skiff's boot test: build each QEMU board image and boot it on every machine it serves. A boot passes
-# only if its output has the expected lines, in order, and QEMU exits with status 0 (the machine
-# stopped through semihosting with success). A fault stops it with 99; a hang is killed by PID after
-# SKIFF_TIMEOUT seconds (QEMU ignores SIGALRM, so the watchdog kills it).
+# only if its output has the expected lines, in order, and QEMU exits with the expected status (the
+# machine stops itself through semihosting). A hang is killed by PID after SKIFF_TIMEOUT seconds
+# (QEMU ignores SIGALRM, so the watchdog kills it).
 #
 #   SKIFF_SYSL      the compiler (default: sysl)
 #   SKIFF_OPT       passed to the build (e.g. -O0)
@@ -16,8 +16,19 @@ limit=${SKIFF_TIMEOUT:-10}
 scratch="$root/scratch"
 mkdir -p "$scratch"
 
-# The lines every boot must print, in this order.
-expected="skiff: hello"
+# The lines every boot must print, in this order. The run ends in a deliberate bus fault, so a boot
+# that passes stops with the fault status (armv7m.FAULT_STATUS), and its report must name the fault
+# and the address.
+expected="skiff: hello
+skiff: tick 1
+skiff: tick 2
+skiff: tick 3
+skiff: interrupt from timer 0
+skiff: provoking a bus fault
+skiff: fault BusFault
+skiff: cfsr 0x00008200
+skiff: bfar 0xf0000000"
+expected_status=99
 
 failed=0
 
@@ -59,13 +70,23 @@ boot() {
     if [ -n "$missing" ]; then
         echo "FAIL $machine: missing \"$missing\" (exit $code, ${took}s); log $log"
         failed=1
-    elif [ "$code" -ne 0 ]; then
-        echo "FAIL $machine: QEMU exited $code (${took}s); log $log"
+    elif [ "$code" -ne "$expected_status" ]; then
+        echo "FAIL $machine: QEMU exited $code, not $expected_status (${took}s); log $log"
         failed=1
     else
         echo "PASS $machine (${took}s)"
     fi
 }
+
+# Arm GNU's libgcc for this core and float ABI, which the board links until the standard library
+# supplies the 64-bit divide itself (FINDINGS 2).
+libgcc=$(arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16 -print-libgcc-file-name)
+if [ ! -f "$libgcc" ]; then
+    echo "FAIL: no Arm GNU libgcc (arm-none-eabi-gcc) for thumbv7em hard-float"
+    exit 1
+fi
+SYSL_EXTRA_CFLAGS="-L$(dirname "$libgcc")"
+export SYSL_EXTRA_CFLAGS
 
 image="$scratch/qemu-mps2.elf"
 if ! "$compiler" build $opt --target thumbv7em-freestanding -o "$image" "$root/boards/qemu-mps2"; then

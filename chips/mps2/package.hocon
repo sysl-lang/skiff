@@ -5,3 +5,8 @@ package {
   name    = "mps2"
   version = "0.0.1"
 }
+
+// Its vector table's interrupt half sends unhandled interrupts to the arch package's handler.
+dependencies {
+  armv7m { workspace = true }
+}

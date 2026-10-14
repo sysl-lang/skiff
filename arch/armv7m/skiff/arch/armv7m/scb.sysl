@@ -1,0 +1,71 @@
+module skiff.arch.armv7m
+
+// The System Control Block, the SysTick timer and the NVIC: the registers every Armv7-M core has at the
+// same addresses (Armv7-M Architecture Reference Manual, B3.2-B3.4). The register blocks are private to
+// the module: the rest of skiff reaches them through the functions here and in its sibling files.
+
+private[armv7m]struct Scb
+    cpuid: volatile u32         // 0xE000_ED00
+    icsr: volatile u32          // 0x04
+    vtor: volatile u32          // 0x08
+    aircr: volatile u32         // 0x0c
+    scr: volatile u32           // 0x10
+    ccr: volatile u32           // 0x14
+    shpr1: volatile u32         // 0x18
+    shpr2: volatile u32         // 0x1c
+    shpr3: volatile u32         // 0x20
+    shcsr: volatile u32         // 0x24 system handler control and state
+    cfsr: volatile u32          // 0x28 configurable fault status: MMFSR, BFSR, UFSR
+    hfsr: volatile u32          // 0x2c HardFault status
+    dfsr: volatile u32          // 0x30
+    mmfar: volatile u32         // 0x34 MemManage fault address, when CFSR.MMARVALID
+    bfar: volatile u32          // 0x38 BusFault address, when CFSR.BFARVALID
+
+@assert(offsetof(Scb, shcsr) == 0x24, "SHCSR is at 0xE000ED24")
+@assert(offsetof(Scb, bfar) == 0x38, "BFAR is at 0xE000ED38")
+
+private[armv7m]const SCB: usize = 0xE000_ED00
+private[armv7m]scb() -> *Scb = ptr_cast(SCB)
+
+private[armv7m]const SHCSR_MEMFAULTENA: u32 = 1 << 16
+private[armv7m]const SHCSR_BUSFAULTENA: u32 = 1 << 17
+private[armv7m]const SHCSR_USGFAULTENA: u32 = 1 << 18
+
+// CFSR bits a report reads.
+private[armv7m]const CFSR_MMARVALID: u32 = 1 << 7
+private[armv7m]const CFSR_BFARVALID: u32 = 1 << 15
+
+private[armv7m]struct SysTick
+    csr: volatile u32           // 0xE000_E010 control and status
+    rvr: volatile u32           // 0x14 reload value
+    cvr: volatile u32           // 0x18 current value
+    calib: volatile u32         // 0x1c
+
+private[armv7m]const SYSTICK: usize = 0xE000_E010
+private[armv7m]systick() -> *SysTick = ptr_cast(SYSTICK)
+
+private[armv7m]const CSR_ENABLE: u32 = 1 << 0
+private[armv7m]const CSR_TICKINT: u32 = 1 << 1
+private[armv7m]const CSR_CLKSOURCE: u32 = 1 << 2      // the processor clock, not the external reference
+
+// One NVIC register: each of ISER, ICER and ICPR is an array of these, one bit per interrupt.
+private[armv7m]struct Reg
+    v: volatile u32
+
+private[armv7m]const NVIC_ISER: usize = 0xE000_E100    // set-enable
+private[armv7m]const NVIC_ICER: usize = 0xE000_E180    // clear-enable
+private[armv7m]const NVIC_ICPR: usize = 0xE000_E280    // clear-pending
+
+// The NVIC register in the array at `base` that holds interrupt `irq`'s bit.
+private[armv7m]nvic_reg(base: usize, irq: u32) -> *Reg = ptr_cast(base + 4 * usize(irq / 32))
+private[armv7m]nvic_bit(irq: u32) -> u32 = 1 << (irq % 32)
+
+// Let interrupt `irq` (the chip's number, counted from 0 after the sixteen system exceptions) through,
+// discarding any request left pending from before.
+enable_irq(irq: u32)
+    nvic_reg(NVIC_ICPR, irq).v = nvic_bit(irq)
+    nvic_reg(NVIC_ISER, irq).v = nvic_bit(irq)
+
+// Stop interrupt `irq` from being taken; a request stays pending until it is enabled or cleared.
+disable_irq(irq: u32)
+    nvic_reg(NVIC_ICER, irq).v = nvic_bit(irq)
