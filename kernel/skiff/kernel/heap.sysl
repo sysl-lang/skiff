@@ -1,0 +1,103 @@
+module skiff.kernel
+
+import sysl.slices.align_up
+
+// A heap: blocks of any size carved from one region of memory the board gives it. It is optional — a
+// program that needs only fixed-size blocks uses a `Pool` and never sets a heap up.
+//
+// The region is a run of blocks laid end to end, each starting with a header word that holds its size
+// in bytes (header included, a multiple of `HEAP_ALIGN`) and, in its lowest bit, whether it is in use.
+// `alloc` takes the first free block big enough, merging each free block with the free blocks after it
+// as it passes, and splits off what it does not need. `release` marks a block free and merges it with
+// the free blocks after it. Every block a caller gets starts on a `HEAP_ALIGN` boundary.
+//
+// Both walk the blocks, so their time grows with how many there are: a heap suits allocations made at
+// start-up or outside a task's deadline. A block given back is checked against the walk, so one not
+// from this heap or given back twice stops the program.
+struct Heap
+    base: usize         // the first block's header; 0 until `init`
+    bytes: usize
+
+    // Lay the heap over `region`, as one free block. Anything the heap held before is forgotten.
+    init(*self, region: []u8)
+        val start = usize(align_up(&region[0], HEAP_ALIGN))
+        val end = usize(&region[0]) + region.len
+        if end < start + 2 * HEAP_ALIGN then panic("skiff: a heap region too small for one block")
+        self.base = start
+        self.bytes = (end - start) & ~(HEAP_ALIGN - 1)
+        header(start).v = self.bytes
+
+    // `count` bytes, or `None` when no free block is big enough. A request for none answers `None`
+    // too, since an empty block could not be given back.
+    alloc(*self, count: usize) -> Option[[]u8]
+        if count == 0 || count > self.bytes then return None
+        val need = (count + HEAP_HEADER + HEAP_ALIGN - 1) & ~(HEAP_ALIGN - 1)
+        val state = enter()
+        var at = self.base
+        while at < self.base + self.bytes
+            val size = self.merge_after(at)
+            if (header(at).v & BLOCK_USED) == 0 && size >= need
+                if size - need >= 2 * HEAP_ALIGN
+                    header(at + need).v = size - need
+                    header(at).v = need | BLOCK_USED
+                else
+                    header(at).v = size | BLOCK_USED
+                leave(state)
+                val p: *u8 = ptr_cast(at + HEAP_HEADER)
+                return Some(p[0..<count])
+            at += size
+        leave(state)
+        None
+
+    // Give back `block`, which this heap's `alloc` handed out and nobody has given back since.
+    release(*self, block: []u8)
+        val wanted = usize(&block[0]) - HEAP_HEADER
+        val state = enter()
+        var at = self.base
+        while at < self.base + self.bytes && at < wanted
+            at += header(at).v & ~BLOCK_USED
+        if at != wanted || at >= self.base + self.bytes
+            leave(state)
+            panic("skiff: a block given back to a heap it is not from")
+        if (header(at).v & BLOCK_USED) == 0
+            leave(state)
+            panic("skiff: a heap block given back twice")
+        header(at).v = header(at).v & ~BLOCK_USED
+        val _ = self.merge_after(at)
+        leave(state)
+
+    // The size of the largest free block a caller could have, merging free blocks as it goes. Once
+    // everything is given back it is the whole region less one header.
+    largest(*self) -> usize
+        val state = enter()
+        var best: usize = 0
+        var at = self.base
+        while at < self.base + self.bytes
+            val size = self.merge_after(at)
+            if (header(at).v & BLOCK_USED) == 0 && size - HEAP_HEADER > best
+                best = size - HEAP_HEADER
+            at += size
+        leave(state)
+        best
+
+    // If the block at `at` is free, merge every free block that follows it into it. Answers its size.
+    private merge_after(*self, at: usize) -> usize
+        var size = header(at).v & ~BLOCK_USED
+        if (header(at).v & BLOCK_USED) != 0 then return size
+        while at + size < self.base + self.bytes && (header(at + size).v & BLOCK_USED) == 0
+            size += header(at + size).v
+        header(at).v = size
+        size
+
+// The boundary every block starts on, and so every address `alloc` answers.
+const HEAP_ALIGN: usize = 8
+
+// The header word takes a whole `HEAP_ALIGN`, so that what follows it is aligned too.
+private const HEAP_HEADER: usize = HEAP_ALIGN
+
+private const BLOCK_USED: usize = 1
+
+private struct Header
+    v: usize
+
+private header(at: usize) -> *Header = ptr_cast(at)

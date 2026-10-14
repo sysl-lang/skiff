@@ -1,0 +1,46 @@
+module skiff.kernel
+
+// A pool: `N` blocks of one type in static storage, handed out one at a time and given back whole.
+//
+// Every block is the same size, so there is no fragmentation, and taking one or giving one back costs a
+// bounded amount of time: what a real-time task can afford where a general heap is too slow or too
+// unpredictable. A block given back is checked: one from another pool, one not at a block's start or one
+// already given back stops the program, since each is a bug that would otherwise hand the same memory
+// to two owners.
+//
+// Its storage folds, so a pool can be module storage on a bare-metal image:
+// `Pool([Message(0); 8], [false; 8], 8)`.
+struct Pool[T, const N: usize]
+    blocks: [N]T
+    used: [N]bool
+    left: usize         // blocks not handed out
+
+    // A block, or `None` when every one is out. Its contents are whatever its last owner left.
+    alloc(*self) -> Option[*T]
+        val state = enter()
+        for i in 0..<N
+            if !self.used[i]
+                self.used[i] = true
+                self.left -= 1
+                leave(state)
+                return Some(&self.blocks[i])
+        leave(state)
+        None
+
+    // Give back `block`, which this pool's `alloc` handed out and nobody has given back since.
+    release(*self, block: *T)
+        val first = usize(&self.blocks[0])
+        val at = usize(block)
+        if at < first || (at - first) % sizeof(T) != 0 || (at - first) / sizeof(T) >= N
+            panic("skiff: a block given back to a pool it is not from")
+        val i = (at - first) / sizeof(T)
+        val state = enter()
+        if !self.used[i]
+            leave(state)
+            panic("skiff: a pool block given back twice")
+        self.used[i] = false
+        self.left += 1
+        leave(state)
+
+    // How many blocks are not handed out.
+    available(*self) -> usize = self.left

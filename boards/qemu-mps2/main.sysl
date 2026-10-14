@@ -39,6 +39,12 @@ putchar(c: int) -> int
 board_exit(code: int) -> never
     armv7m.halt(i32(code))
 
+// A task the MPU stopped: report it on the console. The kernel runs the other tasks on.
+@export("skiff_task_fault")
+task_fault(f: *armv7m.Fault, task: *kernel.TaskInfo)
+    var b = Board()
+    armv7m.report_task_fault(f, task, &b)
+
 // The arch package's fault handler hands the fault here: report it on the console and stop.
 @export("skiff_fault")
 fault(f: *armv7m.Fault) -> never

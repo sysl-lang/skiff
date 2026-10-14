@@ -1,0 +1,94 @@
+module skiff.arch.armv7m
+
+import sysl.slices.align_up
+import skiff.kernel.Protection
+
+// The Armv7-M memory protection unit (PMSAv7, Architecture Reference Manual B3.5) as the kernel's
+// `Protection`.
+//
+// Tasks run privileged, and the MPU runs with PRIVDEFENA set, so privileged code sees the default
+// memory map wherever no region says otherwise. Two regions say otherwise, and both forbid every
+// access, privileged or not:
+//   - **The null guard**, region 0: the first `NULL_GUARD_BYTES` of the address space, so that a read
+//     or write through a null pointer, or a small offset from one, faults. The processor reads the
+//     vector table through the default memory map, not the MPU's regions, so the table may live there,
+//     as it does on QEMU's MPS2 boards.
+//   - **The stack guard**, region 1: `STACK_GUARD_BYTES` at the bottom of the running task's stack,
+//     moved on every switch. A region must be aligned to its size, so the guard starts at the first
+//     such boundary in the stack, and the task has what lies above it.
+//
+// A frame bigger than the guard can step over it, so a task whose functions keep large arrays on the
+// stack can still write below its stack unseen. The guard catches a push, a call or an exception frame
+// that runs off the end, which is how a stack almost always overflows.
+private[armv7m] struct Mpu
+    kind: volatile u32          // 0xE000_ED90 MPU_TYPE: how many regions
+    ctrl: volatile u32          // 0x94
+    rnr: volatile u32           // 0x98 region number
+    rbar: volatile u32          // 0x9c region base address
+    rasr: volatile u32          // 0xa0 region attributes and size
+
+@assert(offsetof(Mpu, rasr) == 0x10, "MPU_RASR is at 0xE000EDA0")
+
+private const MPU: usize = 0xE000_ED90
+private mpu() -> *Mpu = ptr_cast(MPU)
+
+private const CTRL_ENABLE: u32 = 1 << 0
+private const CTRL_PRIVDEFENA: u32 = 1 << 2
+
+private const RBAR_VALID: u32 = 1 << 4      // take the region number from RBAR's low bits
+private const RASR_ENABLE: u32 = 1 << 0
+private const RASR_XN: u32 = 1 << 28        // never execute
+// AP = 0b000 in bits 24-26: no access at all, which is what both guards want.
+
+private const NULL_REGION: u32 = 0
+private const STACK_REGION: u32 = 1
+
+// How much of the address space from zero faults on any access.
+const NULL_GUARD_BYTES: usize = 256
+
+// How much of the bottom of a task's stack faults on any access.
+const STACK_GUARD_BYTES: usize = 64
+
+// RASR's SIZE field for a region of `bytes`, a power of two of at least 32: the region is
+// 2^(SIZE + 1) bytes.
+private size_field(bytes: usize) -> u32
+    var log: u32 = 0
+    while (1usize << log) < bytes
+        log += 1
+    (log - 1) << 1
+
+// Where a stack starting at `stack` has its guard.
+private[armv7m] stack_guard(stack: usize) -> usize
+    val p: *u8 = ptr_cast(stack)
+    usize(align_up(p, STACK_GUARD_BYTES))
+
+// The core's MPU as the kernel's protection.
+struct Protector
+end Protector
+
+impl Protection for Protector
+    guard(*self, base: usize, bytes: usize)
+        val g = stack_guard(base)
+        if g + STACK_GUARD_BYTES > base + bytes then panic("skiff: a task stack too small for its guard")
+        val m = mpu()
+        m.rbar = u32(g) | RBAR_VALID | STACK_REGION
+        m.rasr = RASR_XN | size_field(STACK_GUARD_BYTES) | RASR_ENABLE
+
+// Turn the MPU on with the null guard, and an empty stack guard until the first task runs. Call before
+// `kernel.run`, with `kernel.protect(&protector)`.
+enable_protection()
+    val m = mpu()
+    if ((m.kind >> 8) & 0xff) < 2 then panic("skiff: this core's MPU has fewer than two regions")
+    m.rbar = RBAR_VALID | NULL_REGION
+    m.rasr = RASR_XN | size_field(NULL_GUARD_BYTES) | RASR_ENABLE
+    m.rnr = STACK_REGION
+    m.rasr = 0
+    m.ctrl = CTRL_PRIVDEFENA | CTRL_ENABLE
+    asm
+        [thumb]
+            "dsb"
+            "isb"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+
+// Whether the MPU is on.
+private[armv7m] protection_on() -> bool = (mpu().ctrl & CTRL_ENABLE) != 0

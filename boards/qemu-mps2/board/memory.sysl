@@ -1,0 +1,147 @@
+module board
+
+import sysl.sync.Atomic
+import skiff.arch.armv7m
+import skiff.kernel
+import skiff.kernel.{Heap, Machine, Pool}
+
+// The memory scenarios, after waits.sysl's have finished.
+//   - Tick 110, a task overflows its stack: it pushes until it runs into its guard. The MPU stops it,
+//     the report names it, and every other task runs on.
+//   - Tick 112, a task reads through a null pointer. The MPU's null guard stops it the same way.
+//   - Tick 114, two tasks share a pool of four blocks, each taking two at a time and giving them back
+//     a hundred times, yielding in between so that they interleave. Then one task carves a heap into
+//     blocks of different sizes and gives them back out of order. The pool must end with all four
+//     blocks and the heap with one block as big as it began.
+//   - Tick 120, a last task checks that both faulting tasks were stopped while it kept running, and
+//     provokes the bus fault that ends the run.
+
+private var stack_overflow: [128]u32 = [0; 128]
+private var stack_null: [128]u32 = [0; 128]
+private var stack_pool_a: [256]u32 = [0; 256]
+private var stack_pool_b: [256]u32 = [0; 256]
+private var stack_last: [256]u32 = [0; 256]
+
+spawn_memory(cortex: *armv7m.Cortex)
+    kernel.spawn(cortex, stack_overflow, &task_overflow, 2, "deep")
+    kernel.spawn(cortex, stack_null, &task_null, 2, "null")
+    kernel.spawn(cortex, stack_pool_a, &task_pool_a, 2, "pool A")
+    kernel.spawn(cortex, stack_pool_b, &task_pool_b, 2, "pool B")
+    kernel.spawn(cortex, stack_last, &task_last, 3, "last")
+
+// Push r0-r7 again and again, until the stack runs into its guard.
+extern "skiff_overflow" overflow() -> never
+
+// Load a word from address 0.
+extern "skiff_load_null" load_null() -> u32
+
+private var deep_index: Atomic[u32] = Atomic(0)
+private var null_index: Atomic[u32] = Atomic(0)
+
+private task_overflow() -> never
+    deep_index.store(u32(kernel.running_task().index))
+    kernel.sleep_until(epoch + 110)
+    overflow()
+
+private task_null() -> never
+    null_index.store(u32(kernel.running_task().index))
+    kernel.sleep_until(epoch + 112)
+    val _ = load_null()
+    say("skiff: a load through a null pointer was not stopped\n")
+    kernel.sleep_forever()
+
+// A pool and a heap.
+
+struct Block
+    words: [4]u32
+
+private var blocks: Pool[Block, 4] = Pool([Block([0; 4]); 4], [false; 4], 4)
+private var pool_done: Atomic[u32] = Atomic(0)
+private var pool_misses: Atomic[u32] = Atomic(0)
+
+private task_pool_a() -> never = share_pool(0xa)
+private task_pool_b() -> never = share_pool(0xb)
+
+// Take two blocks, mark them as this task's, yield, check nobody else wrote them, give them back. The
+// second task to finish checks the pool and the heap.
+private share_pool(mark: u32) -> never
+    kernel.sleep_until(epoch + 114)
+    for _ in 0..<100
+        val first = blocks.alloc()
+        val second = blocks.alloc()
+        first match
+            Some(b) -> b.words[0] = mark
+            None -> val _ = pool_misses.add(1)
+        second match
+            Some(b) -> b.words[0] = mark
+            None -> val _ = pool_misses.add(1)
+        kernel.yield_now()
+        first match
+            Some(b) ->
+                if b.words[0] != mark then val _ = pool_misses.add(1)
+                blocks.release(b)
+            None -> ()
+        second match
+            Some(b) ->
+                if b.words[0] != mark then val _ = pool_misses.add(1)
+                blocks.release(b)
+            None -> ()
+    if pool_done.add(1) == 1
+        if blocks.available() == 4 && pool_misses.load() == 0
+            say("skiff: a pool of four came back whole after 400 allocations\n")
+        else
+            var board = Board()
+            board.write("skiff: the pool has ".bytes)
+            kernel.write_dec(&board, u32(blocks.available()))
+            board.write(" of 4 blocks, ".bytes)
+            kernel.write_dec(&board, pool_misses.load())
+            board.write(" misses\n".bytes)
+        check_heap()
+    kernel.sleep_forever()
+
+private var heap: Heap = Heap(0, 0)
+private var arena: [1024]u8 = [0; 1024]
+
+// Carve the heap into six blocks of different sizes, give them back out of order, and check that it
+// is one block as big as when it started.
+private check_heap()
+    heap.init(arena)
+    val whole = heap.largest()
+    var parts: [6][]u8 = [[]; 6]
+    var carved = true
+    for i in 0usize..<6
+        heap.alloc(24 + 40 * i) match
+            Some(b) -> parts[i] = b
+            None -> carved = false
+    for i in [4, 1, 5, 0, 2, 3]
+        if parts[i].len > 0 then heap.release(parts[i])
+    if carved && heap.largest() == whole
+        say("skiff: a heap carved six ways came back whole\n")
+    else
+        say("skiff: the heap did not come back whole\n")
+
+private task_last() -> never
+    var board = Board()
+    kernel.sleep_until(epoch + 120)
+    if kernel.stopped(usize(deep_index.load())) && kernel.stopped(usize(null_index.load()))
+        say("skiff: both faulting tasks were stopped, and the rest ran on\n")
+    else
+        say("skiff: a faulting task was not stopped\n")
+    bus_fault(&board)
+
+asm
+    [thumb]
+        ".syntax unified"
+        ".text"
+        ".thumb_func"
+        ".globl skiff_overflow"
+        "skiff_overflow:"
+        "1: push {{r0-r7}}"
+        "b 1b"
+        ".thumb_func"
+        ".globl skiff_load_null"
+        "skiff_load_null:"
+        "movs r1, #0"
+        "ldr r0, [r1]"
+        "bx lr"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the probes are Armv7-M assembly"

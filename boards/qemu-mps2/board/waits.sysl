@@ -16,7 +16,7 @@ import skiff.kernel.{Flags, FOREVER, Machine, Mutex, NO_OWNER, Queue, Semaphore}
 //     task are measured.
 //   - Tick 90, a queue of two that a producer sends 1 to 5 through, waiting whenever it is full.
 //   - Tick 100, event flags: a task waits for two bits that another sets two ticks apart, and must
-//     wake on the second, not the first. It then provokes the bus fault that ends the run.
+//     wake on the second, not the first.
 
 private var stack_low: [256]u32 = [0; 256]
 private var stack_mid: [256]u32 = [0; 256]
@@ -28,14 +28,14 @@ private var stack_flag_wait: [256]u32 = [0; 256]
 private var stack_flag_set: [256]u32 = [0; 256]
 
 spawn_waits(cortex: *armv7m.Cortex)
-    kernel.spawn(cortex, stack_low, &task_low, 1)
-    kernel.spawn(cortex, stack_mid, &task_mid, 2)
-    kernel.spawn(cortex, stack_high, &task_high, 3)
-    kernel.spawn(cortex, stack_timer, &task_timer, 3)
-    kernel.spawn(cortex, stack_producer, &task_producer, 2)
-    kernel.spawn(cortex, stack_consumer, &task_consumer, 2)
-    kernel.spawn(cortex, stack_flag_wait, &task_flag_wait, 3)
-    kernel.spawn(cortex, stack_flag_set, &task_flag_set, 2)
+    kernel.spawn(cortex, stack_low, &task_low, 1, "low")
+    kernel.spawn(cortex, stack_mid, &task_mid, 2, "middle")
+    kernel.spawn(cortex, stack_high, &task_high, 3, "high")
+    kernel.spawn(cortex, stack_timer, &task_timer, 3, "timer")
+    kernel.spawn(cortex, stack_producer, &task_producer, 2, "producer")
+    kernel.spawn(cortex, stack_consumer, &task_consumer, 2, "consumer")
+    kernel.spawn(cortex, stack_flag_wait, &task_flag_wait, 3, "flag wait")
+    kernel.spawn(cortex, stack_flag_set, &task_flag_set, 2, "flag set")
 
 // Work for `ticks` ticks without blocking or yielding.
 private busy(ticks: u32)
@@ -43,7 +43,7 @@ private busy(ticks: u32)
     while kernel.ticks() - start < ticks
         ()
 
-private say(line: string)
+private[board] say(line: string)
     var board = Board()
     board.write(line.bytes)
 
@@ -164,7 +164,7 @@ private task_flag_wait() -> never
         board.write(" at step ".bytes)
         kernel.write_dec(&board, step.load())
         board.write("\n".bytes)
-    bus_fault(&board)
+    kernel.sleep_forever()
 
 private task_flag_set() -> never
     kernel.sleep_until(epoch + 101)

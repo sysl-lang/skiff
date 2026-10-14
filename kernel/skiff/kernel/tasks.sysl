@@ -33,8 +33,15 @@ trait Port
     // Wait for an interrupt; the idle task's whole body.
     idle(*self)
 
+// What the kernel needs from a memory protection unit. Before a task runs, the kernel names its stack,
+// and the unit makes the memory just below what the task may use fault on any access, so that a task
+// overflowing its stack is stopped at the edge instead of writing over whatever lies beneath.
+trait Protection
+    // Guard the bottom of the stack at `base`, `bytes` long, for the task about to run.
+    guard(*self, base: usize, bytes: usize)
+
 // How many tasks the table holds, the idle task included.
-const MAX_TASKS: usize = 16
+const MAX_TASKS: usize = 24
 
 // The idle task's priority; every other task's must be higher.
 const IDLE_PRIORITY: u8 = 0
@@ -45,8 +52,12 @@ const FOREVER: u32 = 0xffff_ffff
 enum TaskState
     Ready
     Blocked
+    Stopped             // for good: it faulted, and never runs again
 
 struct Task
+    name: string
+    stack: usize        // the address of the bottom of its stack
+    stack_bytes: usize
     sp: usize           // saved while the task is not running
     priority: u8        // what the scheduler compares: `base`, or higher while it holds a mutex wanted
     base: u8            // the priority it was given
@@ -61,7 +72,7 @@ struct Task
     got: u32            // the flags that ended its wait
 
 // An unused row of the table.
-val NO_TASK: Task = Task(0, 0, 0, TaskState.Ready, 0, false, 0, false, 0, 0, false, 0)
+val NO_TASK: Task = Task("", 0, 0, 0, 0, 0, TaskState.Ready, 0, false, 0, false, 0, 0, false, 0)
 
 // The table and the choices made over it. It holds no hardware state, so the host tests drive one
 // directly; the kernel keeps one of its own, `scheduler`.
@@ -135,6 +146,13 @@ struct Scheduler
     blocked_on(*self, i: usize, on: usize) -> bool
         self.tasks[i].state == TaskState.Blocked && self.tasks[i].on == on && on != 0
 
+    // Stop the running task for good. It is never chosen again, and a switch is wanted.
+    stop_running(*self)
+        val t = &self.tasks[self.running]
+        t.state = TaskState.Stopped
+        t.on = 0
+        t.timed = false
+
     // Make blocked task `i` ready: what it waited for has happened.
     wake(*self, i: usize)
         val t = &self.tasks[i]
@@ -184,24 +202,48 @@ empty_scheduler() -> Scheduler = Scheduler([NO_TASK; MAX_TASKS], 0, 0)
 // image as data: a bare-metal image never runs initializers. The row is spelled out rather than named
 // as `NO_TASK`, because naming a `val` keeps the initializer from being laid in as data (FINDINGS 5).
 private[kernel] var scheduler: Scheduler =
-    Scheduler([Task(0, 0, 0, TaskState.Ready, 0, false, 0, false, 0, 0, false, 0); MAX_TASKS], 0, 0)
+    Scheduler([Task("", 0, 0, 0, 0, 0, TaskState.Ready, 0, false, 0, false, 0, 0, false, 0); MAX_TASKS], 0, 0)
 
 // The port, once `run` has started the tasks; until then a tick switches nothing and nothing blocks.
 private var port: Option[*Port] = None
 
-// Add a task that starts at `entry` on `stack`, with `priority` above `IDLE_PRIORITY`. Tasks are
-// added before `run`.
-spawn(p: *Port, stack: []u32, entry: *extern() -> never, priority: u8)
+// The memory protection, if `protect` has named one: every task's stack is guarded while it runs.
+private var protection: Option[*Protection] = None
+
+// Add a task called `name` that starts at `entry` on `stack`, with `priority` above `IDLE_PRIORITY`.
+// Tasks are added before `run`.
+spawn(p: *Port, stack: []u32, entry: *extern() -> never, priority: u8, name: string)
     if priority == IDLE_PRIORITY then panic("skiff: a task's priority must be above the idle task's")
-    val _ = scheduler.add(p.new_context(stack, entry), priority)
+    add_task(p, stack, entry, priority, name)
+
+private add_task(p: *Port, stack: []u32, entry: *extern() -> never, priority: u8, name: string)
+    val i = scheduler.add(p.new_context(stack, entry), priority)
+    val t = &scheduler.tasks[i]
+    t.name = name
+    t.stack = usize(&stack[0])
+    t.stack_bytes = stack.len * 4
+
+// Guard every task's stack with `pr` from `run` on. Called before `run`.
+protect(pr: *Protection)
+    protection = Some(pr)
 
 // Start the tasks, adding the idle task on `idle_stack`. Never returns. Interrupts are masked from
 // here until the first task runs, which starts with them unmasked.
 run(p: *Port, idle_stack: []u32) -> never
-    val _ = scheduler.add(p.new_context(idle_stack, &idle_task), IDLE_PRIORITY)
+    add_task(p, idle_stack, &idle_task, IDLE_PRIORITY, "idle")
     val _ = p.mask()
     port = Some(p)
-    p.start_first(scheduler.first())
+    val sp = scheduler.first()
+    guard_running()
+    p.start_first(sp)
+
+// Guard the running task's stack, if there is protection.
+private guard_running()
+    protection match
+        Some(pr) ->
+            val t = scheduler.tasks[scheduler.running]
+            pr.guard(t.stack, t.stack_bytes)
+        None -> ()
 
 private idle_task() -> never
     loop
@@ -209,8 +251,33 @@ private idle_task() -> never
             Some(p) -> p.idle()
             None -> ()
 
-// Called by the port's switch with the running task's stack pointer; answers the next task's.
-switch_context(sp: usize) -> usize = scheduler.switch(sp)
+// Called by the port's switch with the running task's stack pointer; answers the next task's, with its
+// stack guarded.
+switch_context(sp: usize) -> usize
+    val next = scheduler.switch(sp)
+    guard_running()
+    next
+
+// What a fault handler needs to know about the task that was running.
+struct TaskInfo
+    index: usize
+    name: string
+    stack: usize        // the bottom of its stack
+    stack_bytes: usize
+
+// The running task.
+running_task() -> TaskInfo
+    val t = scheduler.tasks[scheduler.running]
+    TaskInfo(scheduler.running, t.name, t.stack, t.stack_bytes)
+
+// Stop the running task for good, from a fault handler: it is never chosen again, and a switch is asked
+// for, which happens as soon as the handler returns.
+stop_running()
+    scheduler.stop_running()
+    request_switch()
+
+// Whether task `i` has been stopped.
+stopped(i: usize) -> bool = scheduler.tasks[i].state == TaskState.Stopped
 
 // Hold off the interrupts that use the kernel, from a task or from an interrupt handler. Before `run`
 // there are no tasks to protect and nothing is masked.

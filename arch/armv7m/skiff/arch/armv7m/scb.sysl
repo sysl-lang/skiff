@@ -32,6 +32,7 @@ private[armv7m]const SHCSR_BUSFAULTENA: u32 = 1 << 17
 private[armv7m]const SHCSR_USGFAULTENA: u32 = 1 << 18
 
 // CFSR bits a report reads.
+private[armv7m]const CFSR_MSTKERR: u32 = 1 << 4      // a MemManage fault pushing an exception frame
 private[armv7m]const CFSR_MMARVALID: u32 = 1 << 7
 private[armv7m]const CFSR_BFARVALID: u32 = 1 << 15
 

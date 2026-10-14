@@ -194,5 +194,7 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
 - **Proposed fix:** when the folder meets a module `val` whose own initializer folds, it substitutes
   that value, just as it already does for a `const`. A test: the probe above builds for
   `thumbv7em-freestanding`, and the image holds the table in `.data`/`.bss` with no initializer call.
+- **Status:** accepted by `sysl` as a bug for the release after alpha.12. The folder will substitute a
+  module `val` whose own initializer folds, with a check against a `val` that names itself.
 - **What skiff does until then:** the kernel's `scheduler` writes the empty row out in full instead of
   naming `NO_TASK`, with a comment pointing here. Remove that once the fix ships.

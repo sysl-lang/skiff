@@ -1,0 +1,185 @@
+module skiff.kernel
+@tests
+
+// Pools, the heap and stack protection on the host, with no tasks running. The MPU itself, and a task
+// stopped by it, are the board's boot test.
+
+struct Message
+    a: u32
+    b: u32
+
+@test("a pool hands out each block once, then none, and takes every one back")
+pool_reclaims_exactly()
+    var pool: Pool[Message, 3] = Pool([Message(0, 0); 3], [false; 3], 3)
+    var got: [3]usize = [0; 3]
+    for i in 0..<3
+        pool.alloc() match
+            Some(m) -> got[i] = usize(m)
+            None -> assert(false, "a block while some are left")
+    assert(pool.alloc() == None, "none left")
+    assert_eq(pool.available(), 0)
+    assert(got[0] != got[1] && got[1] != got[2] && got[0] != got[2], "three different blocks")
+    for i in 0..<3
+        val m: *Message = ptr_cast(got[i])
+        pool.release(m)
+    assert_eq(pool.available(), 3)
+    for _ in 0..<3
+        assert(pool.alloc() != None, "every block again")
+    assert(pool.alloc() == None, "and no more than three")
+
+@test("a block given back twice is refused", should_trap: "skiff: a pool block given back twice")
+pool_twice()
+    var pool: Pool[Message, 2] = Pool([Message(0, 0); 2], [false; 2], 2)
+    pool.alloc() match
+        Some(m) ->
+            pool.release(m)
+            pool.release(m)
+        None -> ()
+
+@test("a block from somewhere else is refused", should_trap: "skiff: a block given back to a pool it is not from")
+pool_foreign()
+    var pool: Pool[Message, 2] = Pool([Message(0, 0); 2], [false; 2], 2)
+    var other = Message(0, 0)
+    pool.release(&other)
+
+@test("an address inside a block, not at its start, is refused", should_trap: "skiff: a block given back to a pool it is not from")
+pool_inside()
+    var pool: Pool[Message, 2] = Pool([Message(0, 0); 2], [false; 2], 2)
+    val inside: *Message = ptr_cast(usize(&pool.blocks[0]) + 4)
+    pool.release(inside)
+
+private var arena: [256]u8 = [0; 256]
+
+// A heap over `arena`, from an address that is not aligned, so that `init` has to align it.
+private fresh_heap() -> Heap
+    var h = Heap(0, 0)
+    h.init(arena[1..<256])
+    h
+
+@test("a heap's blocks are aligned and do not overlap")
+heap_blocks()
+    var h = fresh_heap()
+    val a = h.alloc(5)
+    val b = h.alloc(17)
+    a match
+        Some(x) -> b match
+            Some(y) ->
+                assert_eq(x.len, 5)
+                assert_eq(y.len, 17)
+                assert_eq(usize(&x[0]) % HEAP_ALIGN, 0)
+                assert_eq(usize(&y[0]) % HEAP_ALIGN, 0)
+                assert(usize(&y[0]) >= usize(&x[0]) + 5, "b after a")
+            None -> assert(false, "b")
+        None -> assert(false, "a")
+
+@test("everything given back makes the whole region one block again")
+heap_reclaims_exactly()
+    var h = fresh_heap()
+    val whole = h.largest()
+    assert(whole >= 256 - 2 * HEAP_ALIGN - HEAP_ALIGN, "the region less alignment and one header")
+    var blocks: [6][]u8 = [[]; 6]
+    for i in 0usize..<6
+        h.alloc(10 + i) match
+            Some(b) -> blocks[i] = b
+            None -> assert(false, "room for six")
+    // Out of order, so that merging has to join blocks on both sides of one given back.
+    for i in [1, 3, 5, 0, 4, 2]
+        h.release(blocks[i])
+    assert_eq(h.largest(), whole)
+    assert(h.alloc(whole) != None, "the whole region in one block")
+
+@test("a freed block is reused first, and a request bigger than any free block answers None")
+heap_first_fit()
+    var h = fresh_heap()
+    val first = h.alloc(32)
+    val _ = h.alloc(32)
+    first match
+        Some(b) ->
+            val at = usize(&b[0])
+            h.release(b)
+            h.alloc(24) match
+                Some(c) -> assert_eq(usize(&c[0]), at)
+                None -> assert(false, "the freed block")
+        None -> assert(false, "first")
+    assert(h.alloc(1000) == None, "too big")
+    assert(h.alloc(0) == None, "nothing")
+
+@test("a heap block given back twice is refused", should_trap: "skiff: a heap block given back twice")
+heap_twice()
+    var h = fresh_heap()
+    h.alloc(8) match
+        Some(b) ->
+            h.release(b)
+            h.release(b)
+        None -> ()
+
+@test("a heap block from somewhere else is refused", should_trap: "skiff: a block given back to a heap it is not from")
+heap_foreign()
+    var h = fresh_heap()
+    var other: [16]u8 = [0; 16]
+    h.release(other[8..<16])
+
+// A protection unit that records what it was asked to guard.
+struct Recorder
+    base: usize
+    bytes: usize
+    calls: u32
+
+impl Protection for Recorder
+    guard(*self, base: usize, bytes: usize)
+        self.base = base
+        self.bytes = bytes
+        self.calls += 1
+
+// A port that builds nothing and switches nothing.
+struct HostPort
+end HostPort
+
+impl Port for HostPort
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize = usize(&stack[0])
+    request_switch(*self) = ()
+    start_first(*self, sp: usize) -> never
+        loop
+            ()
+    mask(*self) -> u32 = 0
+    restore(*self, state: u32) = ()
+    idle(*self) = ()
+
+private never_runs() -> never
+    loop
+        ()
+
+private var stack_one: [64]u32 = [0; 64]
+private var stack_two: [32]u32 = [0; 32]
+
+@test("a switch guards the stack of the task it switches to")
+switch_guards_the_next_stack()
+    scheduler = empty_scheduler()
+    var port = HostPort()
+    var unit = Recorder(0, 0, 0)
+    spawn(&port, stack_one, &never_runs, 1, "one")
+    spawn(&port, stack_two, &never_runs, 1, "two")
+    protect(&unit)
+    scheduler.running = 0
+    val _ = switch_context(0)
+    assert_eq(scheduler.running, 1)
+    assert_eq(unit.calls, 1)
+    assert_eq(unit.base, usize(&stack_two[0]))
+    assert_eq(unit.bytes, 128)
+    assert(running_task().name == "two", "the running task's name")
+
+@test("a stopped task is never chosen again, and stopping the running one wants a switch")
+stopped_task()
+    scheduler = empty_scheduler()
+    val _ = scheduler.add(0, 1)
+    val _ = scheduler.add(0, 2)
+    val _ = scheduler.add(0, 0)
+    scheduler.running = 1
+    scheduler.stop_running()
+    assert(stopped(1), "stopped")
+    assert(scheduler.tick(1), "a switch is wanted")
+    assert_eq(scheduler.choose(), 0)
+    scheduler.running = 0
+    for t in 2u32..20
+        val _ = scheduler.tick(t)
+        assert(scheduler.choose() != 1, "never the stopped task")

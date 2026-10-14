@@ -6,8 +6,8 @@ import skiff.kernel
 import skiff.kernel.Machine
 
 // The tasks the boot test runs, and what each shows. Each scenario starts at its own tick, counted from
-// when the tasks start, so that one has finished before the next begins; the synchronisation scenarios,
-// from tick 45 on, are in waits.sysl.
+// when the tasks start, so that one has finished before the next begins. The synchronisation scenarios,
+// from tick 45 on, are in waits.sysl, and the memory ones, from tick 110 on, in memory.sysl.
 //   - A and B share priority 1 and never yield: each prints a line and then waits for the next tick.
 //     They alternate only because the tick takes turns between them. After three lines each, A
 //     sleeps for good and B spins until tick 40, never giving up the processor of its own accord.
@@ -30,15 +30,21 @@ private var stack_idle: [128]u32 = [0; 128]
 // it should whatever order the tasks first ran in.
 private[board] var epoch: u32 = 0
 
-// Spawn the tasks and run them; the run ends in a bus fault, in the last scenario.
+private var protector: armv7m.Protector = armv7m.Protector()
+
+// Spawn the tasks and run them with every stack guarded; the run ends in a bus fault, in the last
+// scenario.
 run_tasks() -> never
     epoch = kernel.ticks()
-    kernel.spawn(&cortex, stack_a, &task_a, 1)
-    kernel.spawn(&cortex, stack_b, &task_b, 1)
-    kernel.spawn(&cortex, stack_p1, &task_p1, 2)
-    kernel.spawn(&cortex, stack_p2, &task_p2, 2)
-    kernel.spawn(&cortex, stack_h, &task_h, 3)
+    kernel.spawn(&cortex, stack_a, &task_a, 1, "A")
+    kernel.spawn(&cortex, stack_b, &task_b, 1, "B")
+    kernel.spawn(&cortex, stack_p1, &task_p1, 2, "P1")
+    kernel.spawn(&cortex, stack_p2, &task_p2, 2, "P2")
+    kernel.spawn(&cortex, stack_h, &task_h, 3, "H")
     spawn_waits(&cortex)
+    spawn_memory(&cortex)
+    armv7m.enable_protection()
+    kernel.protect(&protector)
     kernel.run(&cortex, stack_idle)
 
 private task_a() -> never = take_turns("skiff: task A ", false)

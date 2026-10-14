@@ -2,7 +2,7 @@
 // the kernel that is generic over the machine is called from here as well.
 
 import skiff.kernel
-import skiff.kernel.{Flags, Machine, Mutex, NO_OWNER, Port, Queue, Semaphore}
+import skiff.kernel.{Flags, Heap, Machine, Mutex, NO_OWNER, Pool, Port, Protection, Queue, Semaphore}
 
 struct Nothing
 end Nothing
@@ -26,6 +26,20 @@ impl Port for NoPort
     restore(*self, state: u32) = ()
     idle(*self) = ()
 
+// Protection that guards nothing.
+struct NoGuard
+end NoGuard
+
+impl Protection for NoGuard
+    guard(*self, base: usize, bytes: usize) = ()
+
+struct Block
+    a: u32
+
+private var pool: Pool[Block, 2] = Pool([Block(0); 2], [false; 2], 2)
+private var heap: Heap = Heap(0, 0)
+private var arena: [64]u8 = [0; 64]
+
 private var sem: Semaphore = Semaphore(0, 1)
 private var mutex: Mutex = Mutex(NO_OWNER)
 private var queue: Queue[u32, 2] = Queue([0, 0], 0, 0)
@@ -43,6 +57,14 @@ private task() -> never
     flags.set(1)
     flags.clear(1)
     val _ = flags.wait(1, true, 1)
+    pool.alloc() match
+        Some(b) -> pool.release(b)
+        None -> ()
+    heap.alloc(4) match
+        Some(b) -> heap.release(b)
+        None -> ()
+    val _ = pool.available() + heap.largest()
+    if kernel.stopped(kernel.running_task().index) then kernel.stop_running()
     kernel.sleep_forever()
 
 @export("main")
@@ -55,5 +77,8 @@ probe() -> i32
     var p = NoPort()
     var stack: [32]u32 = [0; 32]
     var idle: [32]u32 = [0; 32]
-    kernel.spawn(&p, stack, &task, 1)
+    var g = NoGuard()
+    heap.init(arena)
+    kernel.spawn(&p, stack, &task, 1, "task")
+    kernel.protect(&g)
     kernel.run(&p, idle)
