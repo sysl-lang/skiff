@@ -1,0 +1,254 @@
+module skiff.kernel
+
+// Unprivileged tasks: tasks that run with the processor's privilege dropped, each under a map of the
+// memory it may reach.
+//
+// A privileged task (`spawn`) reaches everything, as the kernel itself does. An unprivileged one
+// (`spawn_unprivileged`) reaches only what its map holds:
+//   - its own stack, read and write, never executed;
+//   - up to `MAX_MAP - 1` regions its creator names: its code (or all of it, read and executed), and
+//     grants such as a buffer it shares with another task or the registers of a peripheral it owns.
+// Everything else faults on the first access: the kernel's data, every other task's stack, the
+// scheduler. A fault stops that task alone, as a stack overflow does.
+//
+// **The map is checked when the task is created, and refused rather than rounded.** Each region goes
+// through the unit's `Isolation.encode`, which answers how the unit holds it or why it cannot hold it
+// exactly (a PMSAv7 region is a power of two aligned to its size, with whole eighths switched off; a
+// PMSAv8 one is 32-byte granular). The regions of one map may not overlap one another or the stack,
+// since a PMSAv8 unit faults on an address two regions match. The encoded map is kept with the task
+// and loaded on every switch to it, so the switch does no arithmetic.
+//
+// **A task's kernel calls arrive through a trap** (calls.sysl): an unprivileged task cannot mask the
+// kernel's interrupts, so it cannot run kernel code itself. The kernel reaches a buffer the task hands
+// it only after `may_reach` finds it wholly inside one region of the task's map with the access the
+// call needs, and names kernel objects by handle: `share` gives one, and the creator lists the handles
+// each task may use.
+//
+// A system with no unprivileged task never names an `Isolation`, and a switch to a privileged task
+// loads nothing.
+
+// How a region of a task's map may be reached by the task.
+enum Access
+    Read                // read only, never executed: data the task may look at but not change
+    ReadWrite           // read and written, never executed: its stack, a buffer it shares
+    Execute             // read and executed, never written: code and the constants beside it
+    Device              // a peripheral's registers: read and written in order, never cached or executed
+
+// A run of memory a task may reach, and how.
+struct Region
+    base: usize
+    bytes: usize
+    access: Access
+
+// A region as a protection unit holds it: two words, whose meaning is the unit's.
+struct Slot
+    first: u32
+    second: u32
+
+val NO_SLOT: Slot = Slot(0, 0)
+val NO_REGION: Region = Region(0, 0, Access.Read)
+
+// Why a protection unit cannot hold a region exactly.
+enum RegionError
+    Empty               // it has no bytes
+    Wraps               // it runs past the top of the address space
+    Unaligned           // its base or its end is off the unit's granule (32 bytes on PMSAv8)
+    NotPowerOfTwo       // no power-of-two region aligned to its size, less whole eighths, covers exactly it (PMSAv7)
+
+// Why a task's map was refused at creation. A region is named by its index in the list the creator gave.
+enum MapError derives Eq
+    TooManyRegions                          // more than the unit holds beside the stack
+    Stack(why: RegionError)                 // the unit cannot hold the task's stack as one region
+    Bad(region: usize, why: RegionError)    // the unit cannot hold this region
+    Overlap(first: usize, second: usize)    // these two regions share bytes
+    OverlapsStack(region: usize)            // this region shares bytes with the task's stack
+    NoSuchObject(handle: usize)             // no object has this handle
+
+// What the kernel needs from a memory protection unit to run unprivileged tasks.
+trait Isolation
+    // The most regions one task's map may hold here, its stack included.
+    capacity(*self) -> usize
+
+    // How the unit holds `r`, or why it cannot hold it exactly. Called when a task is created.
+    encode(*self, r: Region) -> Result[Slot, RegionError]
+
+    // Hold `map` for the task about to run: an unprivileged task's map, or an empty one for a privileged
+    // task, which reaches memory through the default map.
+    load(*self, map: []const Slot)
+
+// The most regions a map holds, the stack included.
+const MAX_MAP: usize = 6
+
+// How many kernel objects `share` can name.
+const MAX_OBJECTS: usize = 32
+
+// A kernel call in flight: the four arguments the task passed and the call's number, as the port's trap
+// leaves them (calls.sysl).
+struct CallFrame
+    args: [4]usize
+    number: usize
+
+// What the kernel keeps for an unprivileged task, beside its row in the table.
+struct Map
+    regions: [MAX_MAP]Region    // the stack first, then the creator's regions
+    slots: [MAX_MAP]Slot        // the same, as the unit holds them
+    len: usize
+    objects: u32                // bit h set: the task may name object h in a call
+    call: CallFrame             // the call it is making, while `Task.calling`
+
+val NO_MAP: Map = Map([NO_REGION; MAX_MAP], [NO_SLOT; MAX_MAP], 0, 0, CallFrame([0; 4], 0))
+
+// Each task's map, by its index in the table. Only an unprivileged task's row means anything.
+private[kernel] var maps: [MAX_TASKS]Map = [NO_MAP; MAX_TASKS]
+
+// The protection unit unprivileged tasks run under, once `isolate` has named one.
+private[kernel] var isolation: Option[*Isolation] = None
+
+// Whether the unit holds an unprivileged task's map now, so that a switch to a privileged task must
+// empty it.
+private var mapped: bool = false
+
+// Run unprivileged tasks under `iso`. Called before the first `spawn_unprivileged`.
+isolate(iso: *Isolation)
+    isolation = Some(iso)
+
+// Whether `isolate` has named a unit: the port then sets the processor's privilege on every switch.
+isolating() -> bool = isolation match
+    Some(_) -> true
+    None -> false
+
+// Whether the running task must run unprivileged now: it is an unprivileged task, and not inside a
+// kernel call, which runs privileged.
+running_unprivileged() -> bool
+    val t = scheduler.tasks[scheduler.running]
+    t.user && !t.calling
+
+// Add an unprivileged task, as `spawn` adds a privileged one: called `name`, starting at `entry` on
+// `stack`, with `priority`. It may reach its stack and `regions`, and name in its calls the objects whose
+// handles `objects` lists. Answers its index, or why its map was refused, in which case nothing is
+// added. `isolate` must have been called.
+spawn_unprivileged(p: *Port, stack: []u32, entry: *extern() -> never, priority: u8, name: string, regions: []const Region, objects: []const usize) -> Result[usize, MapError]
+    if priority == IDLE_PRIORITY then panic("skiff: a task's priority must be above the idle task's")
+    val iso = isolation match
+        Some(u) -> u
+        None -> panic("skiff: an unprivileged task before `isolate`")
+    val stack_region = Region(usize(&stack[0]), stack.len * 4, Access.ReadWrite)
+    var map = build_map(iso, stack_region, regions)?
+    for h in objects
+        if h >= object_count then return Err(NoSuchObject(h))
+        map.objects |= 1u32 << u32(h)
+    val state = enter()
+    val i = add_task(p, stack, entry, priority, name)
+    maps[i] = map
+    scheduler.tasks[i].user = true
+    if scheduler.outranks_running(i) then request_switch()
+    leave(state)
+    Ok(i)
+
+// The map of a task whose stack is `stack` and whose creator named `regions`, each encoded by `iso`, or
+// the first reason it cannot be held.
+private[kernel] build_map(iso: *Isolation, stack: Region, regions: []const Region) -> Result[Map, MapError]
+    val most = if iso.capacity() < MAX_MAP then iso.capacity() else MAX_MAP
+    if regions.len + 1 > most then return Err(TooManyRegions)
+    var map = NO_MAP
+    map.regions[0] = stack
+    map.slots[0] = iso.encode(stack) match
+        Ok(s) -> s
+        Err(why) -> return Err(Stack(why))
+    for k in 0..<regions.len
+        val r = regions[k]
+        map.slots[k + 1] = iso.encode(r) match
+            Ok(s) -> s
+            Err(why) -> return Err(Bad(k, why))
+        if overlaps(r, stack) then return Err(OverlapsStack(k))
+        for j in 0..<k
+            if overlaps(regions[j], r) then return Err(Overlap(j, k))
+        map.regions[k + 1] = r
+    map.len = regions.len + 1
+    Ok(map)
+
+// Whether two regions share a byte. Ends are reckoned in 64 bits, so a region ending at the top of a
+// 32-bit address space does not wrap to zero.
+private overlaps(a: Region, b: Region) -> bool
+    u64(a.base) < u64(b.base) + u64(b.bytes) && u64(b.base) < u64(a.base) + u64(a.bytes)
+
+// Whether task `i` may hand the kernel the `bytes` bytes at `addr`, to be read, or written too if
+// `write`. A privileged task may hand it anything. An unprivileged one must hand it bytes lying wholly
+// inside one region of its map whose access allows it: its stack above what the protection reserves at
+// the bottom, a `ReadWrite` region, or for reading only a `Read` or `Execute` one. A buffer straddling
+// two regions is refused even when both would allow it, and a `Device` region is never a buffer: the
+// kernel copies with ordinary loads and stores. An empty buffer reaches nothing, and is allowed.
+may_reach(i: usize, addr: usize, bytes: usize, write: bool) -> bool
+    val t = scheduler.tasks[i]
+    if !t.user || bytes == 0 then return true
+    val start = u64(addr)
+    val end = start + u64(bytes)
+    if end > u64(usize::Max) + 1 then return false
+    val m = &maps[i]
+    for k in 0..<m.len
+        val r = m.regions[k]
+        val low = if k == 0 then u64(r.base + reserved_at_bottom(r.base, r.bytes)) else u64(r.base)
+        val inside = start >= low && end <= u64(r.base) + u64(r.bytes)
+        val allowed = r.access match
+            ReadWrite -> true
+            Read | Execute -> !write
+            Device -> false
+        if inside && allowed then return true
+    false
+
+// The bytes at the bottom of the stack at `base` that its task can never use: the protection's guard.
+private[kernel] reserved_at_bottom(base: usize, bytes: usize) -> usize = protection match
+    Some(pr) -> pr.reserved(base, bytes)
+    None -> 0
+
+// Load the running task's map if it is unprivileged, or empty the unit if a privileged task follows an
+// unprivileged one. Without `isolate`, nothing.
+private[kernel] isolate_running()
+    isolation match
+        Some(iso) ->
+            val i = scheduler.running
+            if scheduler.tasks[i].user
+                val m = &maps[i]
+                iso.load(m.slots[0..<m.len])
+                mapped = true
+            else if mapped
+                iso.load([])
+                mapped = false
+        None -> ()
+
+// A kernel object an unprivileged task may use through a call: a stream of bytes it writes to or reads
+// from. `StreamBuffer` and `MessageBuffer` are channels.
+trait Channel
+    // Write `data`, waiting up to `timeout` ticks for room; answers how many bytes were taken. A message
+    // buffer takes the whole message or nothing.
+    write(*self, data: []const u8, timeout: u32) -> usize
+
+    // Read into `buf`, waiting up to `timeout` ticks; answers how many bytes were read.
+    read(*self, buf: []u8, timeout: u32) -> usize
+
+impl[const N: usize] Channel for StreamBuffer[N]
+    write(*self, data: []const u8, timeout: u32) -> usize = self.send(data, timeout)
+    read(*self, buf: []u8, timeout: u32) -> usize = self.receive(buf, timeout)
+
+impl[const N: usize] Channel for MessageBuffer[N]
+    write(*self, data: []const u8, timeout: u32) -> usize = if self.send(data, timeout) then data.len else 0
+    read(*self, buf: []u8, timeout: u32) -> usize = self.receive(buf, timeout)
+
+// The objects `share` has named, by handle.
+private[kernel] var objects: [MAX_OBJECTS]Option[*Channel] = [None; MAX_OBJECTS]
+private[kernel] var object_count: usize = 0
+
+// Name `c` for unprivileged tasks, answering its handle. A task may use it only if its creator lists
+// the handle in `spawn_unprivileged`.
+share(c: *Channel) -> usize
+    if object_count == MAX_OBJECTS then panic("skiff: the object table is full")
+    objects[object_count] = Some(c)
+    object_count += 1
+    object_count - 1
+
+// The object with handle `h`, if task `i` may use it: a privileged task may use any.
+private[kernel] granted(i: usize, h: usize) -> Option[*Channel]
+    if h >= object_count then return None
+    val t = scheduler.tasks[i]
+    if t.user && (maps[i].objects & (1u32 << u32(h))) == 0 then return None
+    objects[h]

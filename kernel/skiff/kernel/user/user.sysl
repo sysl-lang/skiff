@@ -1,0 +1,80 @@
+module skiff.kernel.user
+
+import skiff.kernel
+import skiff.kernel.{NotifyAction, TaskStats}
+
+// The kernel as an unprivileged task calls it: one function per call, each trapping into the kernel
+// with the call's number and its arguments (kernel calls.sysl). A privileged task calls the kernel
+// directly and has no need of these.
+//
+// A call whose arguments the kernel refuses — a handle the task was not granted, a buffer outside its
+// map — answers `Err` with the reason and does nothing else.
+
+// The port's trap: enter the kernel with call `number` and four arguments, and answer its result. The
+// arch package supplies it (armv7m: `svc`).
+private extern "skiff_trap" trap(number: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> usize
+
+// Why the kernel refused a call.
+enum Refusal
+    NoSuchCall          // the kernel has no call of that number
+    BadHandle           // no task has that index, or the task was not granted that object
+    BadArgument         // an argument is out of range
+    BadBuffer           // a buffer is not wholly inside one region of the task's map that allows the access
+
+// A call's result, or why it was refused.
+private answer(r: usize) -> Result[usize, Refusal]
+    if r < kernel.REFUSED then return Ok(r)
+    Err(r match
+        kernel.REFUSED_CALL -> NoSuchCall
+        kernel.REFUSED_HANDLE -> BadHandle
+        kernel.REFUSED_ARGUMENT -> BadArgument
+        _ -> BadBuffer)
+
+// Where a buffer starts, as a call passes it: an empty one starts nowhere.
+private address(bytes: []const u8) -> usize = if bytes.len == 0 then 0 else usize(&bytes[0])
+
+// Give up the processor to the next ready task of the same priority, if there is one.
+yield_now()
+    val _ = trap(kernel.CALL_YIELD, 0, 0, 0, 0)
+
+// Sleep for `count` ticks, or for good with `kernel.FOREVER`.
+sleep(count: u32)
+    val _ = trap(kernel.CALL_SLEEP, usize(count), 0, 0, 0)
+
+// Sleep until tick `tick`; not at all if it has come.
+sleep_until(tick: u32)
+    val left = i32(tick - ticks())
+    if left > 0 then sleep(u32(left))
+
+// The tick count.
+ticks() -> u32 = u32(trap(kernel.CALL_TICKS, 0, 0, 0, 0))
+
+// The calling task's index in the table, which other tasks notify it by.
+my_index() -> usize = trap(kernel.CALL_SELF, 0, 0, 0, 0)
+
+// Notify task `task`, as `kernel.notify` does. Answers whether the notification was sent.
+notify(task: usize, value: u32, action: NotifyAction) -> Result[bool, Refusal]
+    val n: usize = action match
+        SetBits -> 0
+        Increment -> 1
+        Overwrite -> 2
+        NoOverwrite -> 3
+    val r = answer(trap(kernel.CALL_NOTIFY, task, usize(value), n, 0))?
+    Ok(r == 1)
+
+// Wait up to `timeout` ticks for a notification, as `kernel.notify_take` does.
+notify_take(clear: bool, timeout: u32) -> u32 = u32(trap(kernel.CALL_NOTIFY_TAKE, if clear then 1 else 0, usize(timeout), 0, 0))
+
+// Write `data` to the stream or message buffer whose handle is `channel`, waiting up to `timeout`
+// ticks; answers how many bytes it took.
+send(channel: usize, data: []const u8, timeout: u32) -> Result[usize, Refusal] = answer(trap(kernel.CALL_SEND, channel, address(data), data.len, usize(timeout)))
+
+// Read from the stream or message buffer whose handle is `channel` into `buf`, waiting up to `timeout`
+// ticks; answers how many bytes were read.
+receive(channel: usize, buf: []u8, timeout: u32) -> Result[usize, Refusal] = answer(trap(kernel.CALL_RECEIVE, channel, address(buf), buf.len, usize(timeout)))
+
+// Fill `out` with the tasks' statistics, as `kernel.task_stats` does; answers how many rows the table
+// needs.
+task_stats(out: []TaskStats) -> Result[usize, Refusal]
+    val at = if out.len == 0 then 0 else usize(&out[0])
+    answer(trap(kernel.CALL_TASK_STATS, at, out.len, 0, 0))

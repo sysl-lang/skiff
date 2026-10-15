@@ -47,7 +47,7 @@ trait Protection
     reserved(*self, base: usize, bytes: usize) -> usize
 
 // How many tasks the table holds, the idle task included.
-const MAX_TASKS: usize = 48
+const MAX_TASKS: usize = 56
 
 // The idle task's priority; every other task's must be higher.
 const IDLE_PRIORITY: u8 = 0
@@ -81,9 +81,11 @@ struct Task
     noted: bool         // whether a notification is pending: sent and not yet waited for
     suspended: bool     // never chosen, whatever its state, until resumed (control.sysl)
     run_time: u64       // counts spent running (stats.sysl)
+    user: bool          // whether it runs unprivileged, under a map of its own (isolation.sysl)
+    calling: bool       // whether an unprivileged task is inside a kernel call, running privileged (calls.sysl)
 
 // An unused row of the table.
-val NO_TASK: Task = Task("", 0, 0, 0, 0, 0, 0, TaskState.Ready, 0, false, 0, false, 0, 0, false, 0, 0, false, false, 0)
+val NO_TASK: Task = Task("", 0, 0, 0, 0, 0, 0, TaskState.Ready, 0, false, 0, false, 0, 0, false, 0, 0, false, false, 0, false, false)
 
 // The table and the choices made over it. It holds no hardware state, so the host tests drive one
 // directly; the kernel keeps one of its own, `scheduler`.
@@ -260,7 +262,7 @@ spawn(p: *Port, stack: []u32, entry: *extern() -> never, priority: u8, name: str
     if scheduler.outranks_running(i) then request_switch()
     leave(state)
 
-private add_task(p: *Port, stack: []u32, entry: *extern() -> never, priority: u8, name: string) -> usize
+private[kernel] add_task(p: *Port, stack: []u32, entry: *extern() -> never, priority: u8, name: string) -> usize
     paint(stack)
     val i = scheduler.add(p.new_context(stack, entry), priority)
     val t = &scheduler.tasks[i]
@@ -281,6 +283,7 @@ run(p: *Port, idle_stack: []u32) -> never
     port = Some(p)
     val sp = scheduler.first()
     guard_running()
+    isolate_running()
     start_counting()
     p.start_first(sp)
 
@@ -299,11 +302,13 @@ private idle_task() -> never
             None -> ()
 
 // Called by the port's switch with the running task's stack pointer; answers the next task's, with its
-// stack guarded. The task switched away from is charged for its run time first.
+// stack guarded and, for an unprivileged task, its map loaded. The task switched away from is charged
+// for its run time first.
 switch_context(sp: usize) -> usize
     charge()
     val next = scheduler.switch(sp)
     guard_running()
+    isolate_running()
     next
 
 // What a fault handler needs to know about the task that was running.
