@@ -38,6 +38,22 @@ skiff: a timed wait timed out after 5 ticks
 skiff: timer 0's interrupt woke a waiting task
 skiff: a queue of two carried 1 to 5 in order
 skiff: event flags woke the task on both bits
+skiff: an interrupt's notifications woke the counting task at once, 5 times
+skiff: the counting task took every notification once
+skiff: notified bits woke a task, and its next wait timed out after 5 ticks
+skiff: a pending notification was not overwritten
+skiff: an interrupt streamed 20 bytes to a task, 4 at a time in order, waking it at once
+skiff: 40 framed messages arrived whole and in order across the ring's end
+skiff: a receive buffer too short for a message left it whole
+skiff: a give by a task not holding the recursive mutex was refused
+skiff: a timed take of a held recursive mutex timed out after 2 ticks
+skiff: a recursive mutex held 3 deep went to the waiter on the third give, before the busy task finished
+skiff: a suspended task did not run for 5 ticks, and ran again once resumed
+skiff: an interrupt resumed a task that suspended itself at once, 3 times
+skiff: a lowered priority kept the inherited boost, and the lowered task yielded at once
+skiff: a stopped waiter left its wait list, a task stopped itself, and a new task took a stopped task's row
+skiff: a task spinning for 3 of 6 ticks was charged its share, and idle the rest
+skiff: a task recursing 8 deep lowered its stack high-water mark by its frames
 skiff: task deep overflowed its stack
 skiff: task null broke its memory protection
 skiff: mmfar 0x00000000

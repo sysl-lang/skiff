@@ -2,6 +2,7 @@ module board
 
 import sysl.sync.Atomic
 import skiff.arch.armv7m
+import skiff.chip.mps2
 import skiff.kernel
 import skiff.kernel.Machine
 
@@ -17,7 +18,7 @@ import skiff.kernel.Machine
 //   - H, at priority 3, sleeps for 30 ticks and must be running on the very tick it is due, although B
 //     never yields.
 
-private var cortex: armv7m.Cortex = armv7m.Cortex()
+private[board] var cortex: armv7m.Cortex = armv7m.Cortex()
 
 private var stack_a: [256]u32 = [0; 256]
 private var stack_b: [256]u32 = [0; 256]
@@ -31,6 +32,7 @@ private var stack_idle: [128]u32 = [0; 128]
 private[board] var epoch: u32 = 0
 
 private var protector: armv7m.Protector = armv7m.Protector()
+private var cycles: Cycles = Cycles()
 
 // Spawn the tasks and run them with every stack guarded; the run ends in a bus fault, in the last
 // scenario.
@@ -42,9 +44,16 @@ run_tasks() -> never
     kernel.spawn(&cortex, stack_p2, &task_p2, 2, "P2")
     kernel.spawn(&cortex, stack_h, &task_h, 3, "H")
     spawn_waits(&cortex)
+    spawn_notes(&cortex)
+    spawn_streams(&cortex)
+    spawn_rmutex(&cortex)
+    spawn_control(&cortex)
+    spawn_stats(&cortex)
     spawn_memory(&cortex)
     armv7m.enable_protection()
     kernel.protect(&protector)
+    mps2.counter_start()
+    kernel.measure(&cycles)
     kernel.run(&cortex, stack_idle)
 
 private task_a() -> never = take_turns("skiff: task A ", false)

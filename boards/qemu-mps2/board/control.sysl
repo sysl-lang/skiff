@@ -1,0 +1,200 @@
+module board
+
+import sysl.sync.Atomic
+import skiff.arch.armv7m
+import skiff.chip.mps2
+import skiff.kernel
+import skiff.kernel.{FOREVER, Mutex, NO_OWNER, Semaphore}
+
+// The task control scenarios, after rmutex.sysl's have finished. Controller, at priority 7, drives them.
+//   - Tick 210, Ticker (3) starts counting, once a tick. At 212 Controller suspends it, and for the 5
+//     ticks it is suspended its sleeps end without it running: the count must not move. Then Controller
+//     resumes it, and the count must move again. At 220 Ticker is told to finish, and it stops itself.
+//   - Tick 225, Resumed (4) suspends itself three times, and a task of low priority spins, raising timer
+//     0's interrupt from software every 20,000 counts; the interrupt resumes Resumed. Each resume must
+//     switch straight to Resumed: the spinner must not have counted once since the interrupt.
+//   - Tick 230, Owner (2) locks a mutex and works 3 ticks; at 231 High (6) waits for it, so Owner runs
+//     at 6. At 232 Controller gives Owner the base priority 4, and Owner must still run at 6. Once
+//     Owner gives the mutex back it runs at 4, then lowers itself to 1, and Yielder (3), ready since
+//     231, must run before Owner's next line.
+//   - Tick 237, Stopped (4) waits for a semaphore nobody gives. At 238 Controller stops it and gives the
+//     semaphore, which must go to the count, not to Stopped. Then it spawns Reborn on Stopped's stack,
+//     which must take the row of a stopped task, Ticker's or Stopped's, rather than a new one.
+
+private var stack_controller: [256]u32 = [0; 256]
+private var stack_ticker: [256]u32 = [0; 256]
+private var stack_resumed: [256]u32 = [0; 256]
+// 2 KiB, so that its working stack never shares a page with its guard (notes.sysl's spinner says why).
+private var stack_resume_spinner: [512]u32 = [0; 512]
+private var stack_owner: [256]u32 = [0; 256]
+private var stack_high: [256]u32 = [0; 256]
+private var stack_yielder: [256]u32 = [0; 256]
+private var stack_stopped: [256]u32 = [0; 256]
+
+spawn_control(cortex: *armv7m.Cortex)
+    kernel.spawn(cortex, stack_controller, &task_controller, 7, "controller")
+    kernel.spawn(cortex, stack_ticker, &task_ticker, 3, "ticker")
+    kernel.spawn(cortex, stack_resumed, &task_resumed, 4, "resumed")
+    kernel.spawn(cortex, stack_resume_spinner, &task_resume_spinner, 2, "resume spinner")
+    kernel.spawn(cortex, stack_owner, &task_owner, 2, "owner")
+    kernel.spawn(cortex, stack_high, &task_high, 6, "high")
+    kernel.spawn(cortex, stack_yielder, &task_yielder, 3, "yielder")
+    kernel.spawn(cortex, stack_stopped, &task_stopped, 4, "stopped")
+
+private var ticker_index: Atomic[u32] = Atomic(0)
+private var ticker_on: Atomic[u32] = Atomic(1)
+private var counted: Atomic[u32] = Atomic(0)
+private var ran_on: Atomic[u32] = Atomic(0)
+private var owner_index: Atomic[u32] = Atomic(0)
+private var boosted: Atomic[u32] = Atomic(0)
+private var yielder_ran: Atomic[u32] = Atomic(0)
+private var owner_yielded: Atomic[u32] = Atomic(0)
+private var stopped_index: Atomic[u32] = Atomic(0)
+private var stopped_woke: Atomic[u32] = Atomic(0)
+private var reborn_index: Atomic[u32] = Atomic(0xffff_ffff)
+
+private task_controller() -> never
+    kernel.sleep_until(epoch + 212)
+    val ticker = usize(ticker_index.load())
+    kernel.suspend(ticker)
+    val before = counted.load()
+    kernel.sleep(5)
+    val during = counted.load()
+    kernel.resume(ticker)
+    kernel.sleep(3)
+    if during == before && counted.load() > during && !kernel.suspended(ticker)
+        say("skiff: a suspended task did not run for 5 ticks, and ran again once resumed\n")
+    else
+        say("skiff: a suspended task ran, or did not run again once resumed\n")
+    ticker_on.store(0)
+
+    kernel.sleep_until(epoch + 232)
+    val owner = usize(owner_index.load())
+    kernel.set_priority(owner, 4)
+    boosted.store(u32(kernel.priority(owner)))
+    kernel.sleep_until(epoch + 236)
+    if boosted.load() != 6
+        say("skiff: a lower base priority overwrote an inherited one\n")
+    else if owner_yielded.load() == 0 || kernel.priority(owner) != 1 || kernel.base_priority(owner) != 1
+        say("skiff: a task that lowered its priority did not yield at once\n")
+    else
+        say("skiff: a lowered priority kept the inherited boost, and the lowered task yielded at once\n")
+
+    kernel.sleep_until(epoch + 238)
+    val waiter = usize(stopped_index.load())
+    kernel.stop(waiter)
+    val _ = never_given.give()
+    val left_count = never_given.take(0)
+    val stopped_for_good = kernel.stopped(waiter) && kernel.stopped(ticker) && ran_on.load() == 0
+    kernel.spawn(&cortex, stack_stopped, &task_reborn, 4, "reborn")
+    kernel.sleep(1)
+    val reborn = usize(reborn_index.load())
+    if !left_count || stopped_woke.load() != 0
+        say("skiff: a stopped task was still in its wait list\n")
+    else if !stopped_for_good
+        say("skiff: a stopped task was not stopped for good\n")
+    else if reborn != ticker && reborn != waiter
+        say("skiff: a new task did not take a stopped task's row\n")
+    else
+        say("skiff: a stopped waiter left its wait list, a task stopped itself, and a new task took a stopped task's row\n")
+    kernel.sleep_forever()
+
+// Suspend and resume.
+
+private task_ticker() -> never
+    val me = kernel.running_task().index
+    ticker_index.store(u32(me))
+    kernel.sleep_until(epoch + 210)
+    while ticker_on.load() != 0
+        counted.store(counted.load() + 1)
+        kernel.sleep(1)
+    kernel.stop(me)
+    ran_on.store(1)
+    say("skiff: a task ran on after stopping itself\n")
+    kernel.sleep_forever()
+
+// Resume from an interrupt.
+
+private var resumed_index: Atomic[u32] = Atomic(0)
+private var resume_armed: Atomic[u32] = Atomic(0)
+private var resume_spinning: Atomic[u32] = Atomic(0)
+private var resume_spins: Atomic[u32] = Atomic(0)
+private var spins_at_resume: Atomic[u32] = Atomic(0)
+
+// From timer 0's interrupt, once the scenario arms it: note how far the spinner had counted, and resume
+// the task that suspended itself.
+private[board] control_timer_event()
+    if resume_armed.load() != 0
+        spins_at_resume.store(resume_spins.load())
+        val _ = kernel.resume_from_isr(usize(resumed_index.load()))
+
+private task_resume_spinner() -> never
+    kernel.sleep_until(epoch + 225)
+    while resume_spinning.load() != 0
+        val n = resume_spins.load() + 1
+        resume_spins.store(n)
+        if n % 20_000 == 0 then armv7m.pend_irq(mps2.TIMER0_IRQ)
+    kernel.sleep_forever()
+
+private task_resumed() -> never
+    val me = kernel.running_task().index
+    resumed_index.store(u32(me))
+    resume_spinning.store(1)
+    kernel.sleep_until(epoch + 225)
+    armv7m.set_irq_priority(mps2.TIMER0_IRQ, 0xc0)
+    resume_armed.store(1)
+    armv7m.enable_irq(mps2.TIMER0_IRQ)
+    var at_once: u32 = 0
+    for _ in 0..<3
+        val before = resume_spins.load()
+        kernel.suspend(me)
+        val now = resume_spins.load()
+        if now > before && now == spins_at_resume.load() then at_once += 1
+    resume_armed.store(0)
+    armv7m.disable_irq(mps2.TIMER0_IRQ)
+    resume_spinning.store(0)
+    if at_once == 3
+        say("skiff: an interrupt resumed a task that suspended itself at once, 3 times\n")
+    else
+        say("skiff: a resume from an interrupt did not switch at once\n")
+    kernel.sleep_forever()
+
+// Priorities under inheritance.
+
+private var owned: Mutex = Mutex(NO_OWNER)
+
+private task_owner() -> never
+    val me = kernel.running_task().index
+    owner_index.store(u32(me))
+    kernel.sleep_until(epoch + 230)
+    val _ = owned.lock(FOREVER)
+    busy(3)
+    owned.unlock()
+    kernel.set_priority(me, 1)
+    if yielder_ran.load() != 0 then owner_yielded.store(1)
+    kernel.sleep_forever()
+
+private task_high() -> never
+    kernel.sleep_until(epoch + 231)
+    val _ = owned.lock(FOREVER)
+    owned.unlock()
+    kernel.sleep_forever()
+
+private task_yielder() -> never
+    kernel.sleep_until(epoch + 231)
+    yielder_ran.store(1)
+    kernel.sleep_forever()
+
+// Stopping a waiter, and reusing a row.
+
+private var never_given: Semaphore = Semaphore(0, 1)
+
+private task_stopped() -> never
+    stopped_index.store(u32(kernel.running_task().index))
+    kernel.sleep_until(epoch + 237)
+    if never_given.take(FOREVER) then stopped_woke.store(1) else stopped_woke.store(2)
+    kernel.sleep_forever()
+
+private task_reborn() -> never
+    reborn_index.store(u32(kernel.running_task().index))
+    kernel.sleep_forever()

@@ -1,0 +1,67 @@
+module board
+
+import sysl.sync.Atomic
+import skiff.arch.armv7m
+import skiff.kernel
+import skiff.kernel.{FOREVER, Mutex, NO_OWNER, RecursiveMutex}
+
+// The recursive mutex scenario, after streams.sysl's have finished.
+//   - Tick 180, Holder (priority 1) takes a recursive mutex three times, then gives it back once every
+//     2 ticks, working in between. At tick 181 Waiter (3) first gives it, which must be refused since
+//     it does not hold it, then takes it with a timeout of 2 ticks, which must time out, then takes it
+//     for good. At tick 182 Busy (2) starts 20 ticks of work. Waiter must get the mutex on the third
+//     give and not before, and before Busy finishes: Holder runs at Waiter's priority while it holds
+//     the mutex at any depth. Without inheritance Busy keeps Holder, and so Waiter, waiting.
+
+private var stack_holder: [256]u32 = [0; 256]
+private var stack_waiter: [256]u32 = [0; 256]
+private var stack_busy: [256]u32 = [0; 256]
+
+spawn_rmutex(cortex: *armv7m.Cortex)
+    kernel.spawn(cortex, stack_holder, &task_holder, 1, "holder")
+    kernel.spawn(cortex, stack_waiter, &task_waiter, 3, "waiter")
+    kernel.spawn(cortex, stack_busy, &task_busy, 2, "busy")
+
+private var nested: RecursiveMutex = RecursiveMutex(Mutex(NO_OWNER), 0)
+private var gives: Atomic[u32] = Atomic(0)
+private var busy_done: Atomic[u32] = Atomic(0)
+
+private task_holder() -> never
+    kernel.sleep_until(epoch + 180)
+    for _ in 0..<3
+        if !nested.take(0) then say("skiff: the holder could not take its own recursive mutex again\n")
+    for n in 1u32..3
+        busy(2)
+        // Counted before the give, since the last one switches straight to the waiter.
+        gives.store(n)
+        if !nested.give() then say("skiff: the holder's give was refused\n")
+    kernel.sleep_forever()
+
+private task_waiter() -> never
+    kernel.sleep_until(epoch + 181)
+    if nested.give()
+        say("skiff: a give by a task not holding the recursive mutex was accepted\n")
+    else
+        say("skiff: a give by a task not holding the recursive mutex was refused\n")
+    val start = kernel.ticks()
+    if nested.take(2)
+        say("skiff: a timed take of a held recursive mutex did not time out\n")
+    else if kernel.ticks() - start == 2
+        say("skiff: a timed take of a held recursive mutex timed out after 2 ticks\n")
+    else
+        say("skiff: a timed take of a held recursive mutex timed out on the wrong tick\n")
+    val _ = nested.take(FOREVER)
+    if gives.load() != 3
+        say("skiff: the waiter had the recursive mutex before the third give\n")
+    else if busy_done.load() != 0
+        say("skiff: recursive priority inversion: the busy task finished first\n")
+    else
+        say("skiff: a recursive mutex held 3 deep went to the waiter on the third give, before the busy task finished\n")
+    if !nested.give() then say("skiff: the waiter could not give the recursive mutex back\n")
+    kernel.sleep_forever()
+
+private task_busy() -> never
+    kernel.sleep_until(epoch + 182)
+    busy(20)
+    busy_done.store(1)
+    kernel.sleep_forever()

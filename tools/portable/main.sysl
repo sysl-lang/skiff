@@ -3,7 +3,7 @@
 
 import skiff.kernel
 import sysl.sync.Atomic
-import skiff.kernel.{Doorbell, Flags, Heap, Link, Machine, Mutex, NO_OWNER, Pool, Port, Protection, Queue, Ring, Semaphore}
+import skiff.kernel.{RunCounter, Doorbell, Flags, Heap, Link, Machine, MessageBuffer, Mutex, NO_OWNER, NotifyAction, Pool, Port, Protection, Queue, RecursiveMutex, Ring, Semaphore, StreamBuffer}
 
 struct Nothing
 end Nothing
@@ -33,6 +33,14 @@ end NoGuard
 
 impl Protection for NoGuard
     guard(*self, base: usize, bytes: usize) = ()
+    reserved(*self, base: usize, bytes: usize) -> usize = 0
+
+// A counter that never moves.
+struct NoCounter
+end NoCounter
+
+impl RunCounter for NoCounter
+    count(*self) -> u32 = 0
 
 struct Block
     a: u32
@@ -53,14 +61,19 @@ private var link: Link[u32, 4] = Link(&ring_out, &ring_in, &bell, Flags(0))
 // So does a `Some` of an address.
 private var first_ring: Option[*Ring[u32, 4]] = Some(&ring_out)
 
+private var counter: NoCounter = NoCounter()
+
 private var pool: Pool[Block, 2] = Pool([Block(0); 2], [false; 2], 2)
 private var heap: Heap = Heap(0, 0)
 private var arena: [64]u8 = [0; 64]
 
 private var sem: Semaphore = Semaphore(0, 1)
 private var mutex: Mutex = Mutex(NO_OWNER)
+private var nested: RecursiveMutex = RecursiveMutex(Mutex(NO_OWNER), 0)
 private var queue: Queue[u32, 2] = Queue([0, 0], 0, 0)
 private var flags: Flags = Flags(0)
+private var stream: StreamBuffer[16] = StreamBuffer([0; 16], 0, 0, 1)
+private var messages: MessageBuffer[16] = MessageBuffer(StreamBuffer([0; 16], 0, 0, 1))
 
 private task() -> never
     kernel.yield_now()
@@ -69,11 +82,29 @@ private task() -> never
     val _ = sem.give()
     val _ = sem.take(1)
     if mutex.lock(kernel.FOREVER) then mutex.unlock()
+    if nested.take(kernel.FOREVER)
+        val _ = nested.give()
     val _ = queue.send(1, 0)
     val _ = queue.receive(1)
     flags.set(1)
     flags.clear(1)
     val _ = flags.wait(1, true, 1)
+    val me = kernel.running_task().index
+    val _ = kernel.notify(me, 1, NotifyAction.SetBits)
+    val _ = kernel.notify(me, 0, NotifyAction.Increment)
+    val _ = kernel.notify(me, 2, NotifyAction.Overwrite)
+    val _ = kernel.notify(me, 3, NotifyAction.NoOverwrite)
+    val _ = kernel.notify_wait(0, 0xffff_ffff, 1)
+    val _ = kernel.notify_take(true, 1)
+    var bytes: [4]u8 = [1, 2, 3, 4]
+    val _ = stream.send(bytes, 1) + stream.receive(bytes, 1)
+    val _ = stream.send_now(bytes) + stream.receive_now(bytes)
+    val _ = stream.set_trigger(2) && stream.reset()
+    val _ = stream.available() + stream.space()
+    val _ = stream.is_empty() || stream.is_full()
+    val _ = messages.send(bytes, 1) && messages.send_now(bytes)
+    val _ = messages.receive(bytes, 1) + messages.receive_now(bytes) + messages.next_length() + messages.space()
+    val _ = messages.reset() || messages.is_empty() || messages.is_full()
     pool.alloc() match
         Some(b) -> pool.release(b)
         None -> ()
@@ -86,6 +117,16 @@ private task() -> never
     link.rung()
     val _ = ring_out.waiting()
     if kernel.stopped(kernel.running_task().index) then kernel.stop_running()
+    kernel.set_priority(me, 2)
+    val _ = kernel.priority(me) + kernel.base_priority(me)
+    kernel.suspend(me)
+    kernel.resume(me)
+    val _ = kernel.resume_from_isr(me) || kernel.suspended(me)
+    var rows: [4]kernel.TaskStats = [kernel.NO_STATS; 4]
+    val _ = kernel.task_stats(rows) + kernel.stack_high_water(me)
+    val _ = kernel.total_run_time() + u64(kernel.idle_permille())
+    kernel.reset_stats()
+    kernel.stop(me)
     kernel.sleep_forever()
 
 @export("main")
@@ -107,4 +148,5 @@ probe() -> i32
         None -> ()
     kernel.spawn(&p, stack, &task, 1, "task")
     kernel.protect(&g)
+    kernel.measure(&counter)
     kernel.run(&p, idle)

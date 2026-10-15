@@ -49,3 +49,21 @@ timer0_handler()
     timer0().intclear = 1
     fired.store(fired.load(Ordering.Relaxed) + 1, Ordering.Release)
     board_timer0_event()
+
+// CMSDK APB timer 1, at 0x4000_1000, as a free-running counter: it counts down from 2^32 - 1 on the
+// system clock with its interrupt off, and reloads to 2^32 - 1 at zero, so the counts since it started
+// are its value's complement, wrapping at 2^32.
+private const TIMER1: usize = 0x4000_1000
+
+private timer1() -> *Timer = ptr_cast(TIMER1)
+
+// Start timer 1 counting from 0.
+counter_start()
+    val t = timer1()
+    t.ctrl = 0
+    t.reload = 0xffff_ffff
+    t.value = 0xffff_ffff
+    t.ctrl = CTRL_ENABLE
+
+// Clock cycles counted since `counter_start`, modulo 2^32.
+counter_now() -> u32 = ~timer1().value

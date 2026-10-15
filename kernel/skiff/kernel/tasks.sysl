@@ -4,9 +4,11 @@ module skiff.kernel
 //
 // The highest-priority task that is ready runs. Tasks of equal priority take turns, one tick each: on
 // every tick the scheduler asks for a switch if another task of the running one's priority is ready.
-// A task that is blocked — sleeping, or waiting on a semaphore, a mutex, a queue or flags (sync.sysl) —
-// is not ready until what it waits for happens or its timeout's tick comes. An idle task, at the lowest
-// priority, runs when nothing else is ready.
+// A task that is blocked — sleeping, waiting on a semaphore, a mutex, a queue or flags (sync.sysl), or
+// waiting for a notification (notify.sysl) —
+// is not ready until what it waits for happens or its timeout's tick comes. A suspended task is not
+// chosen, ready or not, until it is resumed (control.sysl). An idle task, at the lowest priority, runs
+// when nothing else is ready.
 //
 // The kernel never touches a register itself. A `Port`, which the arch package provides, builds a
 // task's first stack frame and performs the switch. The switch hands the running task's stack pointer
@@ -40,8 +42,12 @@ trait Protection
     // Guard the bottom of the stack at `base`, `bytes` long, for the task about to run.
     guard(*self, base: usize, bytes: usize)
 
+    // How many bytes at the bottom of the stack at `base`, `bytes` long, its task can never use: the
+    // guard and anything below it. A stack's high-water mark is measured above them.
+    reserved(*self, base: usize, bytes: usize) -> usize
+
 // How many tasks the table holds, the idle task included.
-const MAX_TASKS: usize = 24
+const MAX_TASKS: usize = 48
 
 // The idle task's priority; every other task's must be higher.
 const IDLE_PRIORITY: u8 = 0
@@ -52,15 +58,16 @@ const FOREVER: u32 = 0xffff_ffff
 enum TaskState
     Ready
     Blocked
-    Stopped             // for good: it faulted, and never runs again
+    Stopped             // for good: it faulted or was stopped, and never runs again
 
 struct Task
     name: string
     stack: usize        // the address of the bottom of its stack
     stack_bytes: usize
     sp: usize           // saved while the task is not running
-    priority: u8        // what the scheduler compares: `base`, or higher while it holds a mutex wanted
+    priority: u8        // what the scheduler compares: the higher of `base` and `boost`
     base: u8            // the priority it was given
+    boost: u8           // the highest priority inherited from a mutex waiter while it holds a mutex
     state: TaskState
     on: usize           // the address of what a blocked task waits on; 0 while it only sleeps
     timed: bool         // whether a blocked task's wait ends at `wake`
@@ -70,9 +77,13 @@ struct Task
     want: u32           // the flags a task blocked on a `Flags` waits for
     want_all: bool      // …all of them, rather than any
     got: u32            // the flags that ended its wait
+    note: u32           // its notification value (notify.sysl)
+    noted: bool         // whether a notification is pending: sent and not yet waited for
+    suspended: bool     // never chosen, whatever its state, until resumed (control.sysl)
+    run_time: u64       // counts spent running (stats.sysl)
 
 // An unused row of the table.
-val NO_TASK: Task = Task("", 0, 0, 0, 0, 0, TaskState.Ready, 0, false, 0, false, 0, 0, false, 0)
+val NO_TASK: Task = Task("", 0, 0, 0, 0, 0, 0, TaskState.Ready, 0, false, 0, false, 0, 0, false, 0, 0, false, false, 0)
 
 // The table and the choices made over it. It holds no hardware state, so the host tests drive one
 // directly; the kernel keeps one of its own, `scheduler`.
@@ -81,28 +92,36 @@ struct Scheduler
     count: usize
     running: usize
 
-    // Add a task, ready to run, whose saved stack pointer is `sp`. Answers its index.
+    // Add a task, ready to run, whose saved stack pointer is `sp`. Answers its index: the first
+    // stopped row other than the running task's, which is reused, or else a new row at the end. The
+    // running task's row is never reused, since the switch away from a task that has just stopped
+    // itself still saves its stack pointer there.
     add(*self, sp: usize, priority: u8) -> usize
-        if self.count == MAX_TASKS then panic("skiff: the task table is full")
+        var at = self.count
+        for i in 0..<self.count
+            if at == self.count && i != self.running && self.tasks[i].state == TaskState.Stopped then at = i
+        if at == MAX_TASKS then panic("skiff: the task table is full")
         var t = NO_TASK
         t.sp = sp
         t.priority = priority
         t.base = priority
-        self.tasks[self.count] = t
-        self.count += 1
-        self.count - 1
+        self.tasks[at] = t
+        if at == self.count then self.count += 1
+        at
 
-    // The task that should run now: the highest-priority ready one, and among several of that
+    // Whether task `i` may be chosen: ready, and not suspended.
+    runnable(*self, i: usize) -> bool = self.tasks[i].state == TaskState.Ready && !self.tasks[i].suspended
+
+    // The task that should run now: the highest-priority runnable one, and among several of that
     // priority, the first after the running task in table order, so that they take turns. Answers the
-    // running task itself when nothing else qualifies, even if it is not ready; with an idle task in
+    // running task itself when nothing else qualifies, even if it is not runnable; with an idle task in
     // the table that cannot happen.
     choose(*self) -> usize
         var best = self.running
         var found = false
         for step in 1..self.count
             val i = (self.running + step) % self.count
-            val t = self.tasks[i]
-            if t.state == TaskState.Ready && (!found || t.priority > self.tasks[best].priority)
+            if self.runnable(i) && (!found || self.tasks[i].priority > self.tasks[best].priority)
                 best = i
                 found = true
         best
@@ -146,12 +165,16 @@ struct Scheduler
     blocked_on(*self, i: usize, on: usize) -> bool
         self.tasks[i].state == TaskState.Blocked && self.tasks[i].on == on && on != 0
 
-    // Stop the running task for good. It is never chosen again, and a switch is wanted.
-    stop_running(*self)
-        val t = &self.tasks[self.running]
+    // Stop task `i` for good. It is never chosen again, and since a stopped task is blocked on
+    // nothing, no object wakes it or hands it anything. If it is the running task, a switch is wanted.
+    stop(*self, i: usize)
+        val t = &self.tasks[i]
         t.state = TaskState.Stopped
         t.on = 0
         t.timed = false
+        t.suspended = false
+
+    stop_running(*self) = self.stop(self.running)
 
     // Make blocked task `i` ready: what it waited for has happened.
     wake(*self, i: usize)
@@ -160,13 +183,22 @@ struct Scheduler
         t.on = 0
         t.timed_out = false
 
-    // Whether task `i` should preempt the running one.
-    outranks_running(*self, i: usize) -> bool = self.tasks[i].priority > self.tasks[self.running].priority
+    // Whether task `i` should preempt the running one: it is runnable and of higher priority.
+    outranks_running(*self, i: usize) -> bool
+        self.runnable(i) && self.tasks[i].priority > self.tasks[self.running].priority
+
+    // Whether some runnable task outranks the running one.
+    preempted(*self) -> bool
+        for i in 0..<self.count
+            if self.outranks_running(i) then return true
+        false
 
     // Task `owner` holds something a task of `priority` waits for: it runs at that priority at least,
     // so that no task between the two can keep it from finishing.
     inherit(*self, owner: usize, priority: u8)
-        if self.tasks[owner].priority < priority then self.tasks[owner].priority = priority
+        val t = &self.tasks[owner]
+        if t.boost < priority then t.boost = priority
+        if t.priority < priority then t.priority = priority
 
     // Task `i` takes or gives up a mutex. It keeps any inherited priority until it holds none, so it
     // never drops below a task still waiting on one of them.
@@ -175,11 +207,21 @@ struct Scheduler
     gave_mutex(*self, i: usize)
         val t = &self.tasks[i]
         t.held -= 1
-        if t.held == 0 then t.priority = t.base
+        if t.held == 0
+            t.boost = 0
+            t.priority = t.base
+
+    // Give task `i` the priority `p`. An inherited priority higher than `p` stays until the task holds
+    // no mutex, as it would have under the old one.
+    set_priority(*self, i: usize, p: u8)
+        val t = &self.tasks[i]
+        t.base = p
+        t.priority = if t.boost > p then t.boost else p
 
     // Tick `now` has come: end every timed wait due by it, and answer whether a switch is wanted. One
-    // is when a ready task outranks the running one, when the running one is no longer ready, or when
-    // another ready task shares its priority and it is that task's turn.
+    // is when a runnable task outranks the running one, when the running one is no longer runnable, or
+    // when another runnable task shares its priority and it is that task's turn. A suspended task's
+    // wait ends here too, and it stays suspended.
     tick(*self, now: u32) -> bool
         for i in 0..<self.count
             val t = &self.tasks[i]
@@ -187,11 +229,10 @@ struct Scheduler
                 t.state = TaskState.Ready
                 t.timed_out = t.on != 0
                 t.on = 0
-        val running = self.tasks[self.running]
-        if running.state != TaskState.Ready then return true
+        if !self.runnable(self.running) then return true
+        val priority = self.tasks[self.running].priority
         for i in 0..<self.count
-            val t = self.tasks[i]
-            if i != self.running && t.state == TaskState.Ready && t.priority >= running.priority
+            if i != self.running && self.runnable(i) && self.tasks[i].priority >= priority
                 return true
         false
 
@@ -203,23 +244,30 @@ empty_scheduler() -> Scheduler = Scheduler([NO_TASK; MAX_TASKS], 0, 0)
 private[kernel] var scheduler: Scheduler = Scheduler([NO_TASK; MAX_TASKS], 0, 0)
 
 // The port, once `run` has started the tasks; until then a tick switches nothing and nothing blocks.
-private var port: Option[*Port] = None
+private[kernel] var port: Option[*Port] = None
 
 // The memory protection, if `protect` has named one: every task's stack is guarded while it runs.
-private var protection: Option[*Protection] = None
+private[kernel] var protection: Option[*Protection] = None
 
 // Add a task called `name` that starts at `entry` on `stack`, with `priority` above `IDLE_PRIORITY`.
-// Tasks are added before `run`.
+// Tasks are added before `run`, or by a running task, which reuses the row of a stopped task if there
+// is one (see `Scheduler.add`) and switches to the new task at once if it outranks the caller. The
+// stack must not be one a task that is not stopped still runs on.
 spawn(p: *Port, stack: []u32, entry: *extern() -> never, priority: u8, name: string)
     if priority == IDLE_PRIORITY then panic("skiff: a task's priority must be above the idle task's")
-    add_task(p, stack, entry, priority, name)
+    val state = enter()
+    val i = add_task(p, stack, entry, priority, name)
+    if scheduler.outranks_running(i) then request_switch()
+    leave(state)
 
-private add_task(p: *Port, stack: []u32, entry: *extern() -> never, priority: u8, name: string)
+private add_task(p: *Port, stack: []u32, entry: *extern() -> never, priority: u8, name: string) -> usize
+    paint(stack)
     val i = scheduler.add(p.new_context(stack, entry), priority)
     val t = &scheduler.tasks[i]
     t.name = name
     t.stack = usize(&stack[0])
     t.stack_bytes = stack.len * 4
+    i
 
 // Guard every task's stack with `pr` from `run` on. Called before `run`.
 protect(pr: *Protection)
@@ -228,11 +276,12 @@ protect(pr: *Protection)
 // Start the tasks, adding the idle task on `idle_stack`. Never returns. Interrupts are masked from
 // here until the first task runs, which starts with them unmasked.
 run(p: *Port, idle_stack: []u32) -> never
-    add_task(p, idle_stack, &idle_task, IDLE_PRIORITY, "idle")
+    val _ = add_task(p, idle_stack, &idle_task, IDLE_PRIORITY, "idle")
     val _ = p.mask()
     port = Some(p)
     val sp = scheduler.first()
     guard_running()
+    start_counting()
     p.start_first(sp)
 
 // Guard the running task's stack, if there is protection.
@@ -250,8 +299,9 @@ private idle_task() -> never
             None -> ()
 
 // Called by the port's switch with the running task's stack pointer; answers the next task's, with its
-// stack guarded.
+// stack guarded. The task switched away from is charged for its run time first.
 switch_context(sp: usize) -> usize
+    charge()
     val next = scheduler.switch(sp)
     guard_running()
     next
@@ -289,7 +339,7 @@ private[kernel] leave(state: u32)
         None -> ()
 
 // Whether `run` has started the tasks.
-private started() -> bool = port match
+private[kernel] started() -> bool = port match
     Some(_) -> true
     None -> false
 
@@ -336,6 +386,8 @@ sleep_forever() -> never
     loop
         sleep(FOREVER)
 
-// After a tick: ask the port for a switch if the scheduler wants one.
+// After a tick: charge the running task, and ask the port for a switch if the scheduler wants one.
 private[kernel] reschedule()
-    if started() && scheduler.tick(ticks()) then request_switch()
+    if !started() then return
+    charge()
+    if scheduler.tick(ticks()) then request_switch()

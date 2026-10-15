@@ -1,0 +1,96 @@
+module skiff.kernel
+
+// Task control: suspending and resuming a task, changing its priority, and stopping it for good. A task
+// is named by its index in the table, as `running_task().index` answers it.
+//
+// Suspending is apart from what a task waits for. A suspended task is never chosen, but a wait it was
+// blocked in carries on: an object may still wake it (a semaphore or mutex still hands itself over to
+// it as the highest waiter), and its timeout still comes. Either way it stays suspended, and the wait's
+// outcome is kept, so when it is resumed the call it was blocked in answers as the wait ended: taken
+// if it was woken, timed out if the timeout came first. FreeRTOS differs here: there a suspended task
+// leaves the object's wait list, and its call re-examines the object once it is resumed.
+//
+// Stopping is for good, and the same as a fault stopping a task: the task never runs again, and it is
+// blocked on nothing, so no object can wake it or hand it anything. A mutex it holds stays held, as in
+// FreeRTOS: the kernel does not know what the mutex protected, and so cannot know that releasing it is
+// safe. Its waiters wait until their timeouts. A later `spawn` reuses the stopped task's row.
+//
+// The idle task can be none of suspended, stopped or given another priority. Each of these may be
+// called by a task, and `suspend`, `resume_from_isr` and `stop` also by an interrupt handler whose
+// priority the port masks.
+
+// Suspend task `i`, which may be the running task: it is not chosen again until `resume`. A task that
+// suspends itself switches away at once. Suspending a suspended or stopped task does nothing.
+suspend(i: usize)
+    check_controllable(i)
+    val state = enter()
+    if scheduler.tasks[i].state != TaskState.Stopped
+        scheduler.tasks[i].suspended = true
+        if i == scheduler.running then request_switch()
+    leave(state)
+
+// Resume task `i` from a task. Resuming a task that is not suspended does nothing.
+resume(i: usize)
+    val _ = resume_from_isr(i)
+
+// Resume task `i`, from a task or from an interrupt handler. A switch is asked for only when the task,
+// now runnable, outranks the running one, and the answer is whether one was. Resuming a task that is
+// not suspended does nothing and answers false.
+resume_from_isr(i: usize) -> bool
+    check_task(i)
+    val state = enter()
+    var switched = false
+    if scheduler.tasks[i].suspended
+        scheduler.tasks[i].suspended = false
+        if scheduler.outranks_running(i)
+            request_switch()
+            switched = true
+    leave(state)
+    switched
+
+// Whether task `i` is suspended.
+suspended(i: usize) -> bool
+    check_task(i)
+    scheduler.tasks[i].suspended
+
+// Give task `i` the base priority `p`, above `IDLE_PRIORITY`. While the task holds a mutex that a
+// higher task waits for, it keeps running at that higher priority until it holds none. A switch is asked
+// for when the change leaves a runnable task outranking the running one: the running task lowered, or
+// another raised. A task waiting on an object is woken by priority when the object comes free, so the
+// new priority counts from the next wake. A raised waiter does not raise the owner of a mutex it waits
+// on; that happens when a task starts waiting.
+set_priority(i: usize, p: u8)
+    check_controllable(i)
+    if p == IDLE_PRIORITY then panic("skiff: a task's priority must be above the idle task's")
+    val state = enter()
+    if scheduler.tasks[i].state != TaskState.Stopped
+        scheduler.set_priority(i, p)
+        if scheduler.preempted() then request_switch()
+    leave(state)
+
+// The priority task `i` runs at: its base priority, or an inherited one while that is higher.
+priority(i: usize) -> u8
+    check_task(i)
+    scheduler.tasks[i].priority
+
+// The priority task `i` was given, by `spawn` or `set_priority`.
+base_priority(i: usize) -> u8
+    check_task(i)
+    scheduler.tasks[i].base
+
+// Stop task `i` for good, which may be the running task: a task that stops itself switches away at
+// once and never returns from this call. Stopping a stopped task does nothing.
+stop(i: usize)
+    check_controllable(i)
+    val state = enter()
+    if scheduler.tasks[i].state != TaskState.Stopped
+        scheduler.stop(i)
+        if i == scheduler.running then request_switch()
+    leave(state)
+
+private check_task(i: usize)
+    if i >= scheduler.count then panic("skiff: no such task")
+
+private check_controllable(i: usize)
+    check_task(i)
+    if scheduler.tasks[i].base == IDLE_PRIORITY then panic("skiff: the idle task cannot be controlled")

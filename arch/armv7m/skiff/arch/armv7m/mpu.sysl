@@ -74,6 +74,9 @@ impl Protection for Protector
         m.rbar = u32(g) | RBAR_VALID | STACK_REGION
         m.rasr = RASR_XN | size_field(STACK_GUARD_BYTES) | RASR_ENABLE
 
+    // The guard and the bytes below it, up to the first 64-byte boundary.
+    reserved(*self, base: usize, bytes: usize) -> usize = stack_guard(base) + STACK_GUARD_BYTES - base
+
 // Turn the MPU on with the null guard, and an empty stack guard until the first task runs. Call before
 // `kernel.run`, with `kernel.protect(&protector)`.
 enable_protection()

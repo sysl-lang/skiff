@@ -1,0 +1,253 @@
+module skiff.kernel
+
+// Stream buffers and message buffers: bytes passed from one writer to one reader through a ring in the
+// program's storage, with no allocation.
+//
+// A `StreamBuffer[N]` carries a stream of up to `N` bytes with no boundaries in it. A reader waits
+// until at least its trigger level of bytes is there, so a reader that wants whole records of four
+// bytes is woken once per record, not once per byte. A `MessageBuffer[N]` is built on one and carries
+// whole messages: each is stored behind a length prefix, and is received whole or not at all.
+//
+// Both are written as constructors over constants, so that a bare-metal image lays them in as data:
+// `StreamBuffer([0; 64], 0, 0, 1)` (the last field is the trigger level) and
+// `MessageBuffer(StreamBuffer([0; 64], 0, 0, 1))`.
+//
+// The waits take a timeout in ticks, as every wait does: `FOREVER`, 0 for "only what can be done now",
+// or a count. `send_now` and `receive_now` never wait, so an interrupt handler whose priority the port
+// masks may call them; they ask for a switch only when they wake a task that outranks the running one.
+// There may be one writer and one reader at a time: a second task waiting on the same side would be
+// woken in the first one's place.
+//
+// A blocked reader waits on the stream's address and a blocked writer on the address + 1.
+
+// The bytes in front of every message in a message buffer: its length, least significant byte first.
+const MESSAGE_PREFIX: usize = 4
+
+// A ring of up to `N` bytes, written by one task or handler and read by another.
+struct StreamBuffer[const N: usize]
+    bytes: [N]u8
+    head: usize         // the oldest byte's index
+    len: usize
+    trigger: usize      // the bytes a waiting reader needs, from 1 to N
+
+    // Write as many of `data` as fit, waiting up to `timeout` ticks for room for the rest. Answers how
+    // many were written, from 0 (the timeout came with the ring full) to all of them.
+    send(*self, data: []const u8, timeout: u32) -> usize
+        val deadline = ticks() + timeout
+        var sent: usize = 0
+        var timed_out = false
+        loop
+            val state = enter()
+            val n = self.fill(data, sent)
+            sent += n
+            if n > 0 then self.wake_reader()
+            if sent == data.len || timed_out
+                leave(state)
+                return sent
+            val left = remaining(timeout, deadline)
+            if left == 0
+                leave(state)
+                return sent
+            timed_out = !wait(state, wait_key(self, 1), left)
+
+    // Read up to `buf.len` bytes into `buf`, waiting up to `timeout` ticks for the trigger level to be
+    // reached. Answers how many were read: once the trigger level is reached, as many as are there and
+    // fit; if the timeout comes first, whatever is there, which may be none.
+    receive(*self, buf: []u8, timeout: u32) -> usize
+        val deadline = ticks() + timeout
+        var timed_out = false
+        loop
+            val state = enter()
+            val left = remaining(timeout, deadline)
+            if self.ready() || timed_out || left == 0
+                val n = self.drain(buf)
+                if n > 0 then wake_one(wait_key(self, 1))
+                leave(state)
+                return n
+            timed_out = !wait(state, wait_key(self, 0), left)
+
+    // Write as many of `data` as fit without waiting, from a task or an interrupt handler. Answers how
+    // many were written. Wakes a waiting reader once the trigger level is reached.
+    send_now(*self, data: []const u8) -> usize
+        val state = enter()
+        val n = self.fill(data, 0)
+        if n > 0 then self.wake_reader()
+        leave(state)
+        n
+
+    // Read as many bytes as are there and fit in `buf`, whatever the trigger level, without waiting,
+    // from a task or an interrupt handler. Answers how many were read. Wakes a writer waiting for room.
+    receive_now(*self, buf: []u8) -> usize
+        val state = enter()
+        val n = self.drain(buf)
+        if n > 0 then wake_one(wait_key(self, 1))
+        leave(state)
+        n
+
+    // Set the trigger level a waiting reader needs; 0 means 1. Answers false, changing nothing, for a
+    // level above `N`. A reader already waiting is woken if the new level is met.
+    set_trigger(*self, level: usize) -> bool
+        if level > N then return false
+        val state = enter()
+        self.trigger = if level == 0 then 1 else level
+        self.wake_reader()
+        leave(state)
+        true
+
+    // Empty the ring. Answers false, changing nothing, while a task waits to read or write.
+    reset(*self) -> bool
+        val state = enter()
+        val waiting = scheduler.waiter(wait_key(self, 0)).is_some() || scheduler.waiter(wait_key(self, 1)).is_some()
+        if !waiting
+            self.head = 0
+            self.len = 0
+        leave(state)
+        !waiting
+
+    // The bytes there to read.
+    available(*self) -> usize = self.len
+
+    // The bytes there is room for.
+    space(*self) -> usize = N - self.len
+
+    is_empty(*self) -> bool = self.len == 0
+
+    is_full(*self) -> bool = self.len == N
+
+    // Whether a waiting reader may have what is there.
+    private ready(*self) -> bool = self.len > 0 && self.len >= self.trigger
+
+    // Wake the reader if it waits and may have what is there. The kernel's interrupts are held off.
+    private wake_reader(*self)
+        if self.ready() then wake_one(wait_key(self, 0))
+
+    // Index `i` of the ring, for `i` below 2N.
+    private at(*self, i: usize) -> usize = if i >= N then i - N else i
+
+    // Copy what fits of `data`, from index `from` on, to the end of the ring. Answers how many bytes.
+    private fill(*self, data: []const u8, from: usize) -> usize
+        var n: usize = 0
+        while from + n < data.len && self.len < N
+            self.bytes[self.at(self.head + self.len)] = data[from + n]
+            self.len += 1
+            n += 1
+        n
+
+    // Move what fits of the oldest bytes into `buf`. Answers how many bytes.
+    private drain(*self, buf: []u8) -> usize
+        var n: usize = 0
+        while n < buf.len && self.len > 0
+            buf[n] = self.bytes[self.head]
+            self.head = self.at(self.head + 1)
+            self.len -= 1
+            n += 1
+        n
+
+    // Byte `k` from the oldest, which is there.
+    private peek(*self, k: usize) -> u8 = self.bytes[self.at(self.head + k)]
+
+    // Drop the oldest `count` bytes, which are there.
+    private skip(*self, count: usize)
+        self.head = self.at(self.head + count)
+        self.len -= count
+
+// Whole messages through a stream buffer of `N` bytes. Each message takes `MESSAGE_PREFIX` bytes of
+// it more than its own length, so the longest that can be sent is `N - MESSAGE_PREFIX`.
+struct MessageBuffer[const N: usize]
+    stream: StreamBuffer[N]
+
+    // Send `message` whole, waiting up to `timeout` ticks for room for all of it. Answers whether it
+    // was sent; an empty message, or one longer than the buffer could ever hold, is refused at once.
+    send(*self, message: []const u8, timeout: u32) -> bool
+        if message.len == 0 || message.len > N - MESSAGE_PREFIX then return false
+        val deadline = ticks() + timeout
+        var timed_out = false
+        loop
+            val state = enter()
+            if self.stream.space() >= message.len + MESSAGE_PREFIX
+                self.put(message)
+                leave(state)
+                return true
+            val left = remaining(timeout, deadline)
+            if timed_out || left == 0
+                leave(state)
+                return false
+            timed_out = !wait(state, wait_key(&self.stream, 1), left)
+
+    // Receive the oldest message into `buf`, waiting up to `timeout` ticks for one. Answers its length,
+    // or 0 if the timeout came first or `buf` is too short for it, which leaves it to be received.
+    receive(*self, buf: []u8, timeout: u32) -> usize
+        val deadline = ticks() + timeout
+        var timed_out = false
+        loop
+            val state = enter()
+            val left = remaining(timeout, deadline)
+            if !self.stream.is_empty() || timed_out || left == 0
+                val n = self.take(buf)
+                leave(state)
+                return n
+            timed_out = !wait(state, wait_key(&self.stream, 0), left)
+
+    // Send `message` whole if there is room now, from a task or an interrupt handler. Answers whether
+    // it was sent.
+    send_now(*self, message: []const u8) -> bool
+        if message.len == 0 || message.len > N - MESSAGE_PREFIX then return false
+        val state = enter()
+        val fits = self.stream.space() >= message.len + MESSAGE_PREFIX
+        if fits then self.put(message)
+        leave(state)
+        fits
+
+    // Receive the oldest message into `buf` if there is one, from a task or an interrupt handler.
+    // Answers its length, or 0 if there is none or `buf` is too short for it.
+    receive_now(*self, buf: []u8) -> usize
+        val state = enter()
+        val n = self.take(buf)
+        leave(state)
+        n
+
+    // The length of the oldest message, 0 if there is none.
+    next_length(*self) -> usize
+        val state = enter()
+        val n = self.length()
+        leave(state)
+        n
+
+    // Empty the buffer. Answers false, changing nothing, while a task waits to send or receive.
+    reset(*self) -> bool = self.stream.reset()
+
+    // The longest message there is room for now.
+    space(*self) -> usize
+        val free = self.stream.space()
+        if free > MESSAGE_PREFIX then free - MESSAGE_PREFIX else 0
+
+    is_empty(*self) -> bool = self.stream.is_empty()
+
+    // Whether there is no room for a message even one byte long.
+    is_full(*self) -> bool = self.space() == 0
+
+    // Write `message` behind its length; the room has been checked. Wakes the reader.
+    private put(*self, message: []const u8)
+        val n = message.len
+        val prefix: [MESSAGE_PREFIX]u8 = [u8(n & 0xff), u8((n >> 8) & 0xff), u8((n >> 16) & 0xff), u8((n >> 24) & 0xff)]
+        val _ = self.stream.fill(prefix, 0)
+        val _ = self.stream.fill(message, 0)
+        self.stream.wake_reader()
+
+    // The oldest message's length, from its prefix; 0 if there is none.
+    private length(*self) -> usize
+        if self.stream.is_empty() then return 0
+        var n: usize = 0
+        for k in 0..<MESSAGE_PREFIX
+            n = n | (usize(self.stream.peek(k)) << (8 * k))
+        n
+
+    // Move the oldest message into `buf` if it fits, waking a writer waiting for room. Answers its
+    // length, or 0 if there is none or it does not fit.
+    private take(*self, buf: []u8) -> usize
+        val n = self.length()
+        if n == 0 || n > buf.len then return 0
+        self.stream.skip(MESSAGE_PREFIX)
+        val got = self.stream.drain(buf[0..<n])
+        wake_one(wait_key(&self.stream, 1))
+        got

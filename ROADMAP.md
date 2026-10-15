@@ -127,7 +127,7 @@ is run by hand until a flashing-and-serial harness exists.
 | 0 | Boot, UART, exit: vector table, reset handler, `.data`/`.bss`, the CMSDK UART | `skiff: hello` on `mps2-an500` and `mps2-an386`, QEMU exits 0 ✅ |
 | 1 | Exceptions and interrupts: NVIC, SysTick, fault handlers that report CFSR/HFSR/MMFAR | `skiff: tick 3`, and a deliberate bus fault is reported, not hung on ✅ |
 | 2 | Tasks: static task table, PendSV context switch, preemptive priority scheduler, FPU context with lazy stacking | two tasks at one priority interleave on the tick; a higher-priority task preempts at once; FP registers survive a switch ✅ |
-| 3 | Synchronisation: mutex with priority inheritance, semaphores, message queues, event flags; timeouts; giving from an interrupt | a priority-inversion scenario completes in bounded time; a timed wait times out; interrupt-to-task latency measured ✅ (on QEMU, in its virtual cycles; the real figure comes on the board) |
+| 3 | Synchronisation: mutex with priority inheritance, semaphores, message queues, event flags; timeouts; giving from an interrupt | a priority-inversion scenario completes in bounded time; a timed wait times out; interrupt-to-task latency measured ✅ (on QEMU, in its virtual cycles; the real figure comes on the board. Task notifications, FreeRTOS-style, were added after milestone 5: set bits, increment, overwrite and no-overwrite, waits with entry and exit masks, a counting take, from an interrupt as well. Stream and message buffers, FreeRTOS-style, followed: a byte ring with a trigger level, partial sends and non-blocking sends and receives for interrupts, and whole length-prefixed messages on top of it. A recursive mutex, FreeRTOS-style, followed: its owner may take it again, it is released when the gives balance the takes, a give by a task that does not hold it is refused, and inheritance and timeouts are the plain mutex's. Task control, FreeRTOS-style, followed: suspend and resume (also from an interrupt, switching only for a task that outranks the running one), setting a task's priority under inheritance, and stopping a task for good, with its row reused by a later spawn) |
 | 4 | Memory and protection: the MPU (stack guards, null guard, peripheral regions), static pools, the optional heap | a task overflowing its stack is caught by the MPU and reported; pools reclaim exactly ✅ (stack and null guards, pools, heap; a faulting task is stopped and the rest run on. Peripheral regions are still owed: tasks run privileged over the default map, which already makes peripherals Device and never-execute, so an explicit region would change nothing a test could see until tasks run unprivileged) |
 | 5 | Two cores on `mps2-an521`: the second image, release, the shared region, the MHU doorbell, IPC rings | messages both ways under load, every count exact; the second core's hello ✅ (10,000 each way under multi-threaded TCG, half polled and half woken by the MHU; the M33s run the armv7m package, since Armv8-M Mainline keeps everything it uses, plus `arch/armv8m`, whose stack limit (PSPLIM) guards each task's stack; a task that crosses it is stopped and the link test finishes. A null guard on the M33s is still owed: PMSAv8 has no no-access permission, so it needs the background map off and a region for everything else) |
 | 6 | The H747I-DISCO: clocks (PLLs to 480/240 MHz), USART through the ST-LINK's virtual COM port, flashing both images, HSEM release and IPC | `skiff: hello` from both cores on the board; milestone 5's IPC test passes there |
@@ -135,6 +135,16 @@ is run by hand until a flashing-and-serial harness exists.
 | 8 | Storage: the SDMMC driver behind a block-device trait; FAT (`sh.sysl.fat`) and KFS on the card | a file written survives a power cycle; the card reads on a PC |
 | 9 | Audio: SAI and DMA on the M4 with the board's codec, double-buffered; samples to the M7 through IPC | a WAV file recorded to the SD card plays back correctly on a PC: the recorder's first slice |
 | 10 | Low power: tickless idle, stop mode with a wake source | the idle current drops, measured on the board; timers stay correct across stop |
+
+## Kernel features beside the milestones
+
+| feature | done when |
+|---|---|
+| Task notifications | an interrupt's notification wakes a task at once; set bits, increment, overwrite, no-overwrite ✅ |
+| Stream and message buffers | bytes and framed messages cross the ring's end whole and in order, with a trigger level ✅ |
+| Recursive mutex | nested takes, a refused non-owner give, the hand-over on the last give ✅ |
+| Task control | suspend, resume (from an interrupt too), priorities with inherited boosts, stop, row reuse ✅ |
+| Run-time statistics and stack high-water marks | per-task run time from a board counter (CMSDK timer 1 on QEMU), a total, an idle share, a snapshot with no allocation, reset; painted stacks scanned above the guard ✅ |
 
 ## What skiff reuses rather than writes
 

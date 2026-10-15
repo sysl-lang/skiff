@@ -1,0 +1,361 @@
+module skiff.kernel
+@tests
+
+// Task control on the host, through a port that stands in for the processor. A call that switches away
+// from the running task asks the port for a switch; the port answers by letting ticks pass until the
+// task may run again, acting on the way as another task or an interrupt would if the test said to. So
+// what a real switch would hand back to the task can be read off the call's answer and the tick count.
+
+// What the port does on a chosen tick, as another task or an interrupt.
+enum Act
+    Nothing
+    Suspend
+    Resume      // from an interrupt: `resume_from_isr`
+    Give        // the port's semaphore
+
+struct Event
+    at: u32
+    act: Act
+    task: usize
+
+val NO_EVENT: Event = Event(0, Act.Nothing, 0)
+
+// A port that counts the switches asked of it and the masks held, and runs the clock while the running
+// task may not run (blocked, suspended or stopped): up to `limit` ticks, with the task the scheduler
+// chooses running in its place, acting on `events` on their ticks. `resumes` counts the resumes from an
+// interrupt that answered that they switched.
+struct ControlPort
+    switches: u32
+    masks: u32
+    advancing: bool
+    limit: u32
+    events: [4]Event
+    sem: *Semaphore
+    resumes: u32
+
+    act(*self, e: Event)
+        e.act match
+            Act.Nothing -> ()
+            Act.Suspend -> suspend(e.task)
+            Act.Resume -> if resume_from_isr(e.task) then self.resumes += 1
+            Act.Give ->
+                val _ = self.sem.give()
+
+impl Port for ControlPort
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize = usize(&stack[0])
+
+    request_switch(*self)
+        if self.advancing then return
+        self.switches += 1
+        self.advancing = true
+        var n: u32 = 0
+        val me = scheduler.running
+        while !scheduler.runnable(me) && n < self.limit
+            scheduler.running = scheduler.choose()
+            tick()
+            for k in 0..<4
+                val e = self.events[k]
+                if e.at == ticks() then self.act(e)
+            n += 1
+        scheduler.running = me
+        self.advancing = false
+
+    start_first(*self, sp: usize) -> never
+        loop
+            ()
+
+    mask(*self) -> u32
+        self.masks += 1
+        self.masks
+
+    restore(*self, state: u32)
+        if state != self.masks then panic("restored out of order")
+        self.masks -= 1
+
+    idle(*self) = ()
+
+private control_port(sem: *Semaphore) -> ControlPort = ControlPort(0, 0, false, 100, [NO_EVENT; 4], sem, 0)
+
+// The kernel's table, emptied, with a task per entry of `priorities`; task 0 runs, through `p`.
+private setup(p: *ControlPort, priorities: []const u8)
+    scheduler = empty_scheduler()
+    for pr in priorities
+        val _ = scheduler.add(0, pr)
+    scheduler.running = 0
+    port = Some(p)
+
+// Task `i` blocks for good on `sem`; task 0 runs again.
+private wait_as(sem: *Semaphore, i: usize)
+    scheduler.running = i
+    scheduler.block(ticks(), wait_key(sem, 0), FOREVER)
+    scheduler.running = 0
+
+private entry() -> never
+    loop
+        ()
+
+@test("a suspended ready task is not chosen until resumed, and resuming it preempts")
+suspend_ready()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [1, 2])
+    assert_eq(scheduler.choose(), 1)
+    suspend(1)
+    assert(suspended(1), "suspended")
+    assert_eq(p.switches, 0)
+    assert_eq(scheduler.choose(), 0)
+    assert(!scheduler.tick(ticks()), "no switch for a suspended task")
+    resume(1)
+    assert(!suspended(1), "resumed")
+    assert_eq(p.switches, 1)
+    assert_eq(scheduler.choose(), 1)
+
+@test("a suspended task whose wait times out stays suspended, and its wait answers timed out")
+suspend_blocked_timeout()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [1, 1])
+    val start = ticks()
+    p.events[0] = Event(start + 2, Act.Suspend, 0)
+    p.events[1] = Event(start + 9, Act.Resume, 0)
+    assert(!sem.take(5), "timed out")
+    assert_eq(ticks() - start, 9)
+    assert(!suspended(0), "resumed")
+
+@test("a suspended task woken by a give stays suspended, and its wait answers taken")
+suspend_blocked_given()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [1, 1])
+    val start = ticks()
+    p.events[0] = Event(start + 2, Act.Suspend, 0)
+    p.events[1] = Event(start + 3, Act.Give, 0)
+    p.events[2] = Event(start + 9, Act.Resume, 0)
+    assert(sem.take(FOREVER), "taken")
+    assert_eq(ticks() - start, 9)
+    assert_eq(sem.count, 0)
+
+@test("a woken suspended task asks for no switch, however high its priority")
+suspend_blocked_no_switch()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [1, 3])
+    wait_as(&sem, 1)
+    suspend(1)
+    assert(sem.give(), "given")
+    assert(scheduler.tasks[1].state == TaskState.Ready, "woken")
+    assert_eq(p.switches, 0)
+    assert_eq(scheduler.choose(), 0)
+
+@test("a task that suspends itself switches at once, and runs again only when resumed")
+suspend_self()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [1, 1])
+    val start = ticks()
+    p.events[0] = Event(start + 4, Act.Resume, 0)
+    suspend(0)
+    assert_eq(p.switches, 1)
+    assert_eq(ticks() - start, 4)
+    assert(!suspended(0), "resumed")
+
+@test("a suspended running task is no longer chosen, and the tick wants a switch")
+suspended_running_not_chosen()
+    var s = empty_scheduler()
+    val _ = s.add(0, 2)
+    val _ = s.add(0, 1)
+    s.running = 0
+    s.tasks[0].suspended = true
+    assert(s.tick(0), "a switch")
+    assert_eq(s.choose(), 1)
+
+@test("resuming a task that is not suspended does nothing and asks for no switch")
+resume_not_suspended()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [1, 3])
+    assert(!resume_from_isr(1), "no switch")
+    resume(1)
+    assert_eq(p.switches, 0)
+    assert(!suspended(1), "still not suspended")
+
+@test("a resume from an interrupt preempts only for a task that outranks the running one")
+resume_from_isr_preempts()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [2, 3, 1, 2, 3])
+    for i in 1usize..4
+        suspend(i)
+    assert(resume_from_isr(1), "higher: a switch")
+    assert_eq(p.switches, 1)
+    assert(!resume_from_isr(2), "lower: none")
+    assert(!resume_from_isr(3), "equal: none")
+    assert_eq(p.switches, 1)
+    wait_as(&sem, 4)
+    suspend(4)
+    assert(!resume_from_isr(4), "still blocked: none")
+    assert(scheduler.tasks[4].state == TaskState.Blocked, "still blocked")
+
+@test("an interrupt resumes a task that suspended itself, preempting the task that ran in its place")
+resume_self_from_isr()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [3, 1])
+    val start = ticks()
+    p.events[0] = Event(start + 3, Act.Resume, 0)
+    suspend(0)
+    assert_eq(ticks() - start, 3)
+    assert_eq(p.resumes, 1)
+
+@test("raising another task above the running one preempts, and lowering the running one yields")
+raise_and_lower()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [2, 1, 1])
+    set_priority(1, 2)
+    assert_eq(priority(1), 2)
+    assert_eq(p.switches, 0)
+    set_priority(1, 3)
+    assert_eq(priority(1), 3)
+    assert_eq(base_priority(1), 3)
+    assert_eq(p.switches, 1)
+    set_priority(1, 1)
+    set_priority(0, 1)
+    assert_eq(p.switches, 1)
+    set_priority(0, 3)
+    set_priority(2, 2)
+    assert_eq(p.switches, 1)
+    set_priority(0, 1)
+    assert_eq(p.switches, 2)
+    assert_eq(priority(0), 1)
+
+@test("a suspended task raised above the running one asks for no switch")
+raise_suspended()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [2, 1])
+    suspend(1)
+    set_priority(1, 5)
+    assert_eq(p.switches, 0)
+    assert_eq(priority(1), 5)
+
+@test("an inherited priority outlasts a lower base priority, and the base comes back with the mutex")
+priority_under_inheritance()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    var m = Mutex(NO_OWNER)
+    setup(&p, [1, 4])
+    assert(m.lock(0), "task 0 holds it")
+    scheduler.running = 1
+    scheduler.block(ticks(), wait_key(&m, 0), FOREVER)
+    scheduler.inherit(0, 4)
+    scheduler.running = 0
+    set_priority(0, 2)
+    assert_eq(priority(0), 4)
+    assert_eq(base_priority(0), 2)
+    set_priority(0, 6)
+    assert_eq(priority(0), 6)
+    set_priority(0, 3)
+    assert_eq(priority(0), 4)
+    m.unlock()
+    assert_eq(m.owner, 1)
+    assert_eq(priority(0), 3)
+    assert_eq(base_priority(0), 3)
+
+@test("a waiter's new priority decides which waiter an object wakes")
+waiter_priority_reorders()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [1, 2, 3])
+    wait_as(&sem, 1)
+    wait_as(&sem, 2)
+    set_priority(1, 4)
+    assert(sem.give(), "given")
+    assert(scheduler.tasks[1].state == TaskState.Ready, "the raised waiter is woken")
+    assert(scheduler.tasks[2].state == TaskState.Blocked, "the other still waits")
+
+@test("a stopped waiter leaves the wait list, so a give goes to the count")
+stop_waiter()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [1, 2])
+    wait_as(&sem, 1)
+    stop(1)
+    assert(stopped(1), "stopped")
+    assert_eq(p.switches, 0)
+    assert(sem.give(), "given")
+    assert_eq(sem.count, 1)
+    assert(stopped(1), "still stopped")
+    assert_eq(scheduler.choose(), 0)
+
+@test("a stopped task is not resumed, given a priority or stopped again")
+stop_is_for_good()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [1, 2])
+    suspend(1)
+    stop(1)
+    assert(!suspended(1), "no longer suspended")
+    assert(!resume_from_isr(1), "nothing to resume")
+    suspend(1)
+    assert(!suspended(1), "not suspended")
+    set_priority(1, 5)
+    assert_eq(priority(1), 2)
+    stop(1)
+    assert(stopped(1), "stopped")
+    assert_eq(p.switches, 0)
+
+@test("a task that stops itself switches at once and is never runnable again")
+stop_self()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [1, 1])
+    p.limit = 5
+    val start = ticks()
+    stop(0)
+    assert_eq(p.switches, 1)
+    assert(stopped(0), "stopped")
+    assert_eq(ticks() - start, 5)
+    assert_eq(scheduler.choose(), 1)
+
+@test("a stopped mutex holder keeps the mutex, and a waiter times out")
+stopped_holder_keeps_mutex()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    var m = Mutex(NO_OWNER)
+    setup(&p, [1, 1])
+    scheduler.running = 1
+    assert(m.lock(0), "task 1 holds it")
+    scheduler.running = 0
+    stop(1)
+    val start = ticks()
+    assert(!m.lock(3), "timed out")
+    assert_eq(ticks() - start, 3)
+    assert_eq(m.owner, 1)
+
+@test("a spawn reuses a stopped task's row, but never the running task's")
+slot_reuse()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [1, 1, 1])
+    var stack: [16]u32 = [0; 16]
+    stop(1)
+    spawn(&p, stack, &entry, 2, "new")
+    assert_eq(scheduler.count, 3)
+    assert(scheduler.tasks[1].name == "new", "row 1 reused")
+    assert(!stopped(1), "ready")
+    assert_eq(priority(1), 2)
+    assert_eq(p.switches, 1)
+    scheduler.tasks[0].state = TaskState.Stopped
+    assert_eq(scheduler.add(0, 1), 3)
+    assert_eq(scheduler.count, 4)
+
+@test("a spawn that does not outrank the running task asks for no switch")
+spawn_lower()
+    var sem = Semaphore(0, 1)
+    var p = control_port(&sem)
+    setup(&p, [2])
+    var stack: [16]u32 = [0; 16]
+    spawn(&p, stack, &entry, 1, "low")
+    assert_eq(scheduler.count, 2)
+    assert_eq(p.switches, 0)

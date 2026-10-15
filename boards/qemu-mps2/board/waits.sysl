@@ -38,7 +38,7 @@ spawn_waits(cortex: *armv7m.Cortex)
     kernel.spawn(cortex, stack_flag_set, &task_flag_set, 2, "flag set")
 
 // Work for `ticks` ticks without blocking or yielding.
-private busy(ticks: u32)
+private[board] busy(ticks: u32)
     val start = kernel.ticks()
     while kernel.ticks() - start < ticks
         ()
@@ -88,6 +88,9 @@ timer0_event()
     if armed.load() != 0
         interrupt_at.store(armv7m.systick_now())
         val _ = from_timer.give()
+    notes_timer_event()
+    streams_timer_event()
+    control_timer_event()
 
 private task_timer() -> never
     var board = Board()

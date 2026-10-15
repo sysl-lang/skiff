@@ -1,0 +1,139 @@
+module board
+
+import sysl.sync.Atomic
+import skiff.arch.armv7m
+import skiff.chip.mps2
+import skiff.kernel
+import skiff.kernel.{Machine, MessageBuffer, StreamBuffer}
+
+// The stream and message buffer scenarios, after notes.sysl's have finished.
+//   - Tick 135, a task of low priority spins, raising timer 0's interrupt from software every 20,000
+//     counts, and the interrupt sends one byte, counting up, into a stream buffer of 10 bytes whose
+//     trigger level is 4. A task of high priority receives from it five times. Each receive must
+//     answer exactly 4 bytes, the next 4 in order, so the 20 bytes cross the ring's end twice; and each
+//     wake must come straight from the interrupt that sent the fourth byte: the spinner must not have
+//     counted once since it.
+//   - Tick 160, a task sends 40 messages of 1 to 9 bytes into a message buffer of 24 bytes, faster
+//     than a task of lower priority receives them, so the sender waits for room and the messages and
+//     their length prefixes cross the ring's end again and again. Every message must arrive whole and
+//     in order. Before the sixth (6 bytes) the receiver offers a buffer of 2 bytes, which must answer
+//     0 and leave the message to be received whole.
+
+private var stack_stream_reader: [256]u32 = [0; 256]
+// 2 KiB, so that its working stack never shares a page with its guard (notes.sysl's spinner says why).
+private var stack_stream_spinner: [512]u32 = [0; 512]
+private var stack_message_sender: [256]u32 = [0; 256]
+private var stack_message_receiver: [256]u32 = [0; 256]
+
+spawn_streams(cortex: *armv7m.Cortex)
+    kernel.spawn(cortex, stack_stream_reader, &task_stream_reader, 3, "stream reader")
+    kernel.spawn(cortex, stack_stream_spinner, &task_stream_spinner, 2, "stream spinner")
+    kernel.spawn(cortex, stack_message_sender, &task_message_sender, 3, "message sender")
+    kernel.spawn(cortex, stack_message_receiver, &task_message_receiver, 2, "message receiver")
+
+// An interrupt's bytes, through a stream buffer, to a task.
+
+private var stream: StreamBuffer[10] = StreamBuffer([0; 10], 0, 0, 4)
+private var stream_armed: Atomic[u32] = Atomic(0)
+private var stream_spinning: Atomic[u32] = Atomic(0)
+private var next_byte: Atomic[u32] = Atomic(0)
+private var stream_spins: Atomic[u32] = Atomic(0)
+private var spins_at_byte: Atomic[u32] = Atomic(0)
+
+// From timer 0's interrupt, once the scenario arms it: note how far the spinner had counted, and send
+// the next byte.
+private[board] streams_timer_event()
+    if stream_armed.load() != 0
+        spins_at_byte.store(stream_spins.load())
+        val byte: [1]u8 = [u8(next_byte.load() & 0xff)]
+        if stream.send_now(byte) == 1 then next_byte.store(next_byte.load() + 1)
+
+private task_stream_spinner() -> never
+    kernel.sleep_until(epoch + 135)
+    while stream_spinning.load() != 0
+        val n = stream_spins.load() + 1
+        stream_spins.store(n)
+        if n % 20_000 == 0 then armv7m.pend_irq(mps2.TIMER0_IRQ)
+    kernel.sleep_forever()
+
+private task_stream_reader() -> never
+    var board = Board()
+    stream_spinning.store(1)
+    kernel.sleep_until(epoch + 135)
+    armv7m.set_irq_priority(mps2.TIMER0_IRQ, 0xc0)
+    stream_armed.store(1)
+    armv7m.enable_irq(mps2.TIMER0_IRQ)
+    var buf: [8]u8 = [0; 8]
+    var expect: u32 = 0
+    var whole: u32 = 0
+    var at_once: u32 = 0
+    for _ in 0..<5
+        val got = stream.receive(buf, 50)
+        if stream_spins.load() == spins_at_byte.load() then at_once += 1
+        var in_order = got == 4
+        for k in 0..<got
+            if u32(buf[k]) != expect & 0xff then in_order = false
+            expect += 1
+        if in_order then whole += 1
+    stream_armed.store(0)
+    armv7m.disable_irq(mps2.TIMER0_IRQ)
+    stream_spinning.store(0)
+    if whole == 5 && at_once == 5
+        say("skiff: an interrupt streamed 20 bytes to a task, 4 at a time in order, waking it at once\n")
+    else
+        board.write("skiff: a stream receive had 4 bytes in order ".bytes)
+        kernel.write_dec(&board, whole)
+        board.write(" of 5 times, and woke at once ".bytes)
+        kernel.write_dec(&board, at_once)
+        board.write(" of 5 times\n".bytes)
+    kernel.sleep_forever()
+
+// Framed messages from one task to another, across the ring's end.
+
+private var messages: MessageBuffer[24] = MessageBuffer(StreamBuffer([0; 24], 0, 0, 1))
+private var refused_sends: Atomic[u32] = Atomic(0)
+
+private val MESSAGES: u32 = 40
+
+// The `k`th byte of message `i`, which is `i % 9 + 1` bytes long.
+private message_byte(i: u32, k: u32) -> u8 = u8((i * 3 + k) & 0xff)
+
+private task_message_sender() -> never
+    kernel.sleep_until(epoch + 160)
+    var msg: [9]u8 = [0; 9]
+    for i in 0..<MESSAGES
+        val n = i % 9 + 1
+        for k in 0..<n
+            msg[k] = message_byte(i, k)
+        if !messages.send(msg[0..<usize(n)], 50) then refused_sends.store(refused_sends.load() + 1)
+    kernel.sleep_forever()
+
+private task_message_receiver() -> never
+    var board = Board()
+    kernel.sleep_until(epoch + 160)
+    var buf: [16]u8 = [0; 16]
+    var short: [2]u8 = [0; 2]
+    var whole: u32 = 0
+    var left_whole = false
+    for i in 0..<MESSAGES
+        val n = i % 9 + 1
+        if i == 5
+            left_whole = messages.receive(short, 50) == 0 && messages.next_length() == 6
+        val got = messages.receive(buf, 50)
+        var same = got == usize(n)
+        for k in 0..<n
+            if buf[k] != message_byte(i, k) then same = false
+        if same then whole += 1
+    if whole == MESSAGES && refused_sends.load() == 0
+        say("skiff: 40 framed messages arrived whole and in order across the ring's end\n")
+    else
+        board.write("skiff: framed messages arrived whole ".bytes)
+        kernel.write_dec(&board, whole)
+        board.write(" of 40 times, ".bytes)
+        kernel.write_dec(&board, refused_sends.load())
+        board.write(" sends refused\n".bytes)
+    if left_whole
+        say("skiff: a receive buffer too short for a message left it whole\n")
+    else
+        say("skiff: a receive buffer too short for a message took it\n")
+    kernel.sleep_forever()

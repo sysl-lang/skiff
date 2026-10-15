@@ -1,0 +1,176 @@
+module skiff.kernel
+@tests
+
+// The recursive mutex on the host, through a port that stands in for the processor. A take that waits
+// blocks the running task and asks the port for a switch; the port answers by letting ticks pass until
+// the task is ready again, giving the mutex on the way as another task if the test said to. So what a
+// real switch would hand back to the waiting task can be read off the take's answer and the tick count.
+
+// A port that runs the clock while the running task is blocked, up to `limit` ticks. From tick `at`
+// (0 for never) it gives `mutex` once a tick as task `giver`, `gives` times, counting the gives
+// refused, and notes the lowest priority the giver ran at when it gave.
+struct MutexPort
+    masks: u32
+    advancing: bool
+    limit: u32
+    at: u32
+    gives: u32
+    giver: usize
+    refused: u32
+    giver_priority: u8
+    mutex: *RecursiveMutex
+
+impl Port for MutexPort
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize = usize(&stack[0])
+
+    request_switch(*self)
+        if self.advancing then return
+        self.advancing = true
+        var n: u32 = 0
+        val me = scheduler.running
+        while scheduler.tasks[me].state == TaskState.Blocked && n < self.limit
+            tick()
+            val due = ticks() - self.at
+            if self.at != 0 && due < self.gives
+                scheduler.running = self.giver
+                val p = scheduler.tasks[self.giver].priority
+                if p < self.giver_priority then self.giver_priority = p
+                if !self.mutex.give() then self.refused += 1
+                scheduler.running = me
+            n += 1
+        self.advancing = false
+
+    start_first(*self, sp: usize) -> never
+        loop
+            ()
+
+    mask(*self) -> u32
+        self.masks += 1
+        self.masks
+
+    restore(*self, state: u32)
+        if state != self.masks then panic("restored out of order")
+        self.masks -= 1
+
+    idle(*self) = ()
+
+private new_mutex() -> RecursiveMutex = RecursiveMutex(Mutex(NO_OWNER), 0)
+
+// The kernel's table, emptied, with a task per entry of `priorities`; task 0 runs, through `p`.
+private setup(p: *MutexPort, priorities: []const u8)
+    scheduler = empty_scheduler()
+    for pr in priorities
+        val _ = scheduler.add(0, pr)
+    scheduler.running = 0
+    port = Some(p)
+
+// Task `i` takes `m` `depth` times without waiting; task 0 runs again.
+private hold_as(m: *RecursiveMutex, i: usize, depth: u32)
+    scheduler.running = i
+    for _ in 0..<depth
+        assert(m.take(0), "taken")
+    scheduler.running = 0
+
+@test("the owner takes it again and again, and only the last give releases it")
+nested_takes()
+    var m = new_mutex()
+    var p = MutexPort(0, false, 100, 0, 0, 0, 0, 255, &m)
+    setup(&p, [1, 1])
+    assert(m.take(0), "free")
+    assert(m.take(0), "again")
+    assert(m.take(5), "again, with a timeout it does not need")
+    assert_eq(m.depth, 3)
+    assert_eq(m.inner.owner, 0)
+    assert_eq(scheduler.tasks[0].held, 1)
+    assert(m.give(), "first give")
+    assert(m.give(), "second give")
+    assert_eq(m.depth, 1)
+    assert_eq(m.inner.owner, 0)
+    assert(m.give(), "last give")
+    assert_eq(m.depth, 0)
+    assert_eq(m.inner.owner, NO_OWNER)
+    assert_eq(scheduler.tasks[0].held, 0)
+    assert(!m.give(), "nothing left to give")
+    assert_eq(m.depth, 0)
+    assert_eq(p.masks, 0)
+
+@test("another task cannot have it until the owner's gives balance its takes")
+released_at_zero()
+    var m = new_mutex()
+    var p = MutexPort(0, false, 100, 0, 0, 0, 0, 255, &m)
+    setup(&p, [1, 1])
+    hold_as(&m, 1, 2)
+    assert(!m.take(0), "held at depth 2")
+    scheduler.running = 1
+    assert(m.give(), "down to 1")
+    scheduler.running = 0
+    assert(!m.take(0), "held at depth 1")
+    scheduler.running = 1
+    assert(m.give(), "down to 0")
+    scheduler.running = 0
+    assert(m.take(0), "free now")
+    assert_eq(m.inner.owner, 0)
+    assert_eq(m.depth, 1)
+
+@test("a give by a task that does not hold it is refused and changes nothing")
+not_owner()
+    var m = new_mutex()
+    var p = MutexPort(0, false, 100, 0, 0, 0, 0, 255, &m)
+    setup(&p, [1, 1])
+    hold_as(&m, 1, 2)
+    assert(!m.give(), "task 0 does not hold it")
+    assert_eq(m.depth, 2)
+    assert_eq(m.inner.owner, 1)
+    assert_eq(scheduler.tasks[1].held, 1)
+    assert_eq(p.masks, 0)
+
+@test("a take times out on its tick when the owner keeps it, leaving it as it was")
+take_times_out()
+    var m = new_mutex()
+    var p = MutexPort(0, false, 100, 0, 0, 0, 0, 255, &m)
+    setup(&p, [1, 1])
+    hold_as(&m, 1, 2)
+    val start = ticks()
+    assert(!m.take(5), "timed out")
+    assert_eq(ticks() - start, 5)
+    assert(scheduler.tasks[0].timed_out, "by the timeout")
+    assert_eq(m.inner.owner, 1)
+    assert_eq(m.depth, 2)
+    assert_eq(scheduler.tasks[0].held, 0)
+    assert_eq(p.masks, 0)
+
+@test("a waiter has it only after the final give, and then holds it at depth one")
+waiter_after_final_give()
+    var m = new_mutex()
+    var p = MutexPort(0, false, 100, 0, 0, 1, 0, 255, &m)
+    setup(&p, [1, 1])
+    hold_as(&m, 1, 3)
+    val start = ticks()
+    p.at = start + 2
+    p.gives = 3
+    assert(m.take(50), "taken")
+    assert_eq(ticks() - start, 4)
+    assert_eq(p.refused, 0)
+    assert_eq(m.inner.owner, 0)
+    assert_eq(m.depth, 1)
+    assert_eq(scheduler.tasks[0].held, 1)
+    assert_eq(scheduler.tasks[1].held, 0)
+    assert(m.take(0), "nested again")
+    assert(m.give(), "one")
+    assert(m.give(), "two")
+    assert_eq(m.inner.owner, NO_OWNER)
+
+@test("a waiter raises a nested owner for every give, and the owner drops back on the last")
+inherits_while_nested()
+    var m = new_mutex()
+    var p = MutexPort(0, false, 100, 0, 0, 1, 0, 255, &m)
+    setup(&p, [3, 1])
+    hold_as(&m, 1, 3)
+    val start = ticks()
+    p.at = start + 1
+    p.gives = 3
+    assert(m.take(FOREVER), "taken")
+    assert_eq(p.giver_priority, 3)
+    assert_eq(scheduler.tasks[1].priority, 1)
+    assert_eq(scheduler.tasks[0].priority, 3)
+    assert_eq(m.inner.owner, 0)

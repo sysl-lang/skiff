@@ -56,6 +56,7 @@ private[armv7m]struct Reg
 
 private[armv7m]const NVIC_ISER: usize = 0xE000_E100    // set-enable
 private[armv7m]const NVIC_ICER: usize = 0xE000_E180    // clear-enable
+private[armv7m]const NVIC_ISPR: usize = 0xE000_E200    // set-pending
 private[armv7m]const NVIC_ICPR: usize = 0xE000_E280    // clear-pending
 
 // The NVIC register in the array at `base` that holds interrupt `irq`'s bit.
@@ -79,6 +80,11 @@ private[armv7m]const NVIC_IPR: usize = 0xE000_E400
 set_irq_priority(irq: u32, priority: u8)
     val b: *Byte = ptr_cast(NVIC_IPR + usize(irq))
     b.v = priority
+
+// Raise interrupt `irq` from software, as if its device had asked: once enabled and not held off by
+// the mask, its handler runs before the next instruction.
+pend_irq(irq: u32)
+    nvic_reg(NVIC_ISPR, irq).v = nvic_bit(irq)
 
 // Stop interrupt `irq` from being taken; a request stays pending until it is enabled or cleared.
 disable_irq(irq: u32)

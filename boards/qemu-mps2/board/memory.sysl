@@ -5,15 +5,15 @@ import skiff.arch.armv7m
 import skiff.kernel
 import skiff.kernel.{Heap, Machine, Pool}
 
-// The memory scenarios, after waits.sysl's have finished.
-//   - Tick 110, a task overflows its stack: it pushes until it runs into its guard. The MPU stops it,
+// The memory scenarios, after control.sysl's have finished.
+//   - Tick 250, a task overflows its stack: it pushes until it runs into its guard. The MPU stops it,
 //     the report names it, and every other task runs on.
-//   - Tick 112, a task reads through a null pointer. The MPU's null guard stops it the same way.
-//   - Tick 114, two tasks share a pool of four blocks, each taking two at a time and giving them back
+//   - Tick 252, a task reads through a null pointer. The MPU's null guard stops it the same way.
+//   - Tick 254, two tasks share a pool of four blocks, each taking two at a time and giving them back
 //     a hundred times, yielding in between so that they interleave. Then one task carves a heap into
 //     blocks of different sizes and gives them back out of order. The pool must end with all four
 //     blocks and the heap with one block as big as it began.
-//   - Tick 120, a last task checks that both faulting tasks were stopped while it kept running, and
+//   - Tick 260, a last task checks that both faulting tasks were stopped while it kept running, and
 //     provokes the bus fault that ends the run.
 
 private var stack_overflow: [128]u32 = [0; 128]
@@ -40,12 +40,12 @@ private var null_index: Atomic[u32] = Atomic(0)
 
 private task_overflow() -> never
     deep_index.store(u32(kernel.running_task().index))
-    kernel.sleep_until(epoch + 110)
+    kernel.sleep_until(epoch + 250)
     overflow()
 
 private task_null() -> never
     null_index.store(u32(kernel.running_task().index))
-    kernel.sleep_until(epoch + 112)
+    kernel.sleep_until(epoch + 252)
     val _ = load_null()
     say("skiff: a load through a null pointer was not stopped\n")
     kernel.sleep_forever()
@@ -65,7 +65,7 @@ private task_pool_b() -> never = share_pool(0xb)
 // Take two blocks, mark them as this task's, yield, check nobody else wrote them, give them back. The
 // second task to finish checks the pool and the heap.
 private share_pool(mark: u32) -> never
-    kernel.sleep_until(epoch + 114)
+    kernel.sleep_until(epoch + 254)
     for _ in 0..<100
         val first = blocks.alloc()
         val second = blocks.alloc()
@@ -122,7 +122,7 @@ private check_heap()
 
 private task_last() -> never
     var board = Board()
-    kernel.sleep_until(epoch + 120)
+    kernel.sleep_until(epoch + 260)
     if kernel.stopped(usize(deep_index.load())) && kernel.stopped(usize(null_index.load()))
         say("skiff: both faulting tasks were stopped, and the rest ran on\n")
     else

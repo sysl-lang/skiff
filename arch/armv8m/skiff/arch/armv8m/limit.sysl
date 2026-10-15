@@ -24,7 +24,7 @@ const SWITCH_RESERVE: usize = 104
 
 impl Protection for StackLimit
     guard(*self, base: usize, bytes: usize)
-        val at = ((base + 7) & ~7usize) + SWITCH_RESERVE
+        val at = limit_of(base)
         if at >= base + bytes then panic("skiff: a task stack too small for its limit")
         val limit = u32(at)
         asm
@@ -33,3 +33,9 @@ impl Protection for StackLimit
                 "isb"
                 in limit : reg
             [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv8m is for Armv8-M cores"
+
+    // Everything below the limit: the switch's reserve and the rounding under it.
+    reserved(*self, base: usize, bytes: usize) -> usize = limit_of(base) - base
+
+// Where the limit of a stack starting at `base` sits.
+private limit_of(base: usize) -> usize = ((base + 7) & ~7usize) + SWITCH_RESERVE

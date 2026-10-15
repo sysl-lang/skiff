@@ -1,0 +1,134 @@
+module board
+
+import sysl.sync.Atomic
+import skiff.arch.armv7m
+import skiff.chip.mps2
+import skiff.kernel
+import skiff.kernel.{Machine, NotifyAction}
+
+// The task notification scenarios, after waits.sysl's have finished.
+//   - Tick 110, a task of low priority spins, raising timer 0's interrupt from software every 50,000
+//     counts, and the interrupt notifies a counting task, an increment each time. Five times the
+//     counting task takes the whole count and waits for the next, and each wake must come straight
+//     from the interrupt: the spinner must not have counted once since it. (Raised by the timer
+//     itself, under QEMU the interrupt arrives together with the tick, which would hide a missing
+//     switch.) Then the notifications pile up for 3 ticks with nobody taking, and are taken one at a
+//     time; every one sent must have been taken exactly once.
+//   - Tick 120, a task waits for notified bits and is woken by them, then waits again and nobody
+//     notifies it, so the wait must time out after exactly 5 ticks. At tick 130 it is sent a value
+//     and then a second one that must not overwrite it, and at 131 it finds the first.
+
+private var stack_counter: [256]u32 = [0; 256]
+// A spinner's stack is 2 KiB so that the stack it works in never shares a 1 KiB page with its guard
+// region: QEMU checks every access to such a page the slow way, and the spinner then counts too slowly
+// for the scenario's ticks (see CLAUDE.md).
+private var stack_spinner: [512]u32 = [0; 512]
+private var stack_note_wait: [256]u32 = [0; 256]
+private var stack_note_set: [256]u32 = [0; 256]
+
+spawn_notes(cortex: *armv7m.Cortex)
+    kernel.spawn(cortex, stack_counter, &task_counter, 3, "counter")
+    kernel.spawn(cortex, stack_spinner, &task_spinner, 2, "spinner")
+    kernel.spawn(cortex, stack_note_wait, &task_note_wait, 3, "note wait")
+    kernel.spawn(cortex, stack_note_set, &task_note_set, 2, "note set")
+
+// An interrupt's notifications to a counting task.
+
+private var counter: Atomic[u32] = Atomic(0)
+private var note_armed: Atomic[u32] = Atomic(0)
+private var sent: Atomic[u32] = Atomic(0)
+private var spinning: Atomic[u32] = Atomic(0)
+private var spins: Atomic[u32] = Atomic(0)
+private var spins_at_note: Atomic[u32] = Atomic(0)
+
+// From timer 0's interrupt, once the scenario arms it: note how far the spinner had counted, and
+// notify the counting task.
+private[board] notes_timer_event()
+    if note_armed.load() != 0
+        spins_at_note.store(spins.load())
+        if kernel.notify(usize(counter.load()), 0, NotifyAction.Increment)
+            sent.store(sent.load() + 1)
+
+private task_spinner() -> never
+    kernel.sleep_until(epoch + 110)
+    while spinning.load() != 0
+        val n = spins.load() + 1
+        spins.store(n)
+        if n % 50_000 == 0 then armv7m.pend_irq(mps2.TIMER0_IRQ)
+    kernel.sleep_forever()
+
+private task_counter() -> never
+    var board = Board()
+    counter.store(u32(kernel.running_task().index))
+    spinning.store(1)
+    kernel.sleep_until(epoch + 110)
+    armv7m.set_irq_priority(mps2.TIMER0_IRQ, 0xc0)
+    note_armed.store(1)
+    armv7m.enable_irq(mps2.TIMER0_IRQ)
+    var taken: u32 = 0
+    var at_once: u32 = 0
+    for _ in 0..<5
+        val count = kernel.notify_take(true, 50)
+        if count != 0
+            taken += count
+            if spins.load() == spins_at_note.load() then at_once += 1
+    kernel.sleep(3)
+    note_armed.store(0)
+    armv7m.disable_irq(mps2.TIMER0_IRQ)
+    spinning.store(0)
+    var piled: u32 = 0
+    while kernel.notify_take(false, 0) != 0
+        piled += 1
+    taken += piled
+    if at_once == 5
+        say("skiff: an interrupt's notifications woke the counting task at once, 5 times\n")
+    else
+        board.write("skiff: the counting task woke at once ".bytes)
+        kernel.write_dec(&board, at_once)
+        board.write(" of 5 times\n".bytes)
+    if taken == sent.load() && piled > 1
+        say("skiff: the counting task took every notification once\n")
+    else
+        board.write("skiff: the counting task took ".bytes)
+        kernel.write_dec(&board, taken)
+        board.write(" of ".bytes)
+        kernel.write_dec(&board, sent.load())
+        board.write(" notifications, ".bytes)
+        kernel.write_dec(&board, piled)
+        board.write(" of them piled up\n".bytes)
+    kernel.sleep_forever()
+
+// Notified bits, a timed-out wait, and a value not overwritten.
+
+private var waiter: Atomic[u32] = Atomic(0)
+private var refused: Atomic[u32] = Atomic(0)
+
+private task_note_wait() -> never
+    var board = Board()
+    waiter.store(u32(kernel.running_task().index))
+    kernel.sleep_until(epoch + 120)
+    val got = kernel.notify_wait(0xffff_ffff, 0xffff_ffff, 50)
+    val start = kernel.ticks()
+    val again = kernel.notify_wait(0, 0xffff_ffff, 5)
+    val waited = kernel.ticks() - start
+    if got == Some(0b101) && again == None && waited == 5
+        say("skiff: notified bits woke a task, and its next wait timed out after 5 ticks\n")
+    else
+        board.write("skiff: a notification wait ended after ".bytes)
+        kernel.write_dec(&board, waited)
+        board.write(" ticks\n".bytes)
+    kernel.sleep_until(epoch + 131)
+    if kernel.notify_wait(0, 0xffff_ffff, 0) == Some(5) && refused.load() == 1
+        say("skiff: a pending notification was not overwritten\n")
+    else
+        say("skiff: a pending notification was overwritten\n")
+    kernel.sleep_forever()
+
+private task_note_set() -> never
+    kernel.sleep_until(epoch + 121)
+    val to = usize(waiter.load())
+    val _ = kernel.notify(to, 0b101, NotifyAction.SetBits)
+    kernel.sleep_until(epoch + 130)
+    val _ = kernel.notify(to, 5, NotifyAction.Overwrite)
+    if !kernel.notify(to, 9, NotifyAction.NoOverwrite) then refused.store(1)
+    kernel.sleep_forever()
