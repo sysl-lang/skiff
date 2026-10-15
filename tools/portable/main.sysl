@@ -3,7 +3,7 @@
 
 import skiff.kernel
 import sysl.sync.Atomic
-import skiff.kernel.{Doorbell, Flags, Heap, Link, Machine, Mutex, NO_OWNER, Pool, Port, Protection, Queue, Ring, Semaphore}
+import skiff.kernel.{Doorbell, Flags, Heap, Link, Machine, Mutex, NO_OWNER, NotifyAction, Pool, Port, Protection, Queue, Ring, Semaphore}
 
 struct Nothing
 end Nothing
@@ -74,6 +74,13 @@ private task() -> never
     flags.set(1)
     flags.clear(1)
     val _ = flags.wait(1, true, 1)
+    val me = kernel.running_task().index
+    val _ = kernel.notify(me, 1, NotifyAction.SetBits)
+    val _ = kernel.notify(me, 0, NotifyAction.Increment)
+    val _ = kernel.notify(me, 2, NotifyAction.Overwrite)
+    val _ = kernel.notify(me, 3, NotifyAction.NoOverwrite)
+    val _ = kernel.notify_wait(0, 0xffff_ffff, 1)
+    val _ = kernel.notify_take(true, 1)
     pool.alloc() match
         Some(b) -> pool.release(b)
         None -> ()

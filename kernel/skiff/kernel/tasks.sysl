@@ -4,7 +4,8 @@ module skiff.kernel
 //
 // The highest-priority task that is ready runs. Tasks of equal priority take turns, one tick each: on
 // every tick the scheduler asks for a switch if another task of the running one's priority is ready.
-// A task that is blocked — sleeping, or waiting on a semaphore, a mutex, a queue or flags (sync.sysl) —
+// A task that is blocked — sleeping, waiting on a semaphore, a mutex, a queue or flags (sync.sysl), or
+// waiting for a notification (notify.sysl) —
 // is not ready until what it waits for happens or its timeout's tick comes. An idle task, at the lowest
 // priority, runs when nothing else is ready.
 //
@@ -70,9 +71,11 @@ struct Task
     want: u32           // the flags a task blocked on a `Flags` waits for
     want_all: bool      // …all of them, rather than any
     got: u32            // the flags that ended its wait
+    note: u32           // its notification value (notify.sysl)
+    noted: bool         // whether a notification is pending: sent and not yet waited for
 
 // An unused row of the table.
-val NO_TASK: Task = Task("", 0, 0, 0, 0, 0, TaskState.Ready, 0, false, 0, false, 0, 0, false, 0)
+val NO_TASK: Task = Task("", 0, 0, 0, 0, 0, TaskState.Ready, 0, false, 0, false, 0, 0, false, 0, 0, false)
 
 // The table and the choices made over it. It holds no hardware state, so the host tests drive one
 // directly; the kernel keeps one of its own, `scheduler`.
@@ -203,7 +206,7 @@ empty_scheduler() -> Scheduler = Scheduler([NO_TASK; MAX_TASKS], 0, 0)
 private[kernel] var scheduler: Scheduler = Scheduler([NO_TASK; MAX_TASKS], 0, 0)
 
 // The port, once `run` has started the tasks; until then a tick switches nothing and nothing blocks.
-private var port: Option[*Port] = None
+private[kernel] var port: Option[*Port] = None
 
 // The memory protection, if `protect` has named one: every task's stack is guarded while it runs.
 private var protection: Option[*Protection] = None

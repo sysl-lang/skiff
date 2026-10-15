@@ -1,0 +1,230 @@
+module skiff.kernel
+@tests
+
+// Task notifications on the host, through a port that stands in for the processor. A wait blocks the
+// running task and asks the port for a switch; the port answers by letting ticks pass until the task
+// is ready again, notifying it on the way if the test said to. So what a real switch would hand back
+// to the waiting task can be read off the wait's answer and the tick count.
+
+// A port that counts the switches asked of it and the masks held, and runs the clock while the running
+// task is blocked: up to `limit` ticks, notifying `target` with `value` on tick `at` (0 for never).
+struct ClockPort
+    switches: u32
+    masks: u32
+    advancing: bool
+    limit: u32
+    at: u32
+    target: usize
+    value: u32
+
+impl Port for ClockPort
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize = usize(&stack[0])
+
+    request_switch(*self)
+        self.switches += 1
+        if self.advancing then return
+        self.advancing = true
+        var n: u32 = 0
+        while scheduler.tasks[scheduler.running].state == TaskState.Blocked && n < self.limit
+            tick()
+            if ticks() == self.at
+                val _ = notify(self.target, self.value, NotifyAction.SetBits)
+            n += 1
+        self.advancing = false
+
+    start_first(*self, sp: usize) -> never
+        loop
+            ()
+
+    mask(*self) -> u32
+        self.masks += 1
+        self.masks
+
+    restore(*self, state: u32)
+        if state != self.masks then panic("restored out of order")
+        self.masks -= 1
+
+    idle(*self) = ()
+
+private clock_port() -> ClockPort = ClockPort(0, 0, false, 100, 0, 0, 0)
+
+// The kernel's table, emptied, with a task per entry of `priorities`; task 0 runs, through `p`.
+private setup(p: *ClockPort, priorities: []const u8)
+    scheduler = empty_scheduler()
+    for pr in priorities
+        val _ = scheduler.add(0, pr)
+    scheduler.running = 0
+    port = Some(p)
+
+// Task `i` blocks for good waiting for a notification; task 0 runs again.
+private wait_as(i: usize)
+    scheduler.running = i
+    scheduler.block(0, usize(&scheduler.tasks[i]), FOREVER)
+    scheduler.running = 0
+
+@test("set bits ors into the value, and a wait answers it and clears only the exit mask")
+set_bits()
+    var p = clock_port()
+    setup(&p, [1])
+    assert(notify(0, 0b0101, NotifyAction.SetBits), "sent")
+    assert(notify(0, 0b0011, NotifyAction.SetBits), "sent again")
+    assert(scheduler.tasks[0].noted, "pending")
+    assert(notify_wait(0, 0b0001, 0) == Some(0b0111), "both sends ored")
+    assert(!scheduler.tasks[0].noted, "no longer pending")
+    assert_eq(scheduler.tasks[0].note, 0b0110)
+    assert(notify_wait(0, 0, 0) == None, "nothing pending, and no wait")
+    assert_eq(p.masks, 0)
+
+@test("increment adds one whatever the value sent, and take counts down from it")
+increment_counts()
+    var p = clock_port()
+    setup(&p, [1])
+    assert(notify(0, 0, NotifyAction.Increment), "one")
+    assert(notify(0, 40, NotifyAction.Increment), "two")
+    assert(notify(0, 0xffff_ffff, NotifyAction.Increment), "three")
+    assert_eq(scheduler.tasks[0].note, 3)
+    assert_eq(notify_take(false, 0), 3)
+    assert(!scheduler.tasks[0].noted, "a take clears the pending mark")
+    assert_eq(notify_take(false, 0), 2)
+    assert_eq(notify_take(false, 0), 1)
+    assert_eq(notify_take(false, 0), 0)
+    assert_eq(notify_take(false, 0), 0)
+    assert_eq(scheduler.tasks[0].note, 0)
+
+@test("take with clear answers the whole count and leaves 0")
+take_clears()
+    var p = clock_port()
+    setup(&p, [1])
+    for _ in 0..<5
+        val _ = notify(0, 0, NotifyAction.Increment)
+    assert_eq(notify_take(true, 0), 5)
+    assert_eq(scheduler.tasks[0].note, 0)
+    assert_eq(notify_take(true, 0), 0)
+
+@test("overwrite replaces the value, pending or not")
+overwrite()
+    var p = clock_port()
+    setup(&p, [1])
+    assert(notify(0, 0b1111, NotifyAction.SetBits), "bits")
+    assert(notify(0, 7, NotifyAction.Overwrite), "overwritten while pending")
+    assert(notify_wait(0, 0, 0) == Some(7), "the overwriting value")
+    assert(notify(0, 9, NotifyAction.Overwrite), "and when none is pending")
+    assert_eq(scheduler.tasks[0].note, 9)
+
+@test("no-overwrite fails while a notification is pending, changing nothing")
+no_overwrite()
+    var p = clock_port()
+    setup(&p, [1])
+    assert(notify(0, 5, NotifyAction.NoOverwrite), "nothing pending: written")
+    assert(!notify(0, 9, NotifyAction.NoOverwrite), "pending: refused")
+    assert_eq(scheduler.tasks[0].note, 5)
+    assert(notify_wait(0, 0, 0) == Some(5), "the first value survives")
+    assert(notify(0, 9, NotifyAction.NoOverwrite), "taken: written again")
+    assert_eq(scheduler.tasks[0].note, 9)
+
+@test("a refused no-overwrite wakes nobody")
+no_overwrite_wakes_nobody()
+    var p = clock_port()
+    setup(&p, [1, 3])
+    assert(notify(1, 0, NotifyAction.SetBits), "pending with a value of 0")
+    wait_as(1)
+    assert(!notify(1, 4, NotifyAction.NoOverwrite), "refused")
+    assert(scheduler.tasks[1].state == TaskState.Blocked, "still waiting")
+    assert_eq(p.switches, 0)
+
+@test("the entry mask clears bits only when nothing is pending")
+clear_on_entry()
+    var p = clock_port()
+    setup(&p, [1])
+    scheduler.tasks[0].note = 0b1111
+    assert(notify_wait(0b0011, 0, 0) == None, "nothing pending")
+    assert_eq(scheduler.tasks[0].note, 0b1100)
+    assert(notify(0, 0b0001, NotifyAction.SetBits), "sent")
+    assert(notify_wait(0b1111, 0, 0) == Some(0b1101), "a pending value is kept whole")
+    assert_eq(scheduler.tasks[0].note, 0b1101)
+
+@test("a wait nobody answers times out on its tick and leaves the value as it was")
+wait_times_out()
+    var p = clock_port()
+    setup(&p, [1])
+    scheduler.tasks[0].note = 0b1010
+    val start = ticks()
+    assert(notify_wait(0b0010, 0xffff_ffff, 5) == None, "timed out")
+    assert_eq(ticks() - start, 5)
+    assert(scheduler.tasks[0].timed_out, "by the timeout")
+    assert_eq(scheduler.tasks[0].note, 0b1000)
+    scheduler.tasks[0].note = 0
+    val again = ticks()
+    assert_eq(notify_take(false, 3), 0)
+    assert_eq(ticks() - again, 3)
+    assert_eq(p.masks, 0)
+
+@test("a notification during a wait ends it at once with the value, cleared by the exit mask")
+wait_is_notified()
+    var p = clock_port()
+    setup(&p, [1])
+    val start = ticks()
+    p.at = start + 3
+    p.target = 0
+    p.value = 0b0110
+    assert(notify_wait(0, 0b0010, 50) == Some(0b0110), "woken with the value")
+    assert_eq(ticks() - start, 3)
+    assert(!scheduler.tasks[0].timed_out, "woken, not timed out")
+    assert_eq(scheduler.tasks[0].note, 0b0100)
+
+@test("a take waits while the count is 0 and takes one when notified")
+take_waits()
+    var p = clock_port()
+    setup(&p, [1])
+    val start = ticks()
+    p.at = start + 2
+    p.target = 0
+    p.value = 3
+    assert_eq(notify_take(false, 50), 3)
+    assert_eq(ticks() - start, 2)
+    assert_eq(scheduler.tasks[0].note, 2)
+
+@test("notifying a waiting task of higher priority asks for a switch; a lower one's does not")
+wake_preempts()
+    var p = clock_port()
+    setup(&p, [2, 3, 1])
+    wait_as(1)
+    wait_as(2)
+    assert(notify(2, 1, NotifyAction.SetBits), "to the lower")
+    assert(scheduler.tasks[2].state == TaskState.Ready, "the lower one is ready")
+    assert_eq(p.switches, 0)
+    assert(notify(1, 1, NotifyAction.SetBits), "to the higher")
+    assert(scheduler.tasks[1].state == TaskState.Ready, "the higher one is ready")
+    assert(!scheduler.tasks[1].timed_out, "woken, not timed out")
+    assert_eq(p.switches, 1)
+    assert_eq(scheduler.choose(), 1)
+    assert(notify(1, 1, NotifyAction.SetBits), "to a task not waiting")
+    assert_eq(p.switches, 1)
+
+@test("a notification only wakes a task waiting for one, not one blocked on something else")
+wakes_only_note_waiters()
+    var p = clock_port()
+    setup(&p, [1, 3])
+    var s = Semaphore(0, 1)
+    scheduler.running = 1
+    scheduler.block(0, usize(&s), FOREVER)
+    scheduler.running = 0
+    assert(notify(1, 1, NotifyAction.SetBits), "sent")
+    assert(scheduler.tasks[1].state == TaskState.Blocked, "still on the semaphore")
+    assert_eq(p.switches, 0)
+
+@test("from an interrupt handler, notify never blocks and asks for one switch to a higher waiter")
+from_an_interrupt()
+    var p = clock_port()
+    setup(&p, [1, 3])
+    wait_as(1)
+    // A handler runs on the interrupted task's behalf with the kernel's interrupts held off.
+    val held = enter()
+    for _ in 0..<4
+        assert(notify(1, 0, NotifyAction.Increment), "sent")
+    leave(held)
+    assert_eq(p.masks, 0)
+    assert_eq(p.switches, 1)
+    assert(scheduler.tasks[1].state == TaskState.Ready, "woken")
+    assert_eq(scheduler.tasks[1].note, 4)
+    assert_eq(scheduler.running, 0)

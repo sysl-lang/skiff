@@ -42,6 +42,7 @@ run_tasks() -> never
     kernel.spawn(&cortex, stack_p2, &task_p2, 2, "P2")
     kernel.spawn(&cortex, stack_h, &task_h, 3, "H")
     spawn_waits(&cortex)
+    spawn_notes(&cortex)
     spawn_memory(&cortex)
     armv7m.enable_protection()
     kernel.protect(&protector)

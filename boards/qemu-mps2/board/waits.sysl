@@ -88,6 +88,7 @@ timer0_event()
     if armed.load() != 0
         interrupt_at.store(armv7m.systick_now())
         val _ = from_timer.give()
+    notes_timer_event()
 
 private task_timer() -> never
     var board = Board()

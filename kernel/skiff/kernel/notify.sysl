@@ -1,0 +1,81 @@
+module skiff.kernel
+
+// Task notifications: a 32-bit value and a pending mark in every task's row, sent to one task by
+// index and waited for by that task alone. They need no object and no allocation, so they are the
+// lightest way to wake a task: as a set of event bits, a counting semaphore, or a mailbox of one word.
+//
+// `notify` sets the value and marks a notification pending. A task blocked waiting for one is woken,
+// and if it outranks the running task a switch is asked for. `notify` never blocks, so an interrupt
+// handler whose priority the port masks may call it as a task does.
+//
+// The running task waits with `notify_wait`, which answers the value, or with `notify_take`, which
+// treats it as a count. Both take a timeout in ticks: `FOREVER`, 0 for "only if one is pending now",
+// or a count.
+
+// How `notify` changes the value it sends to.
+enum NotifyAction
+    SetBits             // or `value` into it
+    Increment           // add one, whatever `value` is
+    Overwrite           // replace it with `value`, pending or not
+    NoOverwrite         // replace it with `value`, unless a notification is already pending
+
+// What a task waiting for a notification is blocked on: its own row in the table, an address no
+// object shares.
+private note_key(i: usize) -> usize = usize(&scheduler.tasks[i])
+
+// Notify task `task` (its index in the table), changing its value by `action`. Answers true, except for
+// `NoOverwrite` while a notification is pending, which changes nothing and wakes nobody.
+notify(task: usize, value: u32, action: NotifyAction) -> bool
+    val state = enter()
+    val t = &scheduler.tasks[task]
+    if t.noted && action == NotifyAction.NoOverwrite
+        leave(state)
+        return false
+    t.note = action match
+        SetBits -> t.note | value
+        Increment -> t.note + 1
+        Overwrite | NoOverwrite -> value
+    t.noted = true
+    if scheduler.blocked_on(task, note_key(task)) then wake_task(task)
+    leave(state)
+    true
+
+// Wait up to `timeout` ticks for a notification to the running task. If none is pending, the bits of
+// `clear_on_entry` are cleared from the value first. Answers the value the wait ended on, then clears
+// the bits of `clear_on_exit` from it and the pending mark; answers `None` if the timeout came first,
+// leaving the value as it was.
+notify_wait(clear_on_entry: u32, clear_on_exit: u32, timeout: u32) -> Option[u32]
+    var state = enter()
+    val me = scheduler.running
+    if !scheduler.tasks[me].noted
+        scheduler.tasks[me].note = scheduler.tasks[me].note & ~clear_on_entry
+        if timeout == 0
+            leave(state)
+            return None
+        val _ = wait(state, note_key(me), timeout)
+        state = enter()
+    val t = &scheduler.tasks[me]
+    if !t.noted
+        leave(state)
+        return None
+    val got = t.note
+    t.note = got & ~clear_on_exit
+    t.noted = false
+    leave(state)
+    Some(got)
+
+// Take from the running task's value as from a counting semaphore, waiting up to `timeout` ticks while
+// it is 0. Answers the value as it was before taking, then takes one from it, or with `clear` all of
+// it; answers 0 if the timeout came first. Either way no notification is pending afterwards.
+notify_take(clear: bool, timeout: u32) -> u32
+    var state = enter()
+    val me = scheduler.running
+    if scheduler.tasks[me].note == 0 && timeout != 0
+        val _ = wait(state, note_key(me), timeout)
+        state = enter()
+    val t = &scheduler.tasks[me]
+    val count = t.note
+    if count != 0 then t.note = if clear then 0 else count - 1
+    t.noted = false
+    leave(state)
+    count

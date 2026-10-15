@@ -38,6 +38,10 @@ skiff: a timed wait timed out after 5 ticks
 skiff: timer 0's interrupt woke a waiting task
 skiff: a queue of two carried 1 to 5 in order
 skiff: event flags woke the task on both bits
+skiff: an interrupt's notifications woke the counting task at once, 5 times
+skiff: the counting task took every notification once
+skiff: notified bits woke a task, and its next wait timed out after 5 ticks
+skiff: a pending notification was not overwritten
 skiff: task deep overflowed its stack
 skiff: task null broke its memory protection
 skiff: mmfar 0x00000000
