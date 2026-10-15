@@ -3,7 +3,7 @@
 
 import skiff.kernel
 import sysl.sync.Atomic
-import skiff.kernel.{Doorbell, Flags, Heap, Link, Machine, MessageBuffer, Mutex, NO_OWNER, NotifyAction, Pool, Port, Protection, Queue, Ring, Semaphore, StreamBuffer}
+import skiff.kernel.{Doorbell, Flags, Heap, Link, Machine, MessageBuffer, Mutex, NO_OWNER, NotifyAction, Pool, Port, Protection, Queue, RecursiveMutex, Ring, Semaphore, StreamBuffer}
 
 struct Nothing
 end Nothing
@@ -59,6 +59,7 @@ private var arena: [64]u8 = [0; 64]
 
 private var sem: Semaphore = Semaphore(0, 1)
 private var mutex: Mutex = Mutex(NO_OWNER)
+private var nested: RecursiveMutex = RecursiveMutex(Mutex(NO_OWNER), 0)
 private var queue: Queue[u32, 2] = Queue([0, 0], 0, 0)
 private var flags: Flags = Flags(0)
 private var stream: StreamBuffer[16] = StreamBuffer([0; 16], 0, 0, 1)
@@ -71,6 +72,8 @@ private task() -> never
     val _ = sem.give()
     val _ = sem.take(1)
     if mutex.lock(kernel.FOREVER) then mutex.unlock()
+    if nested.take(kernel.FOREVER)
+        val _ = nested.give()
     val _ = queue.send(1, 0)
     val _ = queue.receive(1)
     flags.set(1)

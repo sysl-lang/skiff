@@ -45,6 +45,9 @@ skiff: a pending notification was not overwritten
 skiff: an interrupt streamed 20 bytes to a task, 4 at a time in order, waking it at once
 skiff: 40 framed messages arrived whole and in order across the ring's end
 skiff: a receive buffer too short for a message left it whole
+skiff: a give by a task not holding the recursive mutex was refused
+skiff: a timed take of a held recursive mutex timed out after 2 ticks
+skiff: a recursive mutex held 3 deep went to the waiter on the third give, before the busy task finished
 skiff: task deep overflowed its stack
 skiff: task null broke its memory protection
 skiff: mmfar 0x00000000

@@ -106,6 +106,34 @@ struct Mutex
             None -> self.owner = NO_OWNER
         leave(state)
 
+// A mutex its owner may take again, written `RecursiveMutex(Mutex(NO_OWNER), 0)`. Each take by the
+// owner adds one to `depth`, and the mutex is released only when as many gives have balanced the
+// takes. Waiting, handing over and priority inheritance are the inner `Mutex`'s: a waiter raises the
+// owner however deep it holds, and the owner keeps that priority until it holds no mutex, so the
+// nested takes and gives in between leave it raised. Only a task may call either method.
+struct RecursiveMutex
+    inner: Mutex
+    depth: u32          // takes not yet balanced by a give; 0 while nobody holds it
+
+    // Take it, waiting up to `timeout` ticks unless the running task already holds it. Answers
+    // whether it is now held.
+    take(*self, timeout: u32) -> bool
+        // Only the running task itself makes `owner` name it, so this needs no mask.
+        if self.inner.owner == scheduler.running
+            self.depth += 1
+            return true
+        if !self.inner.lock(timeout) then return false
+        self.depth = 1
+        true
+
+    // Give back one take, releasing it to the highest-priority waiter on the last. Answers false,
+    // changing nothing, when the running task does not hold it.
+    give(*self) -> bool
+        if self.inner.owner != scheduler.running then return false
+        self.depth -= 1
+        if self.depth == 0 then self.inner.unlock()
+        true
+
 // A queue of up to `N` items of `T`, first in first out. A sender waits while it is full and a
 // receiver while it is empty.
 struct Queue[T, const N: usize]
