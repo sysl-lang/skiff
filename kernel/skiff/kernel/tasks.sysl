@@ -42,7 +42,7 @@ trait Protection
     guard(*self, base: usize, bytes: usize)
 
 // How many tasks the table holds, the idle task included.
-const MAX_TASKS: usize = 24
+const MAX_TASKS: usize = 32
 
 // The idle task's priority; every other task's must be higher.
 const IDLE_PRIORITY: u8 = 0

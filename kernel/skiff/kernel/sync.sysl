@@ -15,16 +15,16 @@ module skiff.kernel
 
 // The address a task blocks on while waiting for `object`, offset by `which` for an object with more
 // than one reason to wait.
-private wait_key[T](object: *T, which: usize) -> usize = usize(object) + which
+private[kernel] wait_key[T](object: *T, which: usize) -> usize = usize(object) + which
 
 // Wake the highest-priority task blocked on `on`, if any.
-private wake_one(on: usize)
+private[kernel] wake_one(on: usize)
     scheduler.waiter(on) match
         Some(i) -> wake_task(i)
         None -> ()
 
 // The ticks left until `deadline`, 0 once it has passed. `FOREVER` stays `FOREVER`.
-private remaining(timeout: u32, deadline: u32) -> u32
+private[kernel] remaining(timeout: u32, deadline: u32) -> u32
     if timeout == FOREVER then return FOREVER
     val left = i32(deadline - ticks())
     if left > 0 then u32(left) else 0

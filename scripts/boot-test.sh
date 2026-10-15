@@ -42,6 +42,9 @@ skiff: an interrupt's notifications woke the counting task at once, 5 times
 skiff: the counting task took every notification once
 skiff: notified bits woke a task, and its next wait timed out after 5 ticks
 skiff: a pending notification was not overwritten
+skiff: an interrupt streamed 20 bytes to a task, 4 at a time in order, waking it at once
+skiff: 40 framed messages arrived whole and in order across the ring's end
+skiff: a receive buffer too short for a message left it whole
 skiff: task deep overflowed its stack
 skiff: task null broke its memory protection
 skiff: mmfar 0x00000000
