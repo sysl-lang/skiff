@@ -1,0 +1,128 @@
+module board
+
+import sysl.sync.Atomic
+import skiff.arch.armv7m
+import skiff.chip.mps2
+import skiff.kernel
+import skiff.kernel.Timer
+
+// The software timer scenarios, after stats.sysl's and before memory.sysl's. The timer service runs at
+// priority 6; Timekeeper (4) drives the scenarios.
+//   - Tick 250, Timekeeper starts Beat, an auto-reload timer of 3 ticks. It must fire on 253 and 256. From
+//     258 to 261 Hog (7) spins, so the service cannot run on 259: Beat fires late, on 261, and then on
+//     262 and 265 — a period after the expiry it was due on, not after the late call. Timekeeper stops
+//     it on 266.
+//   - Tick 250, Timekeeper also starts Once, a one-shot timer of 5 ticks, which must fire on 255 and
+//     never again, and Muted, one of 4 ticks, which it stops on 252, so that it never fires.
+//   - Tick 268, Timekeeper raises timer 0's interrupt from software, and the interrupt starts Kicked, a
+//     one-shot of 2 ticks. The service outranks Timekeeper, so Kicked must be active as soon as the
+//     interrupt has returned, and fire 2 ticks after the interrupt's tick.
+// Every callback checks that it runs in the timer service, not in an interrupt or another task.
+
+private var stack_timers: [256]u32 = [0; 256]
+private var stack_timekeeper: [256]u32 = [0; 256]
+private var stack_hog: [256]u32 = [0; 256]
+
+private var beat: Timer = Timer("beat", 3, true, &on_beat, false, 0, null)
+private var once: Timer = Timer("once", 5, false, &on_once, false, 0, null)
+private var muted: Timer = Timer("muted", 4, false, &on_muted, false, 0, null)
+private var kicked: Timer = Timer("kicked", 2, false, &on_kicked, false, 0, null)
+
+spawn_timers(cortex: *armv7m.Cortex)
+    kernel.start_timers(cortex, stack_timers, 6)
+    kernel.spawn(cortex, stack_timekeeper, &task_timekeeper, 4, "timekeeper")
+    kernel.spawn(cortex, stack_hog, &task_hog, 7, "hog")
+
+// The ticks after the epoch Beat fired on.
+private var beats: [8]u32 = [0; 8]
+private var beat_count: Atomic[u32] = Atomic(0)
+private var once_count: Atomic[u32] = Atomic(0)
+private var muted_count: Atomic[u32] = Atomic(0)
+private var kicked_at: Atomic[u32] = Atomic(0)
+private var elsewhere: Atomic[u32] = Atomic(0)
+
+// Count a callback that did not run in the timer service.
+private in_service()
+    if kernel.running_task().name != "timers" then elsewhere.store(elsewhere.load() + 1)
+
+private on_beat(t: *Timer) -> unit
+    in_service()
+    val n = beat_count.load()
+    if n < 8 then beats[usize(n)] = kernel.ticks() - epoch
+    beat_count.store(n + 1)
+
+private on_once(t: *Timer) -> unit
+    in_service()
+    once_count.store(once_count.load() + 1)
+
+private on_muted(t: *Timer) -> unit
+    in_service()
+    muted_count.store(muted_count.load() + 1)
+
+private on_kicked(t: *Timer) -> unit
+    in_service()
+    kicked_at.store(kernel.ticks())
+
+private var kick_armed: Atomic[u32] = Atomic(0)
+private var kick_tick: Atomic[u32] = Atomic(0)
+private var kick_sent: Atomic[u32] = Atomic(0)
+
+// From timer 0's interrupt, once the scenario arms it: start Kicked, once.
+private[board] timers_timer_event()
+    if kick_armed.load() != 0
+        kick_armed.store(0)
+        kick_tick.store(kernel.ticks())
+        if kicked.start_from_isr() then kick_sent.store(1)
+
+private task_hog() -> never
+    kernel.sleep_until(epoch + 258)
+    while kernel.ticks() - epoch < 261
+        ()
+    kernel.sleep_forever()
+
+private task_timekeeper() -> never
+    var board = Board()
+    kernel.sleep_until(epoch + 250)
+    val _ = beat.start(kernel.FOREVER)
+    val _ = once.start(kernel.FOREVER)
+    val _ = muted.start(kernel.FOREVER)
+    kernel.sleep_until(epoch + 252)
+    val _ = muted.stop(kernel.FOREVER)
+    kernel.sleep_until(epoch + 266)
+    val _ = beat.stop(kernel.FOREVER)
+
+    kernel.sleep_until(epoch + 268)
+    armv7m.set_irq_priority(mps2.TIMER0_IRQ, 0xc0)
+    kick_armed.store(1)
+    armv7m.enable_irq(mps2.TIMER0_IRQ)
+    armv7m.pend_irq(mps2.TIMER0_IRQ)
+    val at_once = kicked.is_active()
+    armv7m.disable_irq(mps2.TIMER0_IRQ)
+    kernel.sleep_until(epoch + 274)
+
+    val want: [8]u32 = [253, 256, 261, 262, 265, 0, 0, 0]
+    if beat_count.load() == 5 && beats == want && !beat.is_active()
+        say("skiff: a reload timer fired every 3 ticks, and a late call did not move the ticks after it\n")
+    else
+        board.write("skiff: beat fired on".bytes)
+        for i in 0..<8
+            board.write(" ".bytes)
+            kernel.write_dec(&board, beats[i])
+        board.write("\n".bytes)
+    if once_count.load() == 1 && !once.is_active() && muted_count.load() == 0 && !muted.is_active()
+        say("skiff: a one-shot timer fired once, and a timer stopped before its expiry never fired\n")
+    else
+        say("skiff: a one-shot timer did not fire once, or a stopped timer fired\n")
+    val kicked_after = kicked_at.load() - kick_tick.load()
+    if kick_sent.load() == 1 && at_once && kicked_after == 2 && !kicked.is_active()
+        say("skiff: a timer started from an interrupt was active at once and fired 2 ticks later\n")
+    else
+        board.write("skiff: a timer started from an interrupt fired ".bytes)
+        kernel.write_dec(&board, kicked_after)
+        board.write(" ticks later, active at once: ".bytes)
+        board.write(if at_once then "yes\n".bytes else "no\n".bytes)
+    if elsewhere.load() == 0
+        say("skiff: every timer callback ran in the timer service\n")
+    else
+        say("skiff: a timer callback ran outside the timer service\n")
+    kernel.sleep_forever()

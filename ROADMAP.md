@@ -145,6 +145,7 @@ is run by hand until a flashing-and-serial harness exists.
 | Recursive mutex | nested takes, a refused non-owner give, the hand-over on the last give ✅ |
 | Task control | suspend, resume (from an interrupt too), priorities with inherited boosts, stop, row reuse ✅ |
 | Run-time statistics and stack high-water marks | per-task run time from a board counter (CMSDK timer 1 on QEMU), a total, an idle share, a snapshot with no allocation, reset; painted stacks scanned above the guard ✅ |
+| Software timers | one-shot and auto-reload timers in static storage, started, stopped, reset and re-periodded from tasks or interrupts through a command queue; callbacks in a service task, never the tick; reload without drift, across the tick's wrap ✅ |
 
 ## What skiff reuses rather than writes
 

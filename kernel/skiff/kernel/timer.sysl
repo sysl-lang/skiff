@@ -1,0 +1,192 @@
+module skiff.kernel
+
+// Software timers: a function called once a given number of ticks have passed, once (a one-shot timer)
+// or every period from then on (an auto-reload timer).
+//
+// A timer is a plain struct in the program's storage, written as a constructor over constants so that a
+// bare-metal image lays it in as data, callback and all:
+//
+//     var blink: Timer = Timer("blink", 50, true, &on_blink, false, 0, null)
+//
+// Callbacks never run in the tick interrupt. They run one after another in the timer service, a task
+// that `start_timers` adds at a priority the program chooses, so a callback may do what a task may do,
+// except wait: while one waits, no other timer's callback can run. Nothing but the service touches a
+// timer's place in the list of active timers. Starting, stopping, resetting and changing the period are
+// commands, sent to the service through a queue of `TIMER_QUEUE_LENGTH`, and each takes effect when the
+// service takes it from the queue. Each has a variant for an interrupt handler that never waits for
+// room in the queue.
+//
+// A command carries the tick it was sent on, and a timer it starts expires `period` ticks after that
+// tick, however long the command waited in the queue. An auto-reload timer's next expiry is the one
+// before plus its period, so the calls never drift from the ticks they were due on, and if the service
+// fell behind, each missed expiry is still called, late. Ticks compare modulo 2^32, so a period may be
+// up to 2^31 - 1 ticks.
+
+// What a timer's callback is: the address of a function given the timer that expired.
+type TimerCallback = *extern(*Timer) -> unit
+
+struct Timer
+    name: string
+    period: u32         // ticks from a start to the expiry, and between expiries of an auto-reload timer
+    reload: bool        // whether it starts again by itself at each expiry
+    callback: TimerCallback
+    active: bool        // whether it will expire: started and since then neither stopped nor, if a one-shot,
+                        // expired
+    expiry: u32         // the tick an active timer next expires on
+    next: *Timer        // the active timer that expires after it, or null
+
+    // Start the timer: it expires `period` ticks from now. Starting an active timer starts it again
+    // from now. Waits up to `timeout` ticks for room in the command queue; answers whether the command
+    // was sent.
+    start(*self, timeout: u32) -> bool = send_timer_command(TimerOp.Start, self, 0, timeout)
+
+    // Stop the timer, so that it does not expire. Stopping a timer that is not active does nothing.
+    stop(*self, timeout: u32) -> bool = send_timer_command(TimerOp.Stop, self, 0, timeout)
+
+    // Start the timer again from now, whether it is active or not: the same as `start`.
+    reset(*self, timeout: u32) -> bool = send_timer_command(TimerOp.Start, self, 0, timeout)
+
+    // Give the timer a new period, above 0, and start it from now with it, whether it was active or not.
+    change_period(*self, period: u32, timeout: u32) -> bool
+        if period == 0 then panic("skiff: a timer's period must be above 0")
+        send_timer_command(TimerOp.Period, self, period, timeout)
+
+    // `start` from an interrupt handler: never waits, and answers false if the queue is full.
+    start_from_isr(*self) -> bool = send_timer_command(TimerOp.Start, self, 0, 0)
+
+    // `stop` from an interrupt handler: never waits, and answers false if the queue is full.
+    stop_from_isr(*self) -> bool = send_timer_command(TimerOp.Stop, self, 0, 0)
+
+    // `reset` from an interrupt handler: never waits, and answers false if the queue is full.
+    reset_from_isr(*self) -> bool = send_timer_command(TimerOp.Start, self, 0, 0)
+
+    // `change_period` from an interrupt handler: never waits, and answers false if the queue is full.
+    change_period_from_isr(*self, period: u32) -> bool
+        if period == 0 then panic("skiff: a timer's period must be above 0")
+        send_timer_command(TimerOp.Period, self, period, 0)
+
+    // Whether the timer will expire. A command still in the queue has not yet changed the answer.
+    is_active(*self) -> bool = self.active
+
+// How many commands the timer service's queue holds.
+const TIMER_QUEUE_LENGTH: usize = 8
+
+enum TimerOp
+    Start
+    Stop
+    Period
+
+// A command to the timer service: what to do to `timer`, sent on tick `sent`, with the new period for
+// `Period`.
+struct TimerCommand
+    op: TimerOp
+    timer: *Timer
+    sent: u32
+    period: u32
+
+// An unused slot of the command queue.
+val NO_TIMER_COMMAND: TimerCommand = TimerCommand(TimerOp.Stop, null, 0, 0)
+
+// The active timers, soonest expiry first; timers with the same expiry in the order they were added.
+// It holds no clock: every operation is given the tick it happens on.
+struct TimerList
+    head: *Timer
+
+    // Add active timer `t`, whose `expiry` is set, as at tick `now`. An expiry up to 2^31 ticks before
+    // `now` is overdue and comes before any that is not.
+    insert(*self, t: *Timer, now: u32)
+        val due_in = i32(t.expiry - now)
+        var before: *Timer = null
+        var at = self.head
+        while at != null && i32(at.expiry - now) <= due_in
+            before = at
+            at = at.next
+        t.next = at
+        if before == null then self.head = t else before.next = t
+
+    // Take `t` out of the list, if it is in it.
+    remove(*self, t: *Timer)
+        var before: *Timer = null
+        var at = self.head
+        while at != null && at != t
+            before = at
+            at = at.next
+        if at == null then return
+        if before == null then self.head = t.next else before.next = t.next
+        t.next = null
+
+    // Take out and answer the first timer whose expiry has come by tick `now`, or null if none has.
+    take_due(*self, now: u32) -> *Timer
+        val t = self.head
+        if t == null || i32(t.expiry - now) > 0 then return null
+        self.head = t.next
+        t.next = null
+        t
+
+    // The ticks from `now` to the first expiry: 0 if it has come, `FOREVER` with no active timer.
+    wait_from(*self, now: u32) -> u32
+        if self.head == null then return FOREVER
+        val left = i32(self.head.expiry - now)
+        if left > 0 then u32(left) else 0
+
+    // Run every timer whose expiry has come by tick `now`, soonest first: an auto-reload timer is put
+    // back a period after the expiry it ran for, and called again in the same round if that has come
+    // too; a one-shot timer is no longer active. Each is taken care of before its callback is called.
+    expire(*self, now: u32)
+        loop
+            val t = self.take_due(now)
+            if t == null then return
+            if t.reload
+                t.expiry += t.period
+                self.insert(t, now)
+            else
+                t.active = false
+            t.callback(t)
+
+    // Carry out command `c`.
+    apply(*self, c: TimerCommand)
+        val t = c.timer
+        if t.active then self.remove(t)
+        c.op match
+            TimerOp.Stop ->
+                t.active = false
+                return
+            TimerOp.Period -> t.period = c.period
+            TimerOp.Start -> ()
+        if t.period == 0 then panic("skiff: a timer's period must be above 0")
+        t.expiry = c.sent + t.period
+        t.active = true
+        self.insert(t, c.sent)
+
+// The active timers, which only the timer service touches.
+private[kernel] var timers: TimerList = TimerList(null)
+
+// The commands sent to the timer service.
+private[kernel] var timer_commands: Queue[TimerCommand, TIMER_QUEUE_LENGTH] =
+    Queue([NO_TIMER_COMMAND; TIMER_QUEUE_LENGTH], 0, 0)
+
+private send_timer_command(op: TimerOp, t: *Timer, period: u32, timeout: u32) -> bool =
+    timer_commands.send(TimerCommand(op, t, ticks(), period), timeout)
+
+// Add the timer service, the task that runs timers' callbacks, at `priority` on `stack`. Called once,
+// before `run` or by a running task. Timers may be started before it is added; their commands wait in
+// the queue, and their ticks count from when they were sent.
+start_timers(p: *Port, stack: []u32, priority: u8)
+    spawn(p, stack, &timer_service, priority, "timers")
+
+private timer_service() -> never
+    loop
+        serve_timers()
+
+// One round of the timer service: run every timer that has expired, wait for a command until the next
+// expiry comes, then carry out that command and every other one waiting.
+private[kernel] serve_timers()
+    timers.expire(ticks())
+    timer_commands.receive(timers.wait_from(ticks())) match
+        Some(c) ->
+            timers.apply(c)
+            loop
+                timer_commands.receive(0) match
+                    Some(more) -> timers.apply(more)
+                    None -> return
+        None -> ()

@@ -1,0 +1,295 @@
+module skiff.kernel
+@tests
+
+// Software timers on the host. The test plays the timer service: it calls `serve_timers`, whose wait
+// for a command blocks the running task and asks the port for a switch, and the port answers by letting
+// ticks pass until the task is ready again. So each callback is seen on the tick a real service would
+// have run it on. The list's arithmetic across the 2^32 wrap is tested on a `TimerList` given its ticks,
+// since the kernel's own count starts at 0.
+
+// A port that runs the clock while the running task is blocked, never for more than 10,000 ticks at a
+// time. On tick `hook_at` it calls `hook`, as an interrupt handler would; on tick `end` it sends the
+// service a command that changes nothing, so that a service waiting past `end` comes back to the test.
+struct TimerPort
+    switches: u32
+    masks: u32
+    advancing: bool
+    in_tick: bool       // whether the clock's tick, the interrupt, is running
+    end: u32
+    hook_at: u32
+    hook: *extern() -> unit
+
+impl Port for TimerPort
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize = usize(&stack[0])
+
+    request_switch(*self)
+        self.switches += 1
+        if self.advancing then return
+        self.advancing = true
+        var n: u32 = 0
+        while scheduler.tasks[scheduler.running].state == TaskState.Blocked
+            if n == 10_000 then panic("the clock ran out")
+            self.in_tick = true
+            tick()
+            self.in_tick = false
+            if ticks() == self.hook_at then self.hook()
+            if ticks() == self.end then val _ = idle_wake.stop_from_isr()
+            n += 1
+        self.advancing = false
+
+    start_first(*self, sp: usize) -> never
+        loop
+            ()
+
+    mask(*self) -> u32
+        self.masks += 1
+        self.masks
+
+    restore(*self, state: u32)
+        if state != self.masks then panic("restored out of order")
+        self.masks -= 1
+
+    idle(*self) = ()
+
+// A callback seen: which timer, on which tick, whether inside the tick interrupt, and which task ran it.
+struct Fire
+    name: string
+    tick: u32
+    in_tick: bool
+    task: usize
+
+val NO_FIRE: Fire = Fire("", 0, false, 0)
+
+private var clock: TimerPort = TimerPort(0, 0, false, false, 0, 0, null)
+private var fires: [32]Fire = [NO_FIRE; 32]
+private var fire_count: usize = 0
+
+private record(t: *Timer) -> unit
+    if fire_count < 32 then fires[fire_count] = Fire(t.name, ticks(), clock.in_tick, scheduler.running)
+    fire_count += 1
+
+private stop_self(t: *Timer) -> unit
+    record(t)
+    val _ = t.stop(0)
+
+private var idle_wake: Timer = Timer("nothing", 1, false, &record, false, 0, null)
+private var ta: Timer = Timer("a", 30, false, &record, false, 0, null)
+private var tb: Timer = Timer("b", 10, false, &record, false, 0, null)
+private var tc: Timer = Timer("c", 20, false, &record, false, 0, null)
+private var td: Timer = Timer("d", 20, false, &record, false, 0, null)
+private var tr: Timer = Timer("r", 5, true, &record, false, 0, null)
+private var selfish: Timer = Timer("selfish", 5, true, &stop_self, false, 0, null)
+
+// The kernel's table, emptied, with a task per entry of `priorities`; task 0 runs.
+private setup(priorities: []const u8)
+    scheduler = empty_scheduler()
+    for pr in priorities
+        val _ = scheduler.add(0, pr)
+    scheduler.running = 0
+    port = Some(&clock)
+
+// Serve as the timer service until tick `end`, and run whatever has expired by then.
+private serve_until(end: u32)
+    clock.end = end
+    while ticks() < end
+        serve_timers()
+    timers.expire(ticks())
+
+// The ticks the callbacks so far were seen on, for timer `name`.
+private fired(name: string) -> [8]u32
+    var out: [8]u32 = [0; 8]
+    var n = 0
+    for i in 0..<fire_count
+        if i < 32 && fires[i].name == name && n < 8
+            out[n] = fires[i].tick
+            n += 1
+    out
+
+@test("several timers expire soonest first, each on its tick, in the service and never in the tick")
+several_in_order()
+    setup([2])
+    assert(ta.start(0), "a sent")
+    assert(tb.start(0), "b sent")
+    assert(tc.start(0), "c sent")
+    assert(td.start(0), "d sent")
+    serve_until(40)
+    assert_eq(fire_count, 4)
+    assert(fires[0].name == "b" && fires[0].tick == 10, "b first, on 10")
+    assert(fires[1].name == "c" && fires[1].tick == 20, "c on 20")
+    assert(fires[2].name == "d" && fires[2].tick == 20, "d on 20, after c, which was started first")
+    assert(fires[3].name == "a" && fires[3].tick == 30, "a on 30")
+    for i in 0..<4
+        assert(!fires[i].in_tick, "not in the tick interrupt")
+        assert_eq(fires[i].task, 0)
+    assert(!ta.is_active() && !tb.is_active(), "one-shots are done")
+    assert_eq(clock.masks, 0)
+
+@test("a one-shot timer expires once; an auto-reload timer every period, and stays active")
+one_shot_and_reload()
+    setup([2])
+    tb.period = 5
+    assert(tb.start(0), "b sent")
+    assert(tr.start(0), "r sent")
+    assert(!tr.is_active(), "not active until the service has the command")
+    serve_until(22)
+    assert(fired("b") == [5, 0, 0, 0, 0, 0, 0, 0], "b once, on 5")
+    assert(fired("r") == [5, 10, 15, 20, 0, 0, 0, 0], "r every 5 ticks")
+    assert(!tb.is_active(), "b is done")
+    assert(tr.is_active(), "r carries on")
+    assert_eq(tr.expiry, 25)
+
+@test("an auto-reload timer's expiries stay a period apart from the first, however late the service is")
+reload_does_not_drift()
+    setup([2])
+    tr.period = 7
+    assert(tr.start(0), "sent on tick 0")
+    sleep(17)
+    assert_eq(ticks(), 17)
+    serve_until(30)
+    assert(fired("r") == [17, 17, 21, 28, 0, 0, 0, 0], "the missed 7 and 14 late, then 21 and 28 on time")
+    assert_eq(tr.expiry, 35)
+
+@test("a command counts from the tick it was sent on, not the tick the service takes it")
+counts_from_sending()
+    setup([2])
+    sleep(4)
+    assert(tb.start(0), "sent on tick 4")
+    sleep(3)
+    serve_until(20)
+    assert(fired("b") == [14, 0, 0, 0, 0, 0, 0, 0], "4 + 10")
+
+@test("a timer stopped before it expires is never called; stopping an inactive timer does nothing")
+stop_before_expiry()
+    setup([2])
+    tb.reload = true
+    assert(tb.start(0), "b sent")
+    assert(tc.start(0), "c sent")
+    serve_until(5)
+    assert(tb.is_active() && tc.is_active(), "both running")
+    assert(tb.stop(0), "b stop sent")
+    assert(tc.stop(0), "c stop sent")
+    assert(ta.stop(0), "a, never started, stop sent")
+    serve_until(50)
+    assert_eq(fire_count, 0)
+    assert(!ta.is_active() && !tb.is_active() && !tc.is_active(), "none active")
+
+@test("a callback may stop its own auto-reload timer")
+callback_stops_itself()
+    setup([2])
+    assert(selfish.start(0), "sent")
+    serve_until(30)
+    assert(fired("selfish") == [5, 0, 0, 0, 0, 0, 0, 0], "once")
+    assert(!selfish.is_active(), "stopped")
+
+@test("reset starts an active timer again from the tick it was sent on")
+reset_restarts()
+    setup([2])
+    assert(tb.start(0), "sent")
+    serve_until(6)
+    assert(tb.reset(0), "reset on 6")
+    serve_until(30)
+    assert(fired("b") == [16, 0, 0, 0, 0, 0, 0, 0], "6 + 10, and never 10")
+
+@test("a new period starts the timer from the tick it was sent on, active or not")
+period_change()
+    setup([2])
+    tr.period = 10
+    assert(tr.start(0), "r sent")
+    serve_until(13)
+    assert(tr.change_period(4, 0), "r to 4 on 13")
+    ta.period = 100
+    assert(ta.change_period(3, 0), "dormant a to 3 on 13")
+    serve_until(26)
+    assert(fired("r") == [10, 17, 21, 25, 0, 0, 0, 0], "10, then 13 + 4 and every 4")
+    assert(fired("a") == [16, 0, 0, 0, 0, 0, 0, 0], "a started by the change, once")
+    assert_eq(tr.period, 4)
+    assert_eq(ta.period, 3)
+
+@test("a period of 0 is refused when it is asked for", should_trap: "skiff: a timer's period must be above 0")
+period_zero_refused()
+    setup([2])
+    val _ = tr.change_period(0, 0)
+
+@test("a timer whose period is 0 is refused when started", should_trap: "skiff: a timer's period must be above 0")
+start_period_zero_refused()
+    setup([2])
+    tb.period = 0
+    assert(tb.start(0), "sent")
+    serve_until(5)
+
+@test("expiries, waits and auto-reloads compare modulo 2^32, across the wrap")
+across_the_wrap()
+    var list = TimerList(null)
+    val now: u32 = 0xffff_fff0
+    ta.expiry = now + 0x20
+    tb.expiry = now + 0x8
+    ta.active = true
+    tb.active = true
+    list.insert(&ta, now)
+    list.insert(&tb, now)
+    assert(list.head == &tb, "b, due before the wrap, first")
+    assert_eq(list.wait_from(now), 8)
+    assert(list.take_due(0xffff_fff7) == null, "nothing due yet")
+    assert(list.take_due(0xffff_fff8) == &tb, "b due on 0xfffffff8")
+    assert_eq(list.wait_from(0xffff_fff8), 0x18)
+    assert(list.take_due(0x0f) == null, "a not due on 0x0f, after the wrap")
+    assert(list.take_due(0x10) == &ta, "a due on 0x10")
+    assert_eq(list.wait_from(0x10), FOREVER)
+    tr.period = 0x10
+    list.apply(TimerCommand(TimerOp.Start, &tr, 0xffff_fffc, 0))
+    assert_eq(tr.expiry, 0x0c)
+    assert_eq(list.wait_from(0xffff_fffc), 0x10)
+    list.expire(0xffff_ffff)
+    assert_eq(fire_count, 0)
+    list.expire(0x0c)
+    assert_eq(fire_count, 1)
+    assert_eq(tr.expiry, 0x1c)
+    assert_eq(list.wait_from(0x0c), 0x10)
+
+@test("a full command queue refuses at once with no timeout, and after the timeout with one")
+full_queue()
+    setup([1])
+    for _ in 0..<TIMER_QUEUE_LENGTH
+        assert(ta.start(0), "room")
+    assert(!ta.start(0), "full")
+    assert(!ta.start_from_isr(), "full, from an interrupt")
+    assert_eq(ticks(), 0)
+    assert(!ta.stop(5), "still full after 5 ticks")
+    assert_eq(ticks(), 5)
+    assert_eq(clock.masks, 0)
+
+private take_one() -> unit
+    val _ = timer_commands.receive(0)
+
+@test("a task waiting for room in the queue sends as soon as the service takes a command")
+waits_for_room()
+    setup([1])
+    for _ in 0..<TIMER_QUEUE_LENGTH
+        assert(ta.start(0), "room")
+    clock.hook_at = 3
+    clock.hook = &take_one
+    assert(tb.start(10), "sent once there was room")
+    assert_eq(ticks(), 3)
+
+@test("from an interrupt, a command wakes the service and asks for a switch if it outranks the task")
+from_isr_wakes_the_service()
+    setup([1, 3])
+    scheduler.running = 1
+    scheduler.block(0, wait_key(&timer_commands, 0), FOREVER)
+    scheduler.running = 0
+    assert(tb.start_from_isr(), "sent")
+    assert(scheduler.tasks[1].state == TaskState.Ready, "the service is woken")
+    assert_eq(clock.switches, 1)
+    assert_eq(ticks(), 0)
+    assert(tc.stop_from_isr() && tc.reset_from_isr() && tc.change_period_from_isr(4), "all three sent")
+    assert_eq(timer_commands.len, 4)
+
+@test("from an interrupt, a command that wakes a lower-priority service asks for no switch")
+from_isr_lower_service()
+    setup([3, 1])
+    scheduler.running = 1
+    scheduler.block(0, wait_key(&timer_commands, 0), FOREVER)
+    scheduler.running = 0
+    assert(tb.start_from_isr(), "sent")
+    assert(scheduler.tasks[1].state == TaskState.Ready, "the service is woken")
+    assert_eq(clock.switches, 0)
