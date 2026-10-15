@@ -19,7 +19,10 @@ import skiff.kernel.{Machine, NotifyAction}
 //     and then a second one that must not overwrite it, and at 131 it finds the first.
 
 private var stack_counter: [256]u32 = [0; 256]
-private var stack_spinner: [256]u32 = [0; 256]
+// A spinner's stack is 2 KiB so that the stack it works in never shares a 1 KiB page with its guard
+// region: QEMU checks every access to such a page the slow way, and the spinner then counts too slowly
+// for the scenario's ticks (see CLAUDE.md).
+private var stack_spinner: [512]u32 = [0; 512]
 private var stack_note_wait: [256]u32 = [0; 256]
 private var stack_note_set: [256]u32 = [0; 256]
 

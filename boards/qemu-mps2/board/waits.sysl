@@ -90,6 +90,7 @@ timer0_event()
         val _ = from_timer.give()
     notes_timer_event()
     streams_timer_event()
+    control_timer_event()
 
 private task_timer() -> never
     var board = Board()

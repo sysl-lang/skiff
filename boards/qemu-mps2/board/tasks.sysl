@@ -17,7 +17,7 @@ import skiff.kernel.Machine
 //   - H, at priority 3, sleeps for 30 ticks and must be running on the very tick it is due, although B
 //     never yields.
 
-private var cortex: armv7m.Cortex = armv7m.Cortex()
+private[board] var cortex: armv7m.Cortex = armv7m.Cortex()
 
 private var stack_a: [256]u32 = [0; 256]
 private var stack_b: [256]u32 = [0; 256]
@@ -45,6 +45,7 @@ run_tasks() -> never
     spawn_notes(&cortex)
     spawn_streams(&cortex)
     spawn_rmutex(&cortex)
+    spawn_control(&cortex)
     spawn_memory(&cortex)
     armv7m.enable_protection()
     kernel.protect(&protector)

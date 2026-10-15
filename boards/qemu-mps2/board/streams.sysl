@@ -20,7 +20,8 @@ import skiff.kernel.{Machine, MessageBuffer, StreamBuffer}
 //     0 and leave the message to be received whole.
 
 private var stack_stream_reader: [256]u32 = [0; 256]
-private var stack_stream_spinner: [256]u32 = [0; 256]
+// 2 KiB, so that its working stack never shares a page with its guard (notes.sysl's spinner says why).
+private var stack_stream_spinner: [512]u32 = [0; 512]
 private var stack_message_sender: [256]u32 = [0; 256]
 private var stack_message_receiver: [256]u32 = [0; 256]
 

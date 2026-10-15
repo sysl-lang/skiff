@@ -107,6 +107,12 @@ private task() -> never
     link.rung()
     val _ = ring_out.waiting()
     if kernel.stopped(kernel.running_task().index) then kernel.stop_running()
+    kernel.set_priority(me, 2)
+    val _ = kernel.priority(me) + kernel.base_priority(me)
+    kernel.suspend(me)
+    kernel.resume(me)
+    val _ = kernel.resume_from_isr(me) || kernel.suspended(me)
+    kernel.stop(me)
     kernel.sleep_forever()
 
 @export("main")

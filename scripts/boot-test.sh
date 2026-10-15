@@ -48,6 +48,10 @@ skiff: a receive buffer too short for a message left it whole
 skiff: a give by a task not holding the recursive mutex was refused
 skiff: a timed take of a held recursive mutex timed out after 2 ticks
 skiff: a recursive mutex held 3 deep went to the waiter on the third give, before the busy task finished
+skiff: a suspended task did not run for 5 ticks, and ran again once resumed
+skiff: an interrupt resumed a task that suspended itself at once, 3 times
+skiff: a lowered priority kept the inherited boost, and the lowered task yielded at once
+skiff: a stopped waiter left its wait list, a task stopped itself, and a new task took a stopped task's row
 skiff: task deep overflowed its stack
 skiff: task null broke its memory protection
 skiff: mmfar 0x00000000
