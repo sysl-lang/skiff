@@ -1,0 +1,111 @@
+module skiff.arch.armv7m
+
+import skiff.kernel
+
+// Kernel calls through SVC: the port's half of kernel calls.sysl.
+//
+// **A call** is `svc 1` from `trap`, with the call's arguments in r0-r3 and its number in r12. On entry
+// the processor has pushed r0-r3, r12, lr, pc and xPSR onto the task's stack, so the first five words of
+// that frame are the kernel's `CallFrame`. `call_entry` hands the frame to `kernel.begin_call`, which
+// checks that it lies in the task's own stack, then lays a second frame just below it that starts
+// `call_thread`, makes thread mode privileged and returns into it. So the call runs in the task's own
+// thread, on its own stack, and may block and be switched away from like any kernel code; while it runs
+// the task is privileged, and the switch keeps it so.
+//
+// **The return** is `svc 2` from `call_thread`, with the answer in r0. `call_entry` hands back the
+// task's privilege, writes the answer over the r0 of the call's frame, and returns through that frame
+// with the EXC_RETURN it arrived with, so the task resumes after its `svc 1` with every register as it
+// was but r0. The SVC handler made the processor fill the frame's FPU half on entry, so a task that uses
+// the FPU gets its s0-s15 and FPSCR back too.
+//
+// **Any other trap is refused and stops the task**, as a fault would: an SVC number the kernel does not
+// take, a call frame outside the task's stack (it moved its stack pointer somewhere else first), or a
+// return with no call in flight. An unprivileged task can reach nothing privileged except through
+// `call_thread`, which runs only the call the kernel recorded.
+
+// The SVC numbers a task may make. `svc 0` starts the first task, from the main stack (context.sysl).
+private const SVC_CALL: u8 = 1
+private const SVC_RETURN: u8 = 2
+
+// The frame the processor pushes: eight words, or twenty-six with the FPU's half (EXC_RETURN bit 4
+// clear).
+private const FRAME_BYTES: usize = 32
+private const FPU_FRAME_BYTES: usize = 104
+private const EXC_RETURN_NO_FPU: u32 = 1 << 4
+
+// Where a task in a call resumes when the call returns: its call's frame, and the EXC_RETURN it trapped
+// with.
+private struct Resume
+    frame: usize
+    exc_return: u32
+
+private var resumes: [kernel.MAX_TASKS]Resume = [Resume(0, 0); kernel.MAX_TASKS]
+
+// The kernel's trap (skiff.kernel.user): enter the kernel with call `number` and four arguments, and
+// answer its result. Every register but r0 comes back as it was.
+@export("skiff_trap")
+trap(number: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> usize
+    var result: usize = 0
+    asm
+        [thumb]
+            "svc 1"
+            in a0 : "r0"
+            in a1 : "r1"
+            in a2 : "r2"
+            in a3 : "r3"
+            in number : "r12"
+            out result : "r0"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+    result
+
+// Called by the SVC handler for an SVC from a task, with the frame the processor pushed and the address
+// of the EXC_RETURN it will return with, which this may rewrite. Answers the process stack to return on.
+@export("skiff_call_entry")
+call_entry(frame: *u32, exc_return: *u32) -> usize
+    val at = usize(frame)
+    val svc: *u8 = ptr_cast(usize(frame[6]) - 2)       // the immediate of the SVC just made
+    val task = kernel.running_task()
+    if *svc == SVC_CALL
+        val bytes = if (*exc_return & EXC_RETURN_NO_FPU) == 0 then FPU_FRAME_BYTES else FRAME_BYTES
+        if kernel.begin_call(at, bytes, FRAME_BYTES)
+            resumes[task.index] = Resume(at, *exc_return)
+            val start: *u32 = ptr_cast(at - FRAME_BYTES)
+            for k in 0..<6
+                start[k] = 0
+            start[6] = u32(usize(&call_thread)) & ~1u32
+            start[7] = XPSR_THUMB
+            *exc_return = EXC_RETURN_THREAD_PSP
+            set_thread_privilege(false)
+            return at - FRAME_BYTES
+    else if *svc == SVC_RETURN && kernel.end_call()
+        val r = resumes[task.index]
+        val call: *u32 = ptr_cast(r.frame)
+        call[0] = frame[0]
+        *exc_return = r.exc_return
+        set_thread_privilege(kernel.running_unprivileged())
+        drop_lazy_fpu_state()
+        return r.frame
+    refuse_trap(frame, task, exc_return)
+
+// Stop the running task for a trap the kernel does not take, reporting it as a fault, and answer the
+// stack its stopped frame is on.
+private refuse_trap(frame: *u32, task: kernel.TaskInfo, exc_return: *u32) -> usize
+    val s = scb()
+    var f = Fault(SVCALL, frame[6], frame[5], 0, s.hfsr, 0, 0)
+    var t = task
+    board_task_fault(&f, &t)
+    kernel.stop_running()
+    drop_lazy_fpu_state()
+    *exc_return = EXC_RETURN_THREAD_PSP
+    stopped_frame(task)
+
+// The privileged thread a call runs in: run the call the kernel recorded, then return its answer.
+private call_thread() -> never
+    val result = kernel.serve_call()
+    asm
+        [thumb]
+            "svc 2"
+            in result : "r0"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+    loop
+        ()

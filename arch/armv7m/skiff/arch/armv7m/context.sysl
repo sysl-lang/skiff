@@ -18,7 +18,11 @@ import skiff.kernel.Port
 // task's context the same way. A task that has never used the FPU saves nothing for it.
 //
 // **The first task starts through SVC**: an exception return is the only way into thread mode on the
-// PSP with a task's xPSR and pc. The handler unwinds the task's context as PendSV would.
+// PSP with a task's xPSR and pc. The handler unwinds the task's context as PendSV would. That is `svc
+// 0`, made on the main stack; an SVC from a task, on the process stack, is a kernel call (calls.sysl).
+//
+// **Privilege is set on the way out of every switch**, once the kernel isolates any task: thread mode
+// runs unprivileged (CONTROL.nPRIV) exactly while an unprivileged task outside a kernel call runs.
 //
 // **Masking is BASEPRI**, not PRIMASK: it holds off SysTick and PendSV, the handlers that touch the
 // kernel's state, and leaves faults, SVC and higher-priority interrupts alone. SVC with interrupts
@@ -48,19 +52,67 @@ asm
         ".thumb_func"
         ".globl skiff_svc"
         "skiff_svc:"
+        "tst lr, #4"
+        "bne 1f"
         "ldr r1, =_stack_top"
         "msr msp, r1"
         "ldmia r0!, {{r4-r11, lr}}"
         "msr psp, r0"
+        "push {{r3, lr}}"
+        "bl skiff_first_privilege"
+        "pop {{r3, lr}}"
         "movs r1, #0"
         "msr basepri, r1"
+        "isb"
+        "bx lr"
+        // A kernel call from a task. If the task has used the FPU, its frame has room for s0-s15 that
+        // the processor fills only lazily; an FPU instruction here fills it now, so that the frame is
+        // whole when the call returns through it. Then `skiff_call_entry` answers the process stack to
+        // return on and rewrites the saved EXC_RETURN in place.
+        "1:"
+        "mrs r0, psp"
+        "tst lr, #0x10"
+        "it eq"
+        "vmoveq.f32 s0, s0"
+        "push {{r4, lr}}"
+        "add r1, sp, #4"
+        "bl skiff_call_entry"
+        "pop {{r4, lr}}"
+        "msr psp, r0"
         "isb"
         "bx lr"
         ".ltorg"
     [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
 
 @export("skiff_switch")
-switch_handler(sp: usize) -> usize = kernel.switch_context(sp)
+switch_handler(sp: usize) -> usize
+    val next = kernel.switch_context(sp)
+    if kernel.isolating() then set_thread_privilege(kernel.running_unprivileged())
+    next
+
+// The first task's privilege, from the SVC that starts it.
+@export("skiff_first_privilege")
+first_privilege()
+    if kernel.isolating() then set_thread_privilege(kernel.running_unprivileged())
+
+// Make thread mode unprivileged, or privileged again: CONTROL.nPRIV, from a handler. The other bits of
+// CONTROL are kept.
+private[armv7m] set_thread_privilege(unprivileged: bool)
+    var control: u32 = 0
+    asm
+        [thumb]
+            "mrs {control}, control"
+            out control : reg
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+    val next = (control & ~CONTROL_NPRIV) | (if unprivileged then CONTROL_NPRIV else 0)
+    asm
+        [thumb]
+            "msr control, {next}"
+            "isb"
+            in next : reg
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+
+private const CONTROL_NPRIV: u32 = 1 << 0
 
 // The priority SysTick and PendSV run at: the lowest there is. Only the top bits a core implements are
 // kept, so 0xff reads back as its lowest level whatever that is.
@@ -72,10 +124,10 @@ private const KERNEL_HANDLER_PRIORITY: u32 = 0xff
 private const MASK_PRIORITY: u32 = 0x80
 
 // EXC_RETURN for thread mode on the PSP with no FPU state: what a new task's context says.
-private const EXC_RETURN_THREAD_PSP: u32 = 0xffff_fffd
+private[armv7m] const EXC_RETURN_THREAD_PSP: u32 = 0xffff_fffd
 
 // xPSR with only the Thumb bit set, the only state a new task's frame needs.
-private const XPSR_THUMB: u32 = 1 << 24
+private[armv7m] const XPSR_THUMB: u32 = 1 << 24
 
 private const ICSR_PENDSVSET: u32 = 1 << 28
 

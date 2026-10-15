@@ -1,21 +1,26 @@
 module skiff.arch.armv7m
 
 import sysl.slices.align_up
-import skiff.kernel.Protection
+import skiff.arch.pmsa
+import skiff.kernel.{Isolation, Protection, Region, RegionError, Slot}
 
 // The Armv7-M memory protection unit (PMSAv7, Architecture Reference Manual B3.5) as the kernel's
-// `Protection`.
+// `Protection`, and as its `Isolation` for unprivileged tasks.
 //
-// Tasks run privileged, and the MPU runs with PRIVDEFENA set, so privileged code sees the default
-// memory map wherever no region says otherwise. Two regions say otherwise, and both forbid every
-// access, privileged or not:
-//   - **The null guard**, region 0: the first `NULL_GUARD_BYTES` of the address space, so that a read
+// The MPU runs with PRIVDEFENA set, so privileged code sees the default memory map wherever no region
+// says otherwise, and unprivileged code sees nothing but its regions. Where regions overlap, the one
+// with the higher number wins. Two regions forbid every access, privileged or not:
+//   - **The null guard**, region 7: the first `NULL_GUARD_BYTES` of the address space, so that a read
 //     or write through a null pointer, or a small offset from one, faults. The processor reads the
 //     vector table through the default memory map, not the MPU's regions, so the table may live there,
-//     as it does on QEMU's MPS2 boards.
-//   - **The stack guard**, region 1: `STACK_GUARD_BYTES` at the bottom of the running task's stack,
+//     as it does on QEMU's MPS2 boards. It is the highest region, so that it wins over an unprivileged
+//     task's code region that starts at zero.
+//   - **The stack guard**, region 6: `STACK_GUARD_BYTES` at the bottom of the running task's stack,
 //     moved on every switch. A region must be aligned to its size, so the guard starts at the first
-//     such boundary in the stack, and the task has what lies above it.
+//     such boundary in the stack, and the task has what lies above it. It wins over an unprivileged
+//     task's stack region.
+// Regions 0 to 5 hold an unprivileged task's map while it runs (`Isolator`), and nothing while a
+// privileged one does.
 //
 // A frame bigger than the guard can step over it, so a task whose functions keep large arrays on the
 // stack can still write below its stack unseen. The guard catches a push, a call or an exception frame
@@ -40,8 +45,10 @@ private const RASR_ENABLE: u32 = 1 << 0
 private const RASR_XN: u32 = 1 << 28        // never execute
 // AP = 0b000 in bits 24-26: no access at all, which is what both guards want.
 
-private const NULL_REGION: u32 = 0
-private const STACK_REGION: u32 = 1
+private const MAP_REGIONS: u32 = 6
+private const STACK_REGION: u32 = 6
+private const NULL_REGION: u32 = 7
+private const REGIONS_NEEDED: u32 = 8
 
 // How much of the address space from zero faults on any access.
 const NULL_GUARD_BYTES: usize = 256
@@ -77,16 +84,45 @@ impl Protection for Protector
     // The guard and the bytes below it, up to the first 64-byte boundary.
     reserved(*self, base: usize, bytes: usize) -> usize = stack_guard(base) + STACK_GUARD_BYTES - base
 
-// Turn the MPU on with the null guard, and an empty stack guard until the first task runs. Call before
-// `kernel.run`, with `kernel.protect(&protector)`.
+// The core's MPU as the kernel's isolation: an unprivileged task's map in regions 0 to 5, encoded by
+// `pmsa.encode_v7`, so each region is a power of two aligned to its size, less whole eighths.
+struct Isolator
+end Isolator
+
+impl Isolation for Isolator
+    capacity(*self) -> usize = usize(MAP_REGIONS)
+
+    encode(*self, r: Region) -> Result[Slot, RegionError] = pmsa.encode_v7(r)
+
+    load(*self, map: []const Slot)
+        val m = mpu()
+        for k in 0u32..<MAP_REGIONS
+            if usize(k) < map.len
+                m.rbar = map[usize(k)].first | RBAR_VALID | k
+                m.rasr = map[usize(k)].second
+            else
+                m.rnr = k
+                m.rasr = 0
+        barrier()
+
+// Turn the MPU on with the null guard, an empty stack guard until the first task runs, and no map. Call
+// before `kernel.run`, with `kernel.protect(&protector)`, and `kernel.isolate(&isolator)` if any task
+// runs unprivileged.
 enable_protection()
     val m = mpu()
-    if ((m.kind >> 8) & 0xff) < 2 then panic("skiff: this core's MPU has fewer than two regions")
+    if ((m.kind >> 8) & 0xff) < REGIONS_NEEDED then panic("skiff: this core's MPU has fewer than eight regions")
+    for k in 0u32..<MAP_REGIONS
+        m.rnr = k
+        m.rasr = 0
     m.rbar = RBAR_VALID | NULL_REGION
     m.rasr = RASR_XN | size_field(NULL_GUARD_BYTES) | RASR_ENABLE
     m.rnr = STACK_REGION
     m.rasr = 0
     m.ctrl = CTRL_PRIVDEFENA | CTRL_ENABLE
+    barrier()
+
+// Make the MPU's new regions hold for the next instruction.
+private barrier()
     asm
         [thumb]
             "dsb"

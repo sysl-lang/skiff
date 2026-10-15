@@ -10,4 +10,5 @@ package {
 dependencies {
   kernel { workspace = true }
   armv7m { workspace = true }
+  pmsa { workspace = true }
 }

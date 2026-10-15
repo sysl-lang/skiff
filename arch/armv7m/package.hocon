@@ -8,4 +8,5 @@ package {
 
 dependencies {
   kernel { workspace = true }
+  pmsa { workspace = true }
 }

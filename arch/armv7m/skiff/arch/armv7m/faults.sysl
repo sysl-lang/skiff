@@ -16,7 +16,9 @@ import skiff.kernel.{Machine, write_hex}
 // **A MemManage fault in a task stops only that task**, and so does a UsageFault for a stack crossing
 // its limit (STKOF, which an Armv8-M core raises against PSPLIM: skiff.arch.armv8m). The MPU or the
 // limit raised it, so the task broke its protection — overflowed its stack or followed a null pointer —
-// and nothing outside it has been written. The board reports it naming the task, the kernel stops the task, and `fault_entry` answers a
+// and nothing outside it has been written. So does any MemManage, BusFault or UsageFault an
+// unprivileged task takes (kernel isolation.sysl). The board reports it naming the task, the kernel
+// stops the task, and `fault_entry` answers a
 // new process stack: a fresh frame at the top of the stopped task's stack, since its own may be the very
 // memory that faulted. The entry returns into thread mode on that stack with BASEPRI cleared, and the
 // switch the kernel asked for happens at once, before the frame is ever unstacked: PendSV tail-chains
@@ -63,6 +65,7 @@ extern "skiff_task_fault" board_task_fault(f: *Fault, task: *kernel.TaskInfo)
 
 private const MEMMANAGE: u32 = 4
 private const USAGEFAULT: u32 = 6
+private[armv7m] const SVCALL: u32 = 11
 private const EXC_RETURN_PSP: u32 = 1 << 2
 
 // FPCCR, whose LSPACT bit says a lazy save of the faulting task's FPU registers is still owed, to the
@@ -71,29 +74,38 @@ private const FPCCR: usize = 0xE000_EF34
 private const FPCCR_LSPACT: u32 = 1 << 0
 
 // Answers the process stack to return on, after a task was stopped; every other fault never returns.
+//
+// An unprivileged task (outside a kernel call) is stopped for any MemManage, BusFault or UsageFault it
+// takes: whatever it touched, it touched with its own privilege, so nothing of the kernel's was
+// written.
 @export("skiff_fault_entry")
 fault_entry(frame: *u32, exception: u32, exc_return: u32) -> usize
     val s = scb()
     val guarded = exception == MEMMANAGE && protection_on()
     val limited = exception == USAGEFAULT && (s.cfsr & CFSR_STKOF) != 0
-    if (exc_return & EXC_RETURN_PSP) != 0 && (guarded || limited)
+    val unprivileged = exception >= MEMMANAGE && exception <= USAGEFAULT && kernel.running_unprivileged()
+    if (exc_return & EXC_RETURN_PSP) != 0 && (guarded || limited || unprivileged)
         var task = kernel.running_task()
-        // A frame the processor could not push lies in the guard, and reading it would fault again; one
-        // that would have crossed a stack limit was never pushed at all.
-        val readable = !limited && usize(frame) >= stack_guard(task.stack) + STACK_GUARD_BYTES
+        // A frame the processor could not push lies in the guard or outside what the task may write, and
+        // reading it could fault again; one that would have crossed a stack limit was never pushed.
+        val readable = !limited && (s.cfsr & CFSR_MSTKERR) == 0 && usize(frame) >= stack_guard(task.stack) + STACK_GUARD_BYTES
         var f = Fault(exception, if readable then frame[6] else 0, if readable then frame[5] else 0, s.cfsr, s.hfsr, s.mmfar, s.bfar)
         s.cfsr = s.cfsr       // the status bits clear when written with ones
         board_task_fault(&f, &task)
         kernel.stop_running()
-        val fpccr: *Reg = ptr_cast(FPCCR)
-        fpccr.v = fpccr.v & ~FPCCR_LSPACT
+        drop_lazy_fpu_state()
         return stopped_frame(task)
     var f = Fault(exception, frame[6], frame[5], s.cfsr, s.hfsr, s.mmfar, s.bfar)
     board_fault(&f)
 
+// Forget a lazy save of FPU registers still owed to a frame that will never be returned through.
+private[armv7m] drop_lazy_fpu_state()
+    val fpccr: *Reg = ptr_cast(FPCCR)
+    fpccr.v = fpccr.v & ~FPCCR_LSPACT
+
 // A frame at the top of `task`'s stack that would start `stopped_task`, which it never does: the switch
 // away from the task comes first. Answers its address.
-private stopped_frame(task: kernel.TaskInfo) -> usize
+private[armv7m] stopped_frame(task: kernel.TaskInfo) -> usize
     val top = (task.stack + task.stack_bytes) & ~7usize
     val frame: *u32 = ptr_cast(top - 32)
     for i in 0..<6
@@ -112,12 +124,15 @@ stack_overflow(f: *Fault, task: *kernel.TaskInfo) -> bool
     val g = stack_guard(task.stack)
     (f.cfsr & (CFSR_STKOF | CFSR_MSTKERR)) != 0 || ((f.cfsr & CFSR_MMARVALID) != 0 && f.mmfar >= u32(g) && f.mmfar < u32(g + STACK_GUARD_BYTES))
 
-// Write a task the MPU stopped to `m`'s console: `skiff: task <name> overflowed its stack`, or
-// `skiff: task <name> broke its memory protection`, then the fault's registers.
+// Write a task its protection stopped to `m`'s console: `skiff: task <name> overflowed its stack`,
+// `skiff: task <name> broke its memory protection`, or for a trap the kernel refused to take (calls.sysl)
+// `skiff: task <name> made a trap the kernel does not take`, then the fault's registers.
 report_task_fault[M: Machine](f: *Fault, task: *kernel.TaskInfo, m: *M)
     m.write("skiff: task ".bytes)
     m.write(task.name.bytes)
-    if stack_overflow(f, task)
+    if f.exception == SVCALL
+        m.write(" made a trap the kernel does not take\n".bytes)
+    else if stack_overflow(f, task)
         m.write(" overflowed its stack\n".bytes)
     else
         m.write(" broke its memory protection\n".bytes)

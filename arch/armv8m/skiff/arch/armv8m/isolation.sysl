@@ -1,0 +1,84 @@
+module skiff.arch.armv8m
+
+import skiff.arch.pmsa
+import skiff.kernel.{Isolation, MAX_MAP, Region, RegionError, Slot}
+
+// The Armv8-M memory protection unit (PMSAv8, Architecture Reference Manual B3.9) as the kernel's
+// `Isolation`: an unprivileged task's map in its first regions, each a base and a limit 32 bytes apart
+// at least.
+//
+// The MPU runs with PRIVDEFENA set, so privileged code sees the default memory map wherever no region
+// says otherwise, and with no region at all while a privileged task runs. Unprivileged code sees only
+// its map. Regions may not overlap: an address two regions match faults, which is why the kernel refuses
+// a map whose regions share a byte. The stack needs no guard region here; PSPLIM guards it
+// (`StackLimit`).
+//
+// The memory kinds the regions name are MAIR0's attributes 0 (normal) and 1 (device), set by
+// `enable_isolation`.
+
+private struct Mpu8
+    kind: volatile u32          // 0xE000_ED90 MPU_TYPE: how many regions
+    ctrl: volatile u32          // 0x94
+    rnr: volatile u32           // 0x98 region number
+    rbar: volatile u32          // 0x9c region base address, access and execute-never
+    rlar: volatile u32          // 0xa0 region limit address, attribute index and enable
+
+@assert(offsetof(Mpu8, rlar) == 0x10, "MPU_RLAR is at 0xE000EDA0")
+
+private struct Word
+    v: volatile u32
+
+private const MPU: usize = 0xE000_ED90
+private const MAIR0: usize = 0xE000_EDC0
+private mpu() -> *Mpu8 = ptr_cast(MPU)
+
+private const CTRL_ENABLE: u32 = 1 << 0
+private const CTRL_PRIVDEFENA: u32 = 1 << 2
+
+// How many regions the unit has.
+private regions() -> u32 = (mpu().kind >> 8) & 0xff
+
+// The regions an unprivileged task's map may take: all the unit has, up to the kernel's `MAX_MAP`.
+private map_regions() -> u32 = if regions() < u32(MAX_MAP) then regions() else u32(MAX_MAP)
+
+// The core's MPU as the kernel's isolation.
+struct Isolator
+end Isolator
+
+impl Isolation for Isolator
+    capacity(*self) -> usize = usize(map_regions())
+
+    encode(*self, r: Region) -> Result[Slot, RegionError] = pmsa.encode_v8(r)
+
+    load(*self, map: []const Slot)
+        val m = mpu()
+        for k in 0u32..<map_regions()
+            m.rnr = k
+            if usize(k) < map.len
+                m.rbar = map[usize(k)].first
+                m.rlar = map[usize(k)].second
+            else
+                m.rlar = 0
+        barrier()
+
+// Turn the MPU on with no region, for the privileged tasks, and the memory kinds the regions name. Call
+// before `kernel.run`, with `kernel.isolate(&isolator)`.
+enable_isolation()
+    val m = mpu()
+    if regions() < u32(MAX_MAP) then panic("skiff: this core's MPU has too few regions for a task's map")
+    m.ctrl = 0
+    val mair: *Word = ptr_cast(MAIR0)
+    mair.v = pmsa.V8_MAIR0
+    for k in 0u32..<regions()
+        m.rnr = k
+        m.rlar = 0
+    m.ctrl = CTRL_PRIVDEFENA | CTRL_ENABLE
+    barrier()
+
+// Make the MPU's new regions hold for the next instruction.
+private barrier()
+    asm
+        [thumb]
+            "dsb"
+            "isb"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv8m is for Armv8-M cores"
