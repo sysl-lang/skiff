@@ -295,3 +295,44 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
 - **Status:** open, reported for the release after alpha.13.
 - **What skiff does:** nothing in place of it. The AN521 board keeps building its link at start-up, as
   before finding 6 was fixed.
+
+## 8. A function's address is not constant data
+
+- **What was being written:** software timers, FreeRTOS-style. A timer is a struct in the program's
+  storage, written as a constructor over constants like `Queue` and `Semaphore`, and it names the
+  function to call when it expires: `Timer("blink", 10, true, &blink, …)`. On a bare-metal image that
+  storage must be laid in as data, so the callback's address has to be.
+- **Shortest input**, built with `sysl build-c . --target thumbv7em-freestanding` (alpha.13):
+
+  ```sysl
+  private fired(n: u32) -> u32 = n + 1
+
+  private var callback: *extern(u32) -> u32 = &fired
+
+  @export("main")
+  probe() -> i32 = i32(callback(1))
+  ```
+
+  ```
+  error: 'probe' is exported and reaches 'callback', which is module storage an initializer fills
+  before the program's own statements run. This artifact has no entry point to fill it in, and
+  'thumbv7em-freestanding' is freestanding — there is no loader to run a constructor either, so the
+  function would read whatever the image left. Build for a hosted target, where the storage is filled
+  before any export can run, or make the initializer constant data, which is laid straight into the
+  object file
+  ```
+
+  The same happens with `fired` marked `@export("fired")`, and with the address as a field of a struct
+  (`Timer(5, &fired, None)`). A hosted `build-c` of the same program succeeds. Unlike finding 7, the
+  diagnostic names no reason the initializer cannot be computed.
+- **What the reference says:** ffi.md § "What constant data is" lists the address of module storage
+  (a `var`, a `val` or an `extern` variable) and a trait object over one as constant data, and says
+  nothing of a function's address either way. A function's address is a relocation exactly as a
+  variable's is: C's `int (*callback)(int) = fired;` is laid into `.data` with an `R_ARM_ABS32` and runs
+  nothing, on a bare machine as anywhere. A gap, then, rather than a bug against the page.
+- **The workarounds, neither taken:** set each timer's callback at start-up (storage the program fills
+  before the service runs, as the AN521 board does for finding 7); or make the callback a trait object
+  (`*Expiry` over the address of a zero-sized struct per callback, which folds since finding 6), so that
+  every callback needs a struct and an `impl` where C needs a function.
+- **Status:** open, reported for the release after alpha.13.
+- **What skiff does:** software timers wait on this finding.
