@@ -116,8 +116,6 @@ impl Port for Cortex
         loop
             ()
 
-    // The operands name their registers because `reg` lets the compiler give `old` the register it
-    // loaded `level` into, and `mrs` would then overwrite `level` before `msr` reads it (FINDINGS 4).
     mask(*self) -> u32
         var old: u32 = 0
         val level = MASK_PRIORITY
@@ -126,8 +124,8 @@ impl Port for Cortex
                 "mrs {old}, basepri"
                 "msr basepri, {level}"
                 "isb"
-                out old : "r0"
-                in level : "r1"
+                out old : reg
+                in level : reg
             [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
         old
 

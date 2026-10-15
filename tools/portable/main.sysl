@@ -47,7 +47,11 @@ impl Doorbell for NoBell
 private var ring_out: Ring[u32, 4] = Ring(Atomic(0), Atomic(0), [0; 4])
 private var ring_in: Ring[u32, 4] = Ring(Atomic(0), Atomic(0), [0; 4])
 private var bell: NoBell = NoBell()
-private var link: Link[u32, 4]
+// Laid into the image as data, `*Doorbell` and all: an archive for a freestanding target has nothing to
+// run an initializer, so this build refuses the link unless it folds.
+private var link: Link[u32, 4] = Link(&ring_out, &ring_in, &bell, Flags(0))
+// So does a `Some` of an address.
+private var first_ring: Option[*Ring[u32, 4]] = Some(&ring_out)
 
 private var pool: Pool[Block, 2] = Pool([Block(0); 2], [false; 2], 2)
 private var heap: Heap = Heap(0, 0)
@@ -98,7 +102,9 @@ probe() -> i32
     heap.init(arena)
     ring_out.reset()
     ring_in.reset()
-    link = Link(&ring_out, &ring_in, &bell, Flags(0))
+    first_ring match
+        Some(r) -> r.reset()
+        None -> ()
     kernel.spawn(&p, stack, &task, 1, "task")
     kernel.protect(&g)
     kernel.run(&p, idle)

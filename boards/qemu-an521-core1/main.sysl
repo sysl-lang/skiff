@@ -1,10 +1,6 @@
 // skiff on QEMU's MPS2 AN521, core 1: the same kernel as core 0's, started by core 0 once the links are
 // empty. It boots and runs its half of the link test (skiff.board.pair) on its own console, UART1.
 
-// Arm GNU's libgcc supplies the 64-bit divide the standard library's number formatting calls, until the
-// library supplies it itself (FINDINGS 2).
-@link("gcc")
-
 import skiff.arch.armv7m
 import skiff.chip.an521
 import skiff.kernel

@@ -19,7 +19,12 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
   hard-float calling convention is the same, but every `f64` operation becomes a call to a
   compiler-rt routine (`__aeabi_dmul` and the rest). Nothing in a freestanding link defines those, so
   an `f64` program does not link at all (finding 2).
-- **Status:** accepted by `sysl` for the release after alpha.12, as `thumbv7em-freestanding-dp`.
+- **Status:** Fixed in 0.1.0-alpha.13. `thumbv7em-freestanding-dp` emits `vmul.f64 d0, d0, d1` for an
+  `f64` multiply (`Tag_FP_arch: FPv5/FP-D16`). The boot test builds the MPS2 program for it and boots
+  it on QEMU's AN500 (Cortex-M7, whose model has the double-precision FPU), and builds it for
+  `thumbv7em-freestanding` for the AN386 (M4). The board's `doubles` check
+  (`(1 + 2^-40)^2 - 1 == 2^-39`) runs on both, in the FPU on the M7 and in the library's soft-float
+  routines on the M4.
 - **Proposed fix:** a `thumbv7em-freestanding-dp` row in `target.sysl`:
   - triple `thumbv7em-none-eabihf`, `-mfpu=fpv5-d16`;
   - checked against clang like every other row;
@@ -54,8 +59,10 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
   `__umoddi3`, `__moddi3`. The same treatment applies to the soft-double routines, so an `f64` program
   links on a Cortex-M.
 - **What skiff would otherwise do:** link Arm GNU's `libgcc.a`, or write the helpers itself.
-- **Status:** accepted by `sysl` for the release after alpha.12. Until it ships, the qemu-mps2 board
-  links Arm GNU's `libgcc.a` (`@link("gcc")`, with `-L` from `scripts/boot-test.sh`).
+- **Status:** Fixed in 0.1.0-alpha.13. The standard library supplies `__aeabi_uldivmod` (weak) and
+  `__aeabi_mem*` on every Thumb target. The three boards no longer have `@link("gcc")`, and
+  `scripts/boot-test.sh` no longer passes libgcc's directory through `SYSL_EXTRA_CFLAGS`;
+  `arm-none-eabi-nm -u` finds nothing undefined in any of the four images.
 
 ## 3. A bare-metal program's file can hold no module storage
 
@@ -100,11 +107,11 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
   `main`, or the file runs no statement, the file is not a body: `var` is the module's and `static` is
   refused, as the `static` diagnostic already says. The first error's anchor is also wrong: it names
   `bump` but points at the `var`, which in the board was 12 lines away.
-- **Status:** accepted by `sysl` as a bug for the release after alpha.12. Both checks will follow one
-  ruling, and the reference will be reconciled.
+- **Status:** Fixed in 0.1.0-alpha.13. The MPS2 board's root file now holds the `Board` the kernel and
+  the fault reports share (`private var machine`), where it used to build one in each export.
 - **What skiff did:** the board's code that needs storage moved into its own module directory
-  (`boards/qemu-mps2/board/`), where `var` is plainly the module's. That layout stands on its own, so
-  nothing changes when this is fixed.
+  (`boards/qemu-mps2/board/`), where `var` is plainly the module's. That layout stands on its own and
+  stays.
 
 ## 4. An `asm` output may be given the register an input is in
 
@@ -151,11 +158,9 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
 - **Proposed fix:** emit every output as early-clobber (`=&r`). It is the conservative direction the
   page already takes for memory and the flags, and it costs at most a register per output. A test
   pins `seven_plus(1) == 8`.
-- **Status:** accepted by `sysl` as a bug for the release after alpha.12. Every output will be emitted
-  early-clobber, an `inout` will keep its tied operand, and tests will pin `seven_plus(1) == 8` and the
-  BASEPRI disassembly on thumb.
-- **What skiff does until then:** `mask` names its registers (`out old : "r0"`, `in level : "r1"`), with
-  a comment pointing here. Remove that once the fix ships.
+- **Status:** Fixed in 0.1.0-alpha.13. `mask` is back to `out old : reg` and `in level : reg`, and
+  compiles to `movs r1, #128; mrs r0, BASEPRI; msr BASEPRI, r1` (r0 out, r1 in, at the default
+  optimisation and at -O0). The control that caught it (SVC leaves BASEPRI raised) still fails.
 
 ## 5. Naming a constant `val` keeps an initializer from being laid in as data
 
@@ -194,10 +199,9 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
 - **Proposed fix:** when the folder meets a module `val` whose own initializer folds, it substitutes
   that value, just as it already does for a `const`. A test: the probe above builds for
   `thumbv7em-freestanding`, and the image holds the table in `.data`/`.bss` with no initializer call.
-- **Status:** accepted by `sysl` as a bug for the release after alpha.12. The folder will substitute a
-  module `val` whose own initializer folds, with a check against a `val` that names itself.
-- **What skiff does until then:** the kernel's `scheduler` writes the empty row out in full instead of
-  naming `NO_TASK`, with a comment pointing here. Remove that once the fix ships.
+- **Status:** Fixed in 0.1.0-alpha.13 for a `val` over a constructor. The kernel's `scheduler` is
+  `Scheduler([NO_TASK; MAX_TASKS], 0, 0)` again and lies in `.data`, with no initializer run. A `val`
+  over `ptr_cast` of a constant is still not substituted (finding 7).
 
 ## 6. A trait object made from module storage's address, and `Some` of an address, are not constant data
 
@@ -242,10 +246,52 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
 - **Proposed fix:** extend constant data to a `*Trait` coerced from a constant address (the address plus
   the impl's vtable symbol), and to a variant whose payload is constant data. Tests: the probe above
   builds for `thumbv7em-freestanding`, and both variables sit in `.data` with relocations.
-- **Status:** accepted by `sysl` as a bug for the release after alpha.12. Each part already folds (an
-  address of module storage, a variant with a payload since alpha.12), so the whole must too. It goes
-  in the same fix as finding 5, and ffi.md's "What constant data is" will name both forms.
-- **What skiff does:** nothing in place of it is a contortion. The link's rings differ by core, so the
-  board builds the whole `Link` at start-up anyway, into storage declared with no initializer (which
-  starts at its type's zero, modules.md). The finding stands for the next program whose wiring is known
-  at build time.
+- **Status:** Fixed in 0.1.0-alpha.13. The probe above builds. `tools/portable` declares its `Link`
+  with an initializer (`Link(&ring_out, &ring_in, &bell, Flags(0))`) and a `Some(&ring_out)`, where it
+  used to build the link in `main`. `build-c` for a freestanding target refuses storage an initializer
+  would fill, so the gate's four builds prove both fold.
+- **What skiff does:** the AN521 board still builds its `Link` at start-up. Declaring both cores' ends
+  as data needs the rings' address, `&RINGS.to_core1` with `val RINGS: *Shared = ptr_cast(SHARED)`,
+  and that does not fold (finding 7).
+
+## 7. A `val` over `ptr_cast` of a constant is not substituted into an initializer
+
+- **What was being written:** the AN521 board's two link ends as constant data, once finding 6 was
+  fixed. The rings sit at a fixed address, so the board names them with a `val`.
+- **Shortest input**, built with `sysl build-c . --target thumbv7em-freestanding` from a program whose
+  export calls `fold.read()`:
+
+  ```sysl
+  module lib.fold
+
+  struct Pair
+      a: u32
+      b: u32
+
+  private const AT: usize = 0x3000_0000
+  private val PAIR: *Pair = ptr_cast(AT)
+
+  private var whole: *Pair = ptr_cast(AT)   // folds
+  private var named: *Pair = PAIR           // does not
+
+  read() -> u32 = whole.a + named.a
+  ```
+
+  ```
+  error: 'probe' is exported and reaches 'lib.fold.named', which is module storage an initializer fills
+  before the program's own statements run. This artifact has no entry point to fill it in, and
+  'thumbv7em-freestanding' is freestanding — there is no loader to run a constructor either, so the
+  function would read whatever the image left. Build for a hosted target, where the storage is filled
+  before any export can run, or make the initializer constant data, which is laid straight into the
+  object file. 'named' cannot be computed while compiling: 'lib.fold.PAIR' is filled when the program
+  runs (fold.sysl:10:28)
+  ```
+
+  `private var fixed_field: *u32 = &PAIR.b` is refused the same way.
+- **What the reference says:** ffi.md § "What constant data is": "A pointer written as `ptr_cast` of
+  such an integer is one too", and the alpha.13 fix for finding 5 substitutes a module `val` whose own
+  initializer folds. `whole` shows that `PAIR`'s initializer folds, so `named` should too, and so should
+  the address of a field through it (the address of a field "at an index the compiler can fold").
+- **Status:** open, reported for the release after alpha.13.
+- **What skiff does:** nothing in place of it. The AN521 board keeps building its link at start-up, as
+  before finding 6 was fixed.

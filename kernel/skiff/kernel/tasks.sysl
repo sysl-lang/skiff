@@ -198,11 +198,9 @@ struct Scheduler
 // An empty table.
 empty_scheduler() -> Scheduler = Scheduler([NO_TASK; MAX_TASKS], 0, 0)
 
-// Written as a constructor over literals, not through `empty_scheduler`, so that it is laid into the
-// image as data: a bare-metal image never runs initializers. The row is spelled out rather than named
-// as `NO_TASK`, because naming a `val` keeps the initializer from being laid in as data (FINDINGS 5).
-private[kernel] var scheduler: Scheduler =
-    Scheduler([Task("", 0, 0, 0, 0, 0, TaskState.Ready, 0, false, 0, false, 0, 0, false, 0); MAX_TASKS], 0, 0)
+// Written as a constructor over constant data, not through `empty_scheduler`, so that it is laid into
+// the image as data: a bare-metal image never runs initializers.
+private[kernel] var scheduler: Scheduler = Scheduler([NO_TASK; MAX_TASKS], 0, 0)
 
 // The port, once `run` has started the tasks; until then a tick switches nothing and nothing blocks.
 private var port: Option[*Port] = None

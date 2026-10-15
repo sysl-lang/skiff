@@ -4,26 +4,24 @@
 // then runs tasks (board/tasks.sysl). The last of them provokes a bus fault, which must be reported and
 // stop the machine with `armv7m.FAULT_STATUS`. So a passing run ends in that status, not 0.
 
-// Arm GNU's libgcc supplies the 64-bit divide the standard library's number formatting calls
-// (`__aeabi_uldivmod`), until the library supplies it itself (FINDINGS 2). The boot test passes the
-// toolchain's directory for this core and float ABI to the link.
-@link("gcc")
-
 import skiff.arch.armv7m
 import skiff.chip.mps2
 import skiff.kernel
 import board
 import board.Board
 
+// The machine as the kernel and the fault reports see it.
+private var machine: Board = Board()
+
 // Called by the arch package's reset handler once there is a stack and `.bss` is zero.
 @export("skiff_main")
 skiff_main() -> never
     armv7m.init()
     mps2.console_init()
-    var b = Board()
-    val status = kernel.boot(&b)
+    val status = kernel.boot(&machine)
     if status != 0 then armv7m.halt(status)
-    board.timer_interrupt(&b)
+    board.timer_interrupt(&machine)
+    board.doubles(&machine)
     board.run_tasks()
 
 // The standard library's `print` writes through C's `putchar`, and a freestanding image has no C library
@@ -41,13 +39,10 @@ board_exit(code: int) -> never
 
 // A task the MPU stopped: report it on the console. The kernel runs the other tasks on.
 @export("skiff_task_fault")
-task_fault(f: *armv7m.Fault, task: *kernel.TaskInfo)
-    var b = Board()
-    armv7m.report_task_fault(f, task, &b)
+task_fault(f: *armv7m.Fault, task: *kernel.TaskInfo) = armv7m.report_task_fault(f, task, &machine)
 
 // The arch package's fault handler hands the fault here: report it on the console and stop.
 @export("skiff_fault")
 fault(f: *armv7m.Fault) -> never
-    var b = Board()
-    armv7m.report(f, &b)
+    armv7m.report(f, &machine)
     armv7m.halt(armv7m.FAULT_STATUS)

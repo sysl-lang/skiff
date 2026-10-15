@@ -29,6 +29,21 @@ timer_interrupt(board: *Board)
     mps2.timer0_stop()
     board.write("skiff: interrupt from timer 0\n".bytes)
 
+// Double precision: the M7's image does it in its FPU (fpv5-d16), the M4's through the standard library's
+// soft-float routines. The operand is read through a volatile field, so the work happens at run time.
+// (1 + 2^-40)^2 - 1 is 2^-39 in f64; in f32 it would be 0.
+private struct Wide
+    v: volatile f64
+
+private var wide: Wide = Wide(1.0 + 1.0 / 1099511627776.0)
+
+doubles(board: *Board)
+    val x = wide.v
+    if (x * x - 1.0) * 549755813888.0 != 1.0
+        board.write("skiff: f64 arithmetic lost precision\n".bytes)
+        armv7m.halt(1)
+    board.write("skiff: f64 arithmetic kept 2^-39\n".bytes)
+
 // A load from an address nothing answers: a precise BusFault, whose report names the address.
 private struct Reg
     v: volatile u32

@@ -10,8 +10,10 @@ MEMORY {
 }
 
 SECTIONS {
-  /* The architecture's sixteen words, then the chip's interrupts, in that order. */
-  .vectors : { KEEP(*(.vectors)) KEEP(*(.vectors.irq)) } > CODE
+  /* The architecture's sixteen words, then the chip's interrupts, in that order. The MPU's null guard
+   * takes the first 256 bytes from every access but the core's vector reads, so nothing else may sit
+   * there: code placed in it faults the first time it runs with the MPU on. */
+  .vectors : { KEEP(*(.vectors)) KEEP(*(.vectors.irq)) . = MAX(., 0x100); } > CODE
   .text    : { *(.text*) *(.rodata*) } > CODE
   .data    : { *(.data*) } > CODE
 

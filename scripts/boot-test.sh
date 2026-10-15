@@ -24,6 +24,7 @@ skiff: tick 1
 skiff: tick 2
 skiff: tick 3
 skiff: interrupt from timer 0
+skiff: f64 arithmetic kept 2^-39
 skiff: task A 1
 skiff: task B 1
 skiff: task A 2
@@ -112,35 +113,34 @@ verdict() {
     fi
 }
 
-# build <target> <board> <image>, with Arm GNU's libgcc for that target's core and float ABI on the
-# link path: the boards link it until the standard library supplies the 64-bit divide (FINDINGS 2).
+# build <target> <board> <image>. The standard library supplies the runtime helpers a freestanding link
+# needs (the 64-bit divide, `__aeabi_mem*`, soft floating point), so nothing else is linked.
 build() {
-    libgcc=$(arm-none-eabi-gcc $4 -mthumb -mfloat-abi=hard -print-libgcc-file-name)
-    if [ ! -f "$libgcc" ]; then
-        echo "FAIL: no Arm GNU libgcc (arm-none-eabi-gcc) for $1"
-        exit 1
-    fi
-    if ! env SYSL_EXTRA_CFLAGS="-L$(dirname "$libgcc")" "$compiler" build $opt --target "$1" -o "$3" "$root/boards/$2"; then
+    if ! "$compiler" build $opt --target "$1" -o "$3" "$root/boards/$2"; then
         echo "FAIL: $2 did not build"
         exit 1
     fi
 }
 
-# The MPS2: one image, on the M7 and on the M4. It ends in the bus fault, status 99.
-image="$scratch/qemu-mps2.elf"
-build thumbv7em-freestanding qemu-mps2 "$image" "-mcpu=cortex-m4 -mfpu=fpv4-sp-d16"
-for machine in mps2-an500 mps2-an386; do
-    run "$scratch/$machine.log" -M "$machine" -kernel "$image"
-    check "$machine" "$scratch/$machine.log" "$mps2_expected"
-    verdict "$machine" 99
-done
+# The MPS2: the same program built for each core's FPU, the M7's double-precision fpv5-d16 on the AN500
+# and the M4's single-precision fpv4-sp-d16 on the AN386. Each ends in the bus fault, status 99.
+m7_image="$scratch/qemu-mps2-m7.elf"
+m4_image="$scratch/qemu-mps2-m4.elf"
+build thumbv7em-freestanding-dp qemu-mps2 "$m7_image"
+build thumbv7em-freestanding qemu-mps2 "$m4_image"
+run "$scratch/mps2-an500.log" -M mps2-an500 -kernel "$m7_image"
+check mps2-an500 "$scratch/mps2-an500.log" "$mps2_expected"
+verdict mps2-an500 99
+run "$scratch/mps2-an386.log" -M mps2-an386 -kernel "$m4_image"
+check mps2-an386 "$scratch/mps2-an386.log" "$mps2_expected"
+verdict mps2-an386 99
 
 # The AN521: an image per core, under multi-threaded TCG so that the cores really run at once. Core 1's
 # image is loaded beside core 0's, and its console, UART1, goes to a file of its own.
 core0="$scratch/an521-core0.elf"
 core1="$scratch/an521-core1.elf"
-build thumb-freestanding qemu-an521-core0 "$core0" "-mcpu=cortex-m33 -mfpu=fpv5-sp-d16"
-build thumb-freestanding qemu-an521-core1 "$core1" "-mcpu=cortex-m33 -mfpu=fpv5-sp-d16"
+build thumb-freestanding qemu-an521-core0 "$core0"
+build thumb-freestanding qemu-an521-core1 "$core1"
 rm -f "$scratch/an521-core1.log"
 run "$scratch/an521-core0.log" -M mps2-an521 -accel tcg,thread=multi -kernel "$core0" \
     -device loader,file="$core1" -serial mon:stdio -serial file:"$scratch/an521-core1.log"
