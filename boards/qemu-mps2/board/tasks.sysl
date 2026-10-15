@@ -9,8 +9,8 @@ import skiff.board.unprivileged
 
 // The tasks the boot test runs, and what each shows. Each scenario starts at its own tick, counted from
 // when the tasks start, so that one has finished before the next begins. The synchronisation scenarios,
-// from tick 45 on, are in waits.sysl; the unprivileged tasks, from tick 250, are the
-// skiff.board.unprivileged package's, which every board runs; the memory ones, from tick 270, are in
+// from tick 45 on, are in waits.sysl; the unprivileged tasks, from tick 280, are the
+// skiff.board.unprivileged package's, which every board runs; the memory ones, from tick 300, are in
 // memory.sysl.
 //   - A and B share priority 1 and never yield: each prints a line and then waits for the next tick.
 //     They alternate only because the tick takes turns between them. After three lines each, A

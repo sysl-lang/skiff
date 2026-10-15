@@ -22,10 +22,10 @@ import skiff.kernel.{Access, Region, RegionError, Slot}
 // The span of a region in 64 bits, so that one ending at the top of the 32-bit address space does
 // not wrap: its start and end, or why it has none.
 private span(r: Region) -> Result[(u64, u64), RegionError]
-    if r.bytes == 0 then return Err(RegionError.Empty)
+    if r.bytes == 0 then return Err(Empty)
     val start = u64(r.base)
     val end = start + u64(r.bytes)
-    if end > 0x1_0000_0000 then return Err(RegionError.Wraps)
+    if end > 0x1_0000_0000 then return Err(Wraps)
     Ok((start, end))
 
 // PMSAv7 (Armv7-M Architecture Reference Manual B3.5): RBAR and RASR.
@@ -64,9 +64,9 @@ encode_v7(r: Region) -> Result[Slot, RegionError]
     val block = start & ~(size - 1)
     var srd: u32 = 0
     if start != block || end != block + size
-        if log < V7_SUBREGION_LOG then return Err(RegionError.NotPowerOfTwo)
+        if log < V7_SUBREGION_LOG then return Err(NotPowerOfTwo)
         val eighth = size >> 3
-        if (start - block) % eighth != 0 || (end - block) % eighth != 0 then return Err(RegionError.NotPowerOfTwo)
+        if (start - block) % eighth != 0 || (end - block) % eighth != 0 then return Err(NotPowerOfTwo)
         val first = u32((start - block) / eighth)
         val last = u32((end - block) / eighth)
         for k in 0u32..<8
@@ -100,7 +100,7 @@ const V8_MAIR0: u32 = 0xff | (0x04 << 8)     // normal: write-back, read and wri
 // unless both its base and its size are multiples of 32 bytes.
 encode_v8(r: Region) -> Result[Slot, RegionError]
     val (start, end) = span(r)?
-    if start % V8_GRANULE != 0 || end % V8_GRANULE != 0 then return Err(RegionError.Unaligned)
+    if start % V8_GRANULE != 0 || end % V8_GRANULE != 0 then return Err(Unaligned)
     val (ap, attr, xn) = r.access match
         Read -> (V8_AP_RO, V8_ATTR_NORMAL, V8_RBAR_XN)
         ReadWrite -> (V8_AP_RW, V8_ATTR_NORMAL, V8_RBAR_XN)

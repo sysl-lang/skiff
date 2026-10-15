@@ -5,7 +5,8 @@ import skiff.arch.armv7m
 import skiff.arch.armv8m
 import skiff.chip.an521
 import skiff.kernel
-import skiff.kernel.{FOREVER, Flags, Link, Machine, Ring, Semaphore}
+import skiff.kernel.{Access, FOREVER, Flags, Link, Machine, Region, Ring, Semaphore}
+import skiff.board.unprivileged
 
 // Two cores, each running its own copy of the kernel, linked through memory both reach.
 //
@@ -18,8 +19,10 @@ import skiff.kernel.{FOREVER, Flags, Link, Machine, Ring, Semaphore}
 //
 // **The boot test.** On each core a sender task sends 1 to `COUNT` to the other core as fast as the
 // ring allows, while a receiver task takes the other core's messages and checks every one arrives once
-// and in order. Each receiver reports on its own console. Core 1's sender then sends `DONE`, and core 0,
-// once its own receiver has finished too, stops the machine.
+// and in order. Beside them run the unprivileged tasks' scenarios every board runs
+// (skiff.board.unprivileged). Each receiver reports on its own console once its core's scenarios have
+// been judged too. Core 1's sender then sends `DONE`, and core 0, once its own receiver has finished
+// too, stops the machine.
 
 // The machine as each core's kernel sees it: its own UART, SysTick on the shared clock.
 struct Board
@@ -39,7 +42,7 @@ struct Shared
     to_core0: Ring[u32, 64]
 
 private const SHARED: usize = 0x3000_0000
-private shared() -> *Shared = ptr_cast(SHARED)
+private val RINGS: *Shared = ptr_cast(SHARED)
 
 // How many messages each core sends the other, and the message that follows them from core 1.
 const COUNT: u32 = 10000
@@ -47,41 +50,74 @@ const DONE: u32 = 0
 
 // Empty both rings: core 0, before it releases core 1.
 reset_links()
-    shared().to_core1.reset()
-    shared().to_core0.reset()
+    RINGS.to_core1.reset()
+    RINGS.to_core0.reset()
 
-private var bell: an521.Bell = an521.Bell(0)
-// This core's end of the link. Which ring is which depends on the core, so `open_link` builds it.
-private var link: Link[u32, 64]
+// Both ends of the link, laid in as data in each core's image: core 0 sends on `to_core1` and rings
+// core 1, and core 1 the other way round. Each core uses its own end, `link()`.
+private var bell0: an521.Bell = an521.Bell(1)
+private var bell1: an521.Bell = an521.Bell(0)
+private var link0: Link[u32, 64] = Link(&RINGS.to_core1, &RINGS.to_core0, &bell0, Flags(0))
+private var link1: Link[u32, 64] = Link(&RINGS.to_core0, &RINGS.to_core1, &bell1, Flags(0))
 
-// Build this core's end of the link the right way round, and let the doorbell interrupt in.
+// This core's end of the link.
+private link() -> *Link[u32, 64] = if an521.core_id() == 0 then &link0 else &link1
+
+// Let the doorbell interrupt in.
 open_link()
-    val me = an521.core_id()
-    bell.to = 1 - me
-    val s = shared()
-    link = if me == 0 then Link(&s.to_core1, &s.to_core0, &bell, Flags(0)) else Link(&s.to_core0, &s.to_core1, &bell, Flags(0))
     armv7m.set_irq_priority(an521.MHU0_IRQ, 0xc0)
     armv7m.enable_irq(an521.MHU0_IRQ)
 
 @export("skiff_an521_doorbell")
-doorbell() = link.rung()
+doorbell() = link().rung()
 
 private var cortex: armv7m.Cortex = armv7m.Cortex()
 private var limit: armv8m.StackLimit = armv8m.StackLimit()
+private var isolator: armv8m.Isolator = armv8m.Isolator()
+private var console: Board = Board()
 private var stack_sender: [512]u32 = [0; 512]
 private var stack_receiver: [512]u32 = [0; 512]
 private var stack_deep: [128]u32 = [0; 128]
 private var stack_idle: [128]u32 = [0; 128]
 private var received: Semaphore = Semaphore(0, 1)
 
-// Run this core's sender and receiver, with every stack held to its limit, and a task that overflows
-// its stack at once: the limit stops it, and the link test must still finish.
+// The code and its constants, from the start of the image to `__code_end` (link.ld), which every
+// unprivileged task may run and read.
+extern "__code_start" code_start: u8
+extern "__code_end" code_end: u8
+
+// When the unprivileged tasks' scenarios start, in ticks after the tasks do.
+private const UNPRIVILEGED_AFTER: u32 = 10
+
+// Run this core's sender and receiver, with every stack held to its limit, a task that overflows its
+// stack at once, and the unprivileged tasks' scenarios (skiff.board.unprivileged): the limit stops the
+// overflowing task, and the link test must still finish.
 run_link_test() -> never
     kernel.spawn(&cortex, stack_sender, &sender, 1, "sender")
     kernel.spawn(&cortex, stack_receiver, &receiver, 1, "receiver")
     kernel.spawn(&cortex, stack_deep, &deep, 2, "deep")
+    kernel.isolate(&isolator)
+    val code = Region(usize(&code_start), usize(&code_end) - usize(&code_start), Access.Execute)
+    val uart = Region(an521.uart_base(an521.core_id()), an521.UART_STRIDE, Access.Device)
+    unprivileged.spawn_all(&cortex, &console, code, uart, kernel.ticks() + UNPRIVILEGED_AFTER)
+    armv8m.enable_isolation()
     kernel.protect(&limit)
     kernel.run(&cortex, stack_idle)
+
+// A structure copy or clear too big to inline becomes a call to C's `memcpy` or `memset` (through the
+// Arm run-time ABI's `__aeabi_memcpy` and `__aeabi_memclr`, which the standard library supplies), and a
+// freestanding image has no C library, so the board supplies them.
+@export("memcpy")
+board_memcpy(dst: *u8, src: *u8, n: usize) -> *u8
+    for i in 0..<n
+        dst[i] = src[i]
+    dst
+
+@export("memset")
+board_memset(dst: *u8, byte: int, n: usize) -> *u8
+    for i in 0..<n
+        dst[i] = u8(byte & 0xff)
+    dst
 
 // Push r0-r7 again and again, until the stack crosses its limit.
 extern "skiff_overflow" overflow() -> never
@@ -100,30 +136,35 @@ asm
     [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the probe is Armv7-M assembly"
 
 private sender() -> never
+    val l = link()
     for n in 1u32..COUNT
-        val _ = link.send(n, FOREVER)
+        val _ = l.send(n, FOREVER)
     if an521.core_id() == 1
         val _ = received.take(FOREVER)
-        val _ = link.send(DONE, FOREVER)
+        val _ = l.send(DONE, FOREVER)
     kernel.sleep_forever()
 
 // The next message, asking again until there is one without ever waiting.
-private poll() -> Option[u32]
+private poll(l: *Link[u32, 64]) -> Option[u32]
     loop
-        val got = link.receive(0)
+        val got = l.receive(0)
         if got.is_some() then return got
 
 private receiver() -> never
     var board = Board()
     val me = an521.core_id()
+    val l = link()
     var in_order: u32 = 0
     for want in 1u32..COUNT
         // The first half polls, so that the receiver sits right behind the sender and reads each slot
         // as soon as `tail` says it is there; the second half waits on the doorbell.
-        val got = if want <= COUNT / 2 then poll() else link.receive(FOREVER)
+        val got = if want <= COUNT / 2 then poll(l) else l.receive(FOREVER)
         got match
             Some(n) -> if n == want then in_order += 1
             None -> ()
+    // Report only once this core's unprivileged scenarios have been judged, so that core 1's `DONE`,
+    // which follows its report, comes after its scenarios too.
+    unprivileged.wait_done()
     board.write("skiff: core ".bytes)
     kernel.write_dec(&board, me)
     board.write(" received ".bytes)
@@ -133,7 +174,7 @@ private receiver() -> never
     board.write(" messages in order\n".bytes)
     val _ = received.give()
     if me == 0
-        if link.receive(FOREVER) == Some(DONE)
+        if l.receive(FOREVER) == Some(DONE)
             board.write("skiff: core 1 finished\n".bytes)
             armv7m.halt(0)
         board.write("skiff: core 1 sent more than it should\n".bytes)

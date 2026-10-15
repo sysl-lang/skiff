@@ -12,7 +12,12 @@ SECTIONS {
   /* The architecture's sixteen words, then the chip's interrupts, in that order. */
   .vectors : { KEEP(*(.vectors)) KEEP(*(.vectors.irq)) } > CODE
   .text    : { *(.text*) *(.rodata*) } > CODE
-  .data    : { *(.data*) } > CODE
+
+  /* The code and its constants are an unprivileged task's code region: PMSAv8 bounds a region to 32
+   * bytes, so the data starts at the next 32-byte boundary. */
+  __code_start = ORIGIN(CODE);
+  __code_end = ALIGN(32);
+  .data __code_end : { *(.data*) } > CODE
 
   /* The reset handler zeroes everything between these two symbols. */
   .bss     : {

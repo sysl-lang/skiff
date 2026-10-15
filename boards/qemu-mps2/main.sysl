@@ -31,6 +31,21 @@ putchar(c: int) -> int
     mps2.put_byte(u8(c & 0xff))
     c
 
+// A structure copy or clear too big to inline becomes a call to C's `memcpy` or `memset` (through the
+// Arm run-time ABI's `__aeabi_memcpy` and `__aeabi_memclr`, which the standard library supplies), and a
+// freestanding image has no C library, so the board supplies them.
+@export("memcpy")
+board_memcpy(dst: *u8, src: *u8, n: usize) -> *u8
+    for i in 0..<n
+        dst[i] = src[i]
+    dst
+
+@export("memset")
+board_memset(dst: *u8, byte: int, n: usize) -> *u8
+    for i in 0..<n
+        dst[i] = u8(byte & 0xff)
+    dst
+
 // The standard library's `exit`, which `panic` ends in after printing its message: stop the machine
 // with that status.
 @export("exit")

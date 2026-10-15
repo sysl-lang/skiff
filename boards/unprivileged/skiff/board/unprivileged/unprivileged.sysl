@@ -59,19 +59,20 @@ private var to_echo: MessageBuffer[32] = MessageBuffer(StreamBuffer([0; 32], 0, 
 private var from_echo: MessageBuffer[32] = MessageBuffer(StreamBuffer([0; 32], 0, 0, 1))
 private var forge_box: MessageBuffer[32] = MessageBuffer(StreamBuffer([0; 32], 0, 0, 1))
 
-// An unprivileged task's stack must be one PMSAv7 region: 1 KiB, aligned to its size.
-@align(1024)
-private var stack_worker: [256]u32 = [0; 256]
-@align(1024)
-private var stack_snoop: [256]u32 = [0; 256]
-@align(1024)
-private var stack_forger: [256]u32 = [0; 256]
-@align(1024)
-private var stack_speaker: [256]u32 = [0; 256]
-@align(1024)
-private var stack_mute: [256]u32 = [0; 256]
-@align(1024)
-private var stack_masker: [256]u32 = [0; 256]
+// An unprivileged task's stack must be one PMSAv7 region: 2 KiB, aligned to its size. A kernel call runs
+// on the caller's stack, and at -O0 the deepest of them takes more than 1 KiB.
+@align(2048)
+private var stack_worker: [512]u32 = [0; 512]
+@align(2048)
+private var stack_snoop: [512]u32 = [0; 512]
+@align(2048)
+private var stack_forger: [512]u32 = [0; 512]
+@align(2048)
+private var stack_speaker: [512]u32 = [0; 512]
+@align(2048)
+private var stack_mute: [512]u32 = [0; 512]
+@align(2048)
+private var stack_masker: [512]u32 = [0; 512]
 private var stack_echo: [256]u32 = [0; 256]
 private var stack_reporter: [256]u32 = [0; 256]
 
@@ -93,22 +94,18 @@ spawn_all(port: *Port, out: *Machine, code: Region, uart: Region, start: u32)
     val shared = Region(usize(&exchange), EXCHANGE_BYTES, Access.ReadWrite)
     val readable = Region(usize(&notice[0]), 256, Access.Read)
     val odd = Region(usize(&exchange) + 4, 100, Access.ReadWrite)
-    val plain: [2]Region = [code, shared]
     kernel.spawn(port, stack_reporter, &task_reporter, 6, "reporter")
     exchange.reporter = u32(kernel.task_stats([]) - 1)     // the row just added: the table's last
     kernel.spawn(port, stack_echo, &task_echo, 3, "echo")
-    val refused: [2]Region = [code, odd]
-    kernel.spawn_unprivileged(port, stack_worker, &task_worker, 4, "odd", refused, []) match
+    kernel.spawn_unprivileged(port, stack_worker, &task_worker, 4, "odd", [code, odd], []) match
         Err(MapError.Bad(1, _)) -> say("skiff: a region the MPU cannot hold exactly was refused when its task was created\n")
         _ -> say("skiff: a region the MPU cannot hold exactly was accepted\n")
-    val _ = unprivileged(port, stack_worker, &task_worker, "worker", plain, [usize(exchange.to_echo), usize(exchange.from_echo)])
-    snoop_index = unprivileged(port, stack_snoop, &task_snoop, "snoop", plain, [])
-    val with_notice: [3]Region = [code, shared, readable]
-    val _ = unprivileged(port, stack_forger, &task_forger, "forger", with_notice, [usize(exchange.forge_box)])
-    val with_uart: [3]Region = [code, shared, uart]
-    val _ = unprivileged(port, stack_speaker, &task_speaker, "speaker", with_uart, [])
-    mute_index = unprivileged(port, stack_mute, &task_mute, "mute", plain, [])
-    val _ = unprivileged(port, stack_masker, &task_masker, "masker", plain, [])
+    val _ = unprivileged(port, stack_worker, &task_worker, "worker", [code, shared], [usize(exchange.to_echo), usize(exchange.from_echo)])
+    snoop_index = unprivileged(port, stack_snoop, &task_snoop, "snoop", [code, shared], [])
+    val _ = unprivileged(port, stack_forger, &task_forger, "forger", [code, shared, readable], [usize(exchange.forge_box)])
+    val _ = unprivileged(port, stack_speaker, &task_speaker, "speaker", [code, shared, uart], [])
+    mute_index = unprivileged(port, stack_mute, &task_mute, "mute", [code, shared], [])
+    val _ = unprivileged(port, stack_masker, &task_masker, "masker", [code, shared], [])
 
 // Wait until the reporter has judged every scenario: a board that stops the machine waits for this.
 wait_done()

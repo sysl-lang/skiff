@@ -12,4 +12,5 @@ dependencies {
   armv7m { workspace = true }
   armv8m { workspace = true }
   an521 { workspace = true }
+  unprivileged { workspace = true }
 }

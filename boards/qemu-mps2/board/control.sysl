@@ -21,7 +21,8 @@ import skiff.kernel.{FOREVER, Mutex, NO_OWNER, Semaphore}
 //     semaphore, which must go to the count, not to Stopped. Then it spawns Reborn on Stopped's stack,
 //     which must take the row of a stopped task, Ticker's or Stopped's, rather than a new one.
 
-private var stack_controller: [256]u32 = [0; 256]
+// 2 KiB: at -O0, spawning Reborn from here takes more than 1 KiB.
+private var stack_controller: [512]u32 = [0; 512]
 private var stack_ticker: [256]u32 = [0; 256]
 private var stack_resumed: [256]u32 = [0; 256]
 // 2 KiB, so that its working stack never shares a page with its guard (notes.sysl's spinner says why).

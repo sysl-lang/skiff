@@ -209,8 +209,7 @@ private[kernel] isolate_running()
         Some(iso) ->
             val i = scheduler.running
             if scheduler.tasks[i].user
-                val m = &maps[i]
-                iso.load(m.slots[0..<m.len])
+                iso.load(maps[i].slots[0..<maps[i].len])
                 mapped = true
             else if mapped
                 iso.load([])

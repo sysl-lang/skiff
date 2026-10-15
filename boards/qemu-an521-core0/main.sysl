@@ -17,6 +17,7 @@ skiff_main() -> never
     if status != 0 then armv7m.halt(status)
     pair.reset_links()
     pair.open_link()
+    an521.open_uarts_to_unprivileged()
     an521.release_core1(pair.CORE1_IMAGE)
     pair.run_link_test()
 

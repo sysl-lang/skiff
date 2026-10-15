@@ -25,6 +25,7 @@ skiff: tick 2
 skiff: tick 3
 skiff: interrupt from timer 0
 skiff: f64 arithmetic kept 2^-39
+skiff: a region the MPU cannot hold exactly was refused when its task was created
 skiff: task A 1
 skiff: task B 1
 skiff: task A 2
@@ -58,6 +59,14 @@ skiff: a reload timer fired every 3 ticks, and a late call did not move the tick
 skiff: a one-shot timer fired once, and a timer stopped before its expiry never fired
 skiff: a timer started from an interrupt was active at once and fired 2 ticks later
 skiff: every timer callback ran in the timer service
+skiff: an unprivileged task made 5 round trips through message buffers with a privileged task
+skiff: task snoop broke its memory protection
+skiff: kernel calls with buffers or handles outside the caller's grants were refused, and touched nothing
+skiff: an unprivileged task granted the UART wrote this line itself
+skiff: task mute broke its memory protection
+skiff: mmfar 0x40004004
+skiff: an unprivileged task's writes to BASEPRI and PRIMASK held off nothing
+skiff: the unprivileged tasks that broke their protection were stopped, and the rest ran on
 skiff: task deep overflowed its stack
 skiff: task null broke its memory protection
 skiff: mmfar 0x00000000
@@ -71,14 +80,25 @@ skiff: bfar 0xf0000000"
 
 # The AN521's two cores, each on its own console (boards/qemu-an521/skiff/board/pair/board.sysl). Core 0
 # stops the machine with status 0 once both have received everything.
+an521_unprivileged="skiff: an unprivileged task made 5 round trips through message buffers with a privileged task
+skiff: task snoop broke its memory protection
+skiff: kernel calls with buffers or handles outside the caller's grants were refused, and touched nothing
+skiff: an unprivileged task granted the UART wrote this line itself
+skiff: task mute broke its memory protection
+skiff: an unprivileged task's writes to BASEPRI and PRIMASK held off nothing
+skiff: the unprivileged tasks that broke their protection were stopped, and the rest ran on"
 an521_core0_expected="skiff: hello
 skiff: tick 3
+skiff: a region the MPU cannot hold exactly was refused when its task was created
 skiff: task deep overflowed its stack
+$an521_unprivileged
 skiff: core 0 received 10000 of 10000 messages in order
 skiff: core 1 finished"
 an521_core1_expected="skiff: hello
 skiff: tick 3
+skiff: a region the MPU cannot hold exactly was refused when its task was created
 skiff: task deep overflowed its stack
+$an521_unprivileged
 skiff: core 1 received 10000 of 10000 messages in order"
 
 failed=0
