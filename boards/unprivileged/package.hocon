@@ -1,0 +1,12 @@
+// The unprivileged-task scenarios every QEMU board runs (module skiff.board.unprivileged): the same
+// tasks on the MPS2's Armv7-M cores and the AN521's Armv8-M ones, each board handing them its port, its
+// console, its isolation and the memory they may be granted.
+
+package {
+  name    = "unprivileged"
+  version = "0.0.1"
+}
+
+dependencies {
+  kernel { workspace = true }
+}

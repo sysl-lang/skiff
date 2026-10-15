@@ -15,7 +15,13 @@ SECTIONS {
    * there: code placed in it faults the first time it runs with the MPU on. */
   .vectors : { KEEP(*(.vectors)) KEEP(*(.vectors.irq)) . = MAX(., 0x100); } > CODE
   .text    : { *(.text*) *(.rodata*) } > CODE
-  .data    : { *(.data*) } > CODE
+
+  /* The code and its constants end below 0x4_0000, and the data starts there: an unprivileged task's
+   * code region is then [0, __code_end), a power of two from zero, as one PMSAv7 region must be, and
+   * holds nothing a task may not read. */
+  __code_end = 0x40000;
+  ASSERT(. <= __code_end, "the code and constants no longer fit below 0x4_0000")
+  .data __code_end : { *(.data*) } > CODE
 
   /* The reset handler zeroes everything between these two symbols. */
   .bss     : {

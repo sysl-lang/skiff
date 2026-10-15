@@ -295,3 +295,139 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
 - **Status:** open, reported for the release after alpha.13.
 - **What skiff does:** nothing in place of it. The AN521 board keeps building its link at start-up, as
   before finding 6 was fixed.
+
+## 9. A slice of a field of indexed module storage, passed through a trait object, is refused as frame-owned
+
+- **What was being written:** the kernel loading an unprivileged task's MPU map on a switch
+  (kernel isolation.sysl, `isolate_running`). The maps are module storage, `maps: [MAX_TASKS]Map`, and
+  the unit is a `*Isolation` trait object: `iso.load(maps[i].slots[0..<maps[i].len])`.
+- **Shortest input** (`sysl run main.sysl`, host):
+
+  ```sysl
+  trait Sink
+      take(*self, words: []const u32)
+
+  struct Count
+      n: usize
+
+  impl Sink for Count
+      take(*self, words: []const u32) = self.n += words.len
+
+  struct Row
+      words: [4]u32
+      len: usize
+
+  var rows: [2]Row = [Row([0; 4], 0); 2]
+  var sink: Count = Count(0)
+
+  feed(s: *Sink, i: usize)
+      s.take(rows[i].words[0..<rows[i].len])
+
+  main()
+      rows[1].len = 3
+      feed(&sink, 1)
+      print(sink.n)
+  ```
+
+  ```
+  error: a slice of an array this frame owns is passed through a trait object, which may hold on to it,
+  so it would outlive the array, and the storage is not this body's to move — it is a field of a value,
+  an array a caller passed by value, or part of an array literal, which has no declaration to move.
+  Declare it as a '[]T', which makes a buffer of its own and owns it, or as a '&[N]T' where the length
+  is fixed
+    --> main.sysl:18:25
+  ```
+
+  The same slice passed to an ordinary function compiles, a slice of a plain module array (`flat[0..<2]`)
+  passed through the trait object compiles, and so does `val r = &rows[i]` then `s.take(r.words[0..<r.len])`.
+- **What the reference says:** memory.md § "What happens when a slice escapes" promotes "a slice of an
+  array **this frame owns**" and a temporary the frame computed. `rows[i].words` is neither: it is module
+  storage, which lasts the whole run, so nothing outlives it and nothing needs to move.
+- **Status:** open, reported for the release after alpha.13.
+- **What skiff does:** `isolate_running` takes the row's address first (`val m = &maps[i]`), the form the
+  kernel already uses for table rows (`val t = &scheduler.tasks[i]`).
+
+## 10. An enum's bare variant is not found through the expected type when the enum is another module's
+
+- **What was being written:** the PMSA region encoders (arch/pmsa), which answer
+  `Result[Slot, RegionError]` where `RegionError` is the kernel's: `return Err(Empty)`.
+- **Shortest input:** a library root `root/lib/m/m.sysl` and a program, `sysl run main.sysl --lib root`:
+
+  ```sysl
+  module lib.m
+
+  enum Why
+      Empty
+      Full
+  ```
+
+  ```sysl
+  import lib.m.Why
+
+  annotated() -> Why
+      val w: Why = Empty
+      w
+
+  returned() -> Why = Full
+
+  main()
+      print(annotated() == Why.Empty, returned() == Why.Full)
+  ```
+
+  ```
+  error: undefined name 'Empty'
+   --> main.sysl:4:18
+  error: undefined name 'Full'
+   --> main.sysl:7:21
+  ```
+
+  `return Err(Empty)` inside a function answering `Result[Slot, RegionError]` gives
+  `error: undefined name 'skiff.arch.pmsa.Empty'`. Within the enum's own module the bare names work.
+- **What the reference says:** types.md § "A variant belongs to its enum": "What a bare name means is
+  settled where it is used, by the type expected there — an argument, an annotated binding, a `return`
+  and a field all supply one", and "**The expected type reaches across modules too**".
+- **Status:** open, reported for the release after alpha.13.
+- **What skiff does:** arch/pmsa writes the qualified form, `Err(RegionError.Empty)`, which the
+  reference gives as always valid.
+
+## 11. An array literal passed where a slice is expected is heap-allocated even when the slice stays put
+
+- **What was being written:** the boards' unprivileged-task scenarios, which name each task's grants
+  and objects as literals: `kernel.spawn_unprivileged(port, stack, &entry, 4, "worker", regions,
+  [h1, h2])`. On a freestanding target the image no longer links:
+
+  ```
+  ld.lld: error: undefined symbol: memcpy
+  ld.lld: error: undefined symbol: memset
+  ld.lld: error: undefined symbol: free
+  ld.lld: error: undefined symbol: malloc
+  ```
+
+- **Shortest input**, `sysl build-c . --target thumbv7em-freestanding -o p.a`, then
+  `arm-none-eabi-objdump -dr p.a`:
+
+  ```sysl
+  var g: usize = 3
+
+  sum(xs: []const usize) -> usize
+      var s: usize = 0
+      for x in xs
+          s += x
+      s
+
+  @export("probe_literal")
+  probe_literal() -> usize = sum([g, g + 1])          // calls malloc
+
+  @export("probe_named")
+  probe_named() -> usize
+      val xs: [2]usize = [g, g + 1]
+      sum(xs)                                         // allocates nothing
+  ```
+
+  `probe_literal` calls `malloc`; `probe_named` does not. `sum` keeps nothing of `xs`.
+- **What the reference says:** memory.md § "What happens when a slice escapes": a literal that must
+  outlive the frame "costs an allocation there and **nothing at a call whose slice stays put**". And
+  "Without an allocator it is always a compile error", not a call to a `malloc` the link cannot find.
+- **Status:** open, reported for the release after alpha.13.
+- **What skiff does:** nothing yet. The board scenarios stopped here, before naming each list in a
+  `val` of its own (the long way round), for a decision.

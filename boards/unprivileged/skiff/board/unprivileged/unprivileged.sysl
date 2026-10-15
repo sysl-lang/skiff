@@ -1,0 +1,278 @@
+module skiff.board.unprivileged
+
+import skiff.kernel
+import skiff.kernel.user
+import skiff.kernel.user.Refusal
+import skiff.kernel.{Access, FOREVER, Machine, MapError, MessageBuffer, NotifyAction, Port, Region, Semaphore, StreamBuffer}
+
+// Unprivileged tasks, as the boot test shows them on every core. Six tasks run unprivileged, each
+// granted its code, its stack and `exchange` (a page of words they share with the privileged tasks), and
+// some of them more; two privileged tasks serve and judge them. From the scenarios' start tick `t`:
+//   - At t, worker makes five round trips with echo, a privileged task, through two message buffers
+//     it names by handle: "ping n" out, "pong n" back.
+//   - At t+3, snoop reads the kernel's tick count straight from the kernel's memory. The MPU stops it,
+//     and the board reports it.
+//   - At t+5, forger hands the kernel buffers it may not: a privileged task's bytes (`vault`), its own
+//     read-only grant to write into, a buffer straddling the end of `exchange`, an object it was not
+//     granted and a task that does not exist. Every call must be refused and touch nothing: `vault`
+//     keeps its bytes, and the message waiting for forger is still whole for the receive that follows.
+//   - At t+8, speaker, granted the UART's registers, writes a line on it itself. At t+9, mute, granted
+//     nothing of the kind, tries the same and is stopped.
+//   - At t+11, masker writes BASEPRI and PRIMASK, which an unprivileged task cannot, and spins on the
+//     tick count through kernel calls: it must see three ticks go by. Had either write masked anything,
+//     the ticks would have stopped (BASEPRI) or the call would have escalated to a HardFault (PRIMASK).
+//   - Reporter, privileged, checks each result as it falls due, and at t+16 that the two tasks the MPU
+//     stopped are stopped while every other task ran on.
+// Before any of it, a task whose map has a region the MPU cannot hold exactly is refused at creation.
+
+// What the unprivileged tasks read and write besides their stacks, at a power-of-two size and alignment
+// so that one PMSAv7 region holds it.
+struct Exchange
+    start: u32              // the scenarios' start tick
+    reporter: u32           // the reporter's index, which worker notifies
+    to_echo: u32            // handles
+    from_echo: u32
+    forge_box: u32
+    uart: u32               // where the UART's registers are
+    round_trips: u32        // worker's results
+    refusals: u32           // forger's
+    forger_got: u32
+    masked_ticks: u32       // masker's
+    basepri_seen: u32
+    unused: [53]u32
+
+@assert(sizeof(Exchange) == EXCHANGE_BYTES, "the exchange fills one 256-byte region")
+
+const EXCHANGE_BYTES: usize = 256
+
+@align(256)
+private var exchange: Exchange = Exchange(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, [0; 53])
+
+// A page forger may read and not write.
+@align(256)
+private var notice: [256]u8 = [0; 256]
+
+// A privileged task's bytes, which no unprivileged task is granted.
+private var vault: [16]u8 = [0x5a; 16]
+
+private var to_echo: MessageBuffer[32] = MessageBuffer(StreamBuffer([0; 32], 0, 0, 1))
+private var from_echo: MessageBuffer[32] = MessageBuffer(StreamBuffer([0; 32], 0, 0, 1))
+private var forge_box: MessageBuffer[32] = MessageBuffer(StreamBuffer([0; 32], 0, 0, 1))
+
+// An unprivileged task's stack must be one PMSAv7 region: 1 KiB, aligned to its size.
+@align(1024)
+private var stack_worker: [256]u32 = [0; 256]
+@align(1024)
+private var stack_snoop: [256]u32 = [0; 256]
+@align(1024)
+private var stack_forger: [256]u32 = [0; 256]
+@align(1024)
+private var stack_speaker: [256]u32 = [0; 256]
+@align(1024)
+private var stack_mute: [256]u32 = [0; 256]
+@align(1024)
+private var stack_masker: [256]u32 = [0; 256]
+private var stack_echo: [256]u32 = [0; 256]
+private var stack_reporter: [256]u32 = [0; 256]
+
+private var console: Option[*Machine] = None
+private var done: Semaphore = Semaphore(0, 1)
+private var snoop_index: usize = 0
+private var mute_index: usize = 0
+
+// Spawn the scenarios, which start at tick `start`. `code` is the code every unprivileged task runs,
+// and `uart` the registers of the console's UART, which speaker is granted. The isolation must have
+// been named (`kernel.isolate`).
+spawn_all(port: *Port, out: *Machine, code: Region, uart: Region, start: u32)
+    console = Some(out)
+    exchange.start = start
+    exchange.uart = u32(uart.base)
+    exchange.to_echo = u32(kernel.share(&to_echo))
+    exchange.from_echo = u32(kernel.share(&from_echo))
+    exchange.forge_box = u32(kernel.share(&forge_box))
+    val shared = Region(usize(&exchange), EXCHANGE_BYTES, Access.ReadWrite)
+    val readable = Region(usize(&notice[0]), 256, Access.Read)
+    val odd = Region(usize(&exchange) + 4, 100, Access.ReadWrite)
+    val plain: [2]Region = [code, shared]
+    kernel.spawn(port, stack_reporter, &task_reporter, 6, "reporter")
+    exchange.reporter = u32(kernel.task_stats([]) - 1)     // the row just added: the table's last
+    kernel.spawn(port, stack_echo, &task_echo, 3, "echo")
+    val refused: [2]Region = [code, odd]
+    kernel.spawn_unprivileged(port, stack_worker, &task_worker, 4, "odd", refused, []) match
+        Err(MapError.Bad(1, _)) -> say("skiff: a region the MPU cannot hold exactly was refused when its task was created\n")
+        _ -> say("skiff: a region the MPU cannot hold exactly was accepted\n")
+    val _ = unprivileged(port, stack_worker, &task_worker, "worker", plain, [usize(exchange.to_echo), usize(exchange.from_echo)])
+    snoop_index = unprivileged(port, stack_snoop, &task_snoop, "snoop", plain, [])
+    val with_notice: [3]Region = [code, shared, readable]
+    val _ = unprivileged(port, stack_forger, &task_forger, "forger", with_notice, [usize(exchange.forge_box)])
+    val with_uart: [3]Region = [code, shared, uart]
+    val _ = unprivileged(port, stack_speaker, &task_speaker, "speaker", with_uart, [])
+    mute_index = unprivileged(port, stack_mute, &task_mute, "mute", plain, [])
+    val _ = unprivileged(port, stack_masker, &task_masker, "masker", plain, [])
+
+// Wait until the reporter has judged every scenario: a board that stops the machine waits for this.
+wait_done()
+    val _ = done.take(FOREVER)
+
+// Spawn an unprivileged task at priority 4, answering its index; a map these scenarios give must fit.
+private unprivileged(port: *Port, stack: []u32, entry: *extern() -> never, name: string, regions: []const Region, objects: []const usize) -> usize
+    kernel.spawn_unprivileged(port, stack, entry, 4, name, regions, objects) match
+        Ok(i) -> i
+        Err(_) -> panic("skiff: a scenario's map was refused")
+
+private say(line: string)
+    console match
+        Some(c) -> c.write(line.bytes)
+        None -> ()
+
+// Worker: five round trips through echo.
+private task_worker() -> never
+    user.sleep_until(exchange.start)
+    var out: [6]u8 = [u8('p'), u8('i'), u8('n'), u8('g'), u8(' '), u8('0')]
+    var back: [8]u8 = [0; 8]
+    var good: u32 = 0
+    for n in 1u8..5
+        out[5] = u8('0') + n
+        val sent = user.send(usize(exchange.to_echo), out, FOREVER)
+        val got = user.receive(usize(exchange.from_echo), back, FOREVER)
+        if sent.unwrap_or(0) == 6 && got.unwrap_or(0) == 6 && back[1] == u8('o') && back[5] == u8('0') + n then good += 1
+    exchange.round_trips = good
+    val _ = user.notify(usize(exchange.reporter), 1, NotifyAction.SetBits)
+    user.sleep(FOREVER)
+    loop
+        ()
+
+// Echo: answer every "ping n" with "pong n".
+private task_echo() -> never
+    var buf: [8]u8 = [0; 8]
+    loop
+        val n = to_echo.receive(buf, FOREVER)
+        buf[1] = u8('o')
+        val _ = from_echo.send(buf[0..<n], FOREVER)
+
+// Snoop: read the kernel's own data.
+private task_snoop() -> never
+    user.sleep_until(exchange.start + 3)
+    exchange.unused[0] = kernel.ticks()        // the load faults; the store is never reached
+    loop
+        ()
+
+// Forger: buffers and handles that are not its own.
+private task_forger() -> never
+    user.sleep_until(exchange.start + 5)
+    val box = usize(exchange.forge_box)
+    val theirs: *u8 = ptr_cast(usize(&vault[0]))
+    val straddling: *u8 = ptr_cast(usize(&exchange) + EXCHANGE_BYTES - 8)
+    val stats: *kernel.TaskStats = ptr_cast(usize(&vault[0]))
+    var refused: u32 = 0
+    if user.receive(box, theirs[0..<16], 0) == Err(Refusal.BadBuffer) then refused += 1
+    if user.send(box, theirs[0..<16], 0) == Err(Refusal.BadBuffer) then refused += 1
+    if user.receive(box, notice[0..<16], 0) == Err(Refusal.BadBuffer) then refused += 1
+    if user.receive(box, straddling[0..<16], 0) == Err(Refusal.BadBuffer) then refused += 1
+    if user.task_stats(stats[0..<1]) == Err(Refusal.BadBuffer) then refused += 1
+    if user.send(usize(exchange.to_echo), notice[0..<4], 0) == Err(Refusal.BadHandle) then refused += 1
+    if user.notify(200, 1, NotifyAction.SetBits) == Err(Refusal.BadHandle) then refused += 1
+    exchange.refusals = refused
+    var mine: [16]u8 = [0; 16]
+    user.receive(box, mine, 0) match
+        Ok(n) -> if mine[0] == u8('w') then exchange.forger_got = u32(n)
+        Err(_) -> ()
+    user.sleep(FOREVER)
+    loop
+        ()
+
+// The CMSDK UART's first two registers, which both boards' UARTs have.
+private struct Uart
+    data: volatile u32          // a write sends a byte
+    state: volatile u32         // bit 0: the transmit buffer is full
+
+// Write `line` on the UART at `exchange.uart`, register by register.
+private write_uart(line: string)
+    val u: *Uart = ptr_cast(usize(exchange.uart))
+    for b in line.bytes
+        while (u.state & 1) != 0 do ()
+        u.data = u32(b)
+
+private task_speaker() -> never
+    user.sleep_until(exchange.start + 8)
+    write_uart("skiff: an unprivileged task granted the UART wrote this line itself\n")
+    user.sleep(FOREVER)
+    loop
+        ()
+
+private task_mute() -> never
+    user.sleep_until(exchange.start + 9)
+    write_uart("skiff: an unprivileged task wrote on a UART it was not granted\n")
+    user.sleep(FOREVER)
+    loop
+        ()
+
+// Masker: try to mask, then watch the ticks go by.
+private task_masker() -> never
+    user.sleep_until(exchange.start + 11)
+    val seen = mask_all()
+    val first = user.ticks()
+    while user.ticks() - first < 3
+        ()
+    exchange.masked_ticks = user.ticks() - first
+    exchange.basepri_seen = seen
+    unmask_all()
+    user.sleep(FOREVER)
+    loop
+        ()
+
+// Raise BASEPRI to hold off every configurable interrupt and set PRIMASK; answer BASEPRI as read back.
+private mask_all() -> u32
+    var seen: u32 = 0
+    val level: u32 = 0x10
+    asm
+        [thumb]
+            "msr basepri, {level}"
+            "cpsid i"
+            "isb"
+            "mrs {seen}, basepri"
+            in level : reg
+            out seen : reg
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the scenario is Arm M-profile assembly"
+    seen
+
+private unmask_all()
+    val level: u32 = 0
+    asm
+        [thumb]
+            "msr basepri, {level}"
+            "cpsie i"
+            in level : reg
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the scenario is Arm M-profile assembly"
+
+// Reporter: judge each scenario as it falls due.
+private task_reporter() -> never
+    val t = exchange.start
+    kernel.sleep_until(t)
+    val _ = kernel.notify_wait(0, 0xffff_ffff, 5)
+    if exchange.round_trips == 5
+        say("skiff: an unprivileged task made 5 round trips through message buffers with a privileged task\n")
+    else
+        say("skiff: the unprivileged task's round trips went wrong\n")
+    // A message waiting for forger, which its refused calls must leave alone.
+    val _ = forge_box.send("whole".bytes, 0)
+    kernel.sleep_until(t + 6)
+    var untouched = true
+    for b in vault
+        if b != 0x5a then untouched = false
+    if exchange.refusals == 7 && exchange.forger_got == 5 && untouched
+        say("skiff: kernel calls with buffers or handles outside the caller's grants were refused, and touched nothing\n")
+    else
+        say("skiff: a kernel call with a buffer or handle outside the caller's grants was not refused\n")
+    kernel.sleep_until(t + 15)
+    if exchange.masked_ticks >= 3 && exchange.basepri_seen == 0
+        say("skiff: an unprivileged task's writes to BASEPRI and PRIMASK held off nothing\n")
+    else
+        say("skiff: an unprivileged task masked interrupts\n")
+    kernel.sleep_until(t + 16)
+    if kernel.stopped(snoop_index) && kernel.stopped(mute_index)
+        say("skiff: the unprivileged tasks that broke their protection were stopped, and the rest ran on\n")
+    else
+        say("skiff: an unprivileged task that broke its protection was not stopped\n")
+    val _ = done.give()
+    kernel.sleep_forever()
