@@ -49,14 +49,14 @@ val NO_SLOT: Slot = Slot(0, 0)
 val NO_REGION: Region = Region(0, 0, Access.Read)
 
 // Why a protection unit cannot hold a region exactly.
-enum RegionError
-    Empty               // it has no bytes
+enum RegionError derives Display
+    Empty              // it has no bytes
     Wraps               // it runs past the top of the address space
     Unaligned           // its base or its end is off the unit's granule (32 bytes on PMSAv8)
     NotPowerOfTwo       // no power-of-two region aligned to its size, less whole eighths, covers exactly it (PMSAv7)
 
 // Why a task's map was refused at creation. A region is named by its index in the list the creator gave.
-enum MapError derives Eq
+enum MapError derives Eq, Display
     TooManyRegions                          // more than the unit holds beside the stack
     Stack(why: RegionError)                 // the unit cannot hold the task's stack as one region
     Bad(region: usize, why: RegionError)    // the unit cannot hold this region
@@ -167,10 +167,12 @@ private[kernel] build_map(iso: *Isolation, stack: Region, regions: []const Regio
     map.len = regions.len + 1
     Ok(map)
 
-// Whether two regions share a byte. Ends are reckoned in 64 bits, so a region ending at the top of a
-// 32-bit address space does not wrap to zero.
-private overlaps(a: Region, b: Region) -> bool
-    u64(a.base) < u64(b.base) + u64(b.bytes) && u64(b.base) < u64(a.base) + u64(a.bytes)
+// Whether two regions, each of which the unit holds, share a byte. Each is reckoned by its last byte,
+// so that one ending at the very top of the address space does not wrap to zero.
+private overlaps(a: Region, b: Region) -> bool = a.base <= last_byte(b) && b.base <= last_byte(a)
+
+// The address of a region's last byte; it has at least one.
+private last_byte(r: Region) -> usize = r.base + (r.bytes - 1)
 
 // Whether task `i` may hand the kernel the `bytes` bytes at `addr`, to be read, or written too if
 // `write`. A privileged task may hand it anything. An unprivileged one must hand it bytes lying wholly
@@ -181,14 +183,13 @@ private overlaps(a: Region, b: Region) -> bool
 may_reach(i: usize, addr: usize, bytes: usize, write: bool) -> bool
     val t = scheduler.tasks[i]
     if !t.user || bytes == 0 then return true
-    val start = u64(addr)
-    val end = start + u64(bytes)
-    if end > u64(usize::Max) + 1 then return false
+    if bytes - 1 > usize::Max - addr then return false     // it would run past the top of memory
+    val last = addr + (bytes - 1)
     val m = &maps[i]
     for k in 0..<m.len
         val r = m.regions[k]
-        val low = if k == 0 then u64(r.base + reserved_at_bottom(r.base, r.bytes)) else u64(r.base)
-        val inside = start >= low && end <= u64(r.base) + u64(r.bytes)
+        val low = if k == 0 then r.base + reserved_at_bottom(r.base, r.bytes) else r.base
+        val inside = addr >= low && last <= last_byte(r)
         val allowed = r.access match
             ReadWrite -> true
             Read | Execute -> !write

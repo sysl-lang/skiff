@@ -1,0 +1,79 @@
+module skiff.arch.pmsa
+@tests
+
+import skiff.kernel.{Access, Region, RegionError, Slot}
+
+// The region encodings against words worked out by hand from the architecture manuals' field layouts.
+
+// The slot `r` encodes to, or a failed test.
+private held(r: Result[Slot, RegionError]) -> Slot = r match
+    Ok(s) -> s
+    Err(_) -> panic("refused a region it should hold")
+
+// Why `r` was refused, or a failed test.
+private refused(r: Result[Slot, RegionError]) -> RegionError = r match
+    Ok(_) -> panic("held a region it should refuse")
+    Err(why) -> why
+
+private check(s: Slot, first: u32, second: u32)
+    assert_eq(s.first, first)
+    assert_eq(s.second, second)
+
+@test("PMSAv7: a power-of-two region aligned to its size is held whole, with its access and memory kind")
+v7_whole_regions()
+    // XN, AP 011, TEX 001 C B, SIZE 9 (1 KiB), enabled.
+    check(held(encode_v7(Region(0x2000_0000, 1024, Access.ReadWrite))), 0x2000_0000, 0x130b_0013)
+    // AP 010: privileged read-write, unprivileged read-only; SIZE 7 (256 bytes).
+    check(held(encode_v7(Region(0x2000_0000, 256, Access.Read))), 0x2000_0000, 0x120b_000f)
+    // No XN, AP 110 (read-only for both), TEX 000 C (write-through), SIZE 17 (256 KiB).
+    check(held(encode_v7(Region(0, 0x4_0000, Access.Execute))), 0, 0x0602_0023)
+    // XN, AP 011, S B (shareable device), SIZE 11 (4 KiB).
+    check(held(encode_v7(Region(0x4000_4000, 4096, Access.Device))), 0x4000_4000, 0x1305_0017)
+    // The smallest region, 32 bytes: SIZE 4.
+    check(held(encode_v7(Region(0x2000_0020, 32, Access.ReadWrite))), 0x2000_0020, 0x130b_0009)
+    // The last 32 bytes of the address space end at 2^32, which is not a wrap.
+    check(held(encode_v7(Region(0xffff_ffe0, 32, Access.ReadWrite))), 0xffff_ffe0, 0x130b_0009)
+
+@test("PMSAv7: a region on whole eighths of a block switches the other eighths off")
+v7_subregions()
+    // Bytes 0x100-0x3ff of a 1 KiB block: eighths 2 to 7 on, 0 and 1 off (SRD 0x03).
+    check(held(encode_v7(Region(0x2000_0100, 0x300, Access.ReadWrite))), 0x2000_0000, 0x130b_0313)
+    // Bytes 0x300-0x4ff cross a 1 KiB boundary, so the block is 2 KiB: eighths 3 and 4 on (SRD 0xe7).
+    check(held(encode_v7(Region(0x2000_0300, 0x200, Access.ReadWrite))), 0x2000_0000, 0x130b_e715)
+    // Every eighth but the last.
+    check(held(encode_v7(Region(0x2000_0000, 0x380, Access.ReadWrite))), 0x2000_0000, 0x130b_8013)
+
+@test("PMSAv7: a region no block covers exactly is refused, not rounded")
+v7_refusals()
+    assert_eq(refused(encode_v7(Region(0x2000_0000, 0, Access.ReadWrite))), RegionError.Empty)
+    assert_eq(refused(encode_v7(Region(0xffff_ff00, 0x200, Access.ReadWrite))), RegionError.Wraps)
+    // 64 bytes off a 64-byte boundary: the block is 128 bytes, which has no eighths to switch off.
+    assert_eq(refused(encode_v7(Region(0x2000_0010, 64, Access.ReadWrite))), RegionError.NotPowerOfTwo)
+    // 300 bytes: not a whole number of the 512-byte block's eighths.
+    assert_eq(refused(encode_v7(Region(0x2000_0000, 300, Access.ReadWrite))), RegionError.NotPowerOfTwo)
+    // Across a 1 KiB boundary, off the 2 KiB block's eighths.
+    assert_eq(refused(encode_v7(Region(0x2000_03c0, 0x80, Access.ReadWrite))), RegionError.NotPowerOfTwo)
+    // Under 32 bytes.
+    assert_eq(refused(encode_v7(Region(0x2000_0000, 16, Access.ReadWrite))), RegionError.NotPowerOfTwo)
+
+@test("PMSAv8: a region is its base and its last 32 bytes, with its access and MAIR index")
+v8_regions()
+    // RO for both (AP 11), executable, attribute 0.
+    check(held(encode_v8(Region(0x1000_0000, 0x4_0000, Access.Execute))), 0x1000_0006, 0x1003_ffe1)
+    // RW for both (AP 01), XN; limit 0x3000_0140.
+    check(held(encode_v8(Region(0x3000_0100, 0x60, Access.ReadWrite))), 0x3000_0103, 0x3000_0141)
+    // RO for both, XN.
+    check(held(encode_v8(Region(0x3000_0000, 32, Access.Read))), 0x3000_0007, 0x3000_0001)
+    // RW, XN, attribute 1 (device).
+    check(held(encode_v8(Region(0x5020_0000, 0x1000, Access.Device))), 0x5020_0003, 0x5020_0fe3)
+    // The last 32 bytes of the address space.
+    check(held(encode_v8(Region(0xffff_ffe0, 32, Access.ReadWrite))), 0xffff_ffe3, 0xffff_ffe1)
+    // MAIR0: attribute 0 normal write-back (0xff), attribute 1 device nGnRE (0x04).
+    assert_eq(V8_MAIR0, 0x04ff)
+
+@test("PMSAv8: a region off the 32-byte granule is refused, not rounded")
+v8_refusals()
+    assert_eq(refused(encode_v8(Region(0x3000_0010, 64, Access.ReadWrite))), RegionError.Unaligned)
+    assert_eq(refused(encode_v8(Region(0x3000_0000, 48, Access.ReadWrite))), RegionError.Unaligned)
+    assert_eq(refused(encode_v8(Region(0x3000_0000, 0, Access.ReadWrite))), RegionError.Empty)
+    assert_eq(refused(encode_v8(Region(0xffff_ffe0, 64, Access.ReadWrite))), RegionError.Wraps)

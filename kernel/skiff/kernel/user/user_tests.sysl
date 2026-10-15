@@ -1,0 +1,93 @@
+module skiff.kernel.user
+@tests
+
+import skiff.kernel
+import skiff.kernel.{Access, NotifyAction, Port, Region, RegionError, Slot, StreamBuffer}
+
+// The `user` functions on the host, through the whole call path a port takes. The trap is answered as
+// the Arm port's is: the arguments are laid as a frame on the calling task's stack, `begin_call` takes
+// it, `serve_call` runs the call and `end_call` ends it. Only the kernel's public surface is used, so the
+// unprivileged task is the first one added, which is the running one until `run`.
+
+@export("skiff_trap")
+private host_trap(number: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> usize
+    val frame = stack.len - 16
+    stack[frame] = a0
+    stack[frame + 1] = a1
+    stack[frame + 2] = a2
+    stack[frame + 3] = a3
+    stack[frame + 4] = number
+    if !kernel.begin_call(usize(&stack[frame]), 8 * sizeof(usize), 4 * sizeof(usize)) then panic("the trap's frame was refused")
+    val r = kernel.serve_call()
+    if !kernel.end_call() then panic("the call was not in flight")
+    r
+
+private struct Fine
+    unused: u32
+
+impl kernel.Isolation for Fine
+    capacity(*self) -> usize = 6
+    encode(*self, r: Region) -> Result[Slot, RegionError] = Ok(Slot(0, 0))
+    load(*self, map: []const Slot) = ()
+
+private struct NoPort
+    unused: u32
+
+impl Port for NoPort
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize = usize(&stack[0])
+    request_switch(*self) = ()
+    start_first(*self, sp: usize) -> never
+        loop
+            ()
+    mask(*self) -> u32 = 0
+    restore(*self, state: u32) = ()
+    idle(*self) = ()
+
+private var fine: Fine = Fine(0)
+private var no_port: NoPort = NoPort(0)
+
+// The unprivileged task's stack, in words the trap's frame is laid in.
+private var stack: [64]usize = [0; 64]
+private var shared: [32]u8 = [0; 32]
+private var private_bytes: [8]u8 = [0x5a; 8]
+private var ring: StreamBuffer[8] = StreamBuffer([0; 8], 0, 0, 1)
+
+private never_runs() -> never
+    loop
+        ()
+
+// An unprivileged task 0, granted `ring` and `shared`, and a privileged task 1.
+private set_up()
+    kernel.isolate(&fine)
+    val h = kernel.share(&ring)
+    val words: *u32 = ptr_cast(&stack[0])
+    val grants: [1]Region = [Region(usize(&shared[0]), 32, Access.ReadWrite)]
+    val _ = kernel.spawn_unprivileged(&no_port, words[0..<stack.len * sizeof(usize) / 4], &never_runs, 2, "user", grants[0..<1], [h])
+    kernel.spawn(&no_port, words[0..<16], &never_runs, 1, "privileged")
+
+@test("the user functions trap into the kernel and answer what it answers")
+user_calls()
+    set_up()
+    assert_eq(my_index(), 0)
+    shared[0] = 9
+    assert(send(0, shared[0..<1], 0) == Ok(1))
+    assert_eq(ring.available(), 1)
+    assert(receive(0, shared[8..<12], 0) == Ok(1))
+    assert_eq(shared[8], 9)
+    assert(notify(1, 3, NotifyAction.SetBits) == Ok(true))
+    assert(notify(1, 4, NotifyAction.NoOverwrite) == Ok(false))
+
+@test("the user functions answer the kernel's refusals as errors, and the refused call does nothing")
+user_refusals()
+    set_up()
+    assert(send(0, private_bytes[0..<4], 0) == Err(Refusal.BadBuffer))
+    assert(send(0, "a literal".bytes, 0) == Err(Refusal.BadBuffer))        // no code region in this map
+    assert(send(1, shared[0..<1], 0) == Err(Refusal.BadHandle))
+    assert_eq(ring.available(), 0)
+    shared[0] = 1
+    assert(send(0, shared[0..<1], 0) == Ok(1))
+    assert(receive(0, private_bytes[0..<4], 0) == Err(Refusal.BadBuffer))
+    assert_eq(private_bytes[0], 0x5a)
+    assert_eq(ring.available(), 1)
+    assert(notify(40, 1, NotifyAction.SetBits) == Err(Refusal.BadHandle))
+    assert(task_stats([]) == Ok(2))         // an empty buffer reaches nothing: the count alone

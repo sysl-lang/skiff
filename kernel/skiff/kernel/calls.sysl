@@ -108,7 +108,13 @@ private[kernel] dispatch(i: usize, c: CallFrame) -> usize
             ch.read(p[0..<a[2]], u32(a[3]))
         CALL_TASK_STATS ->
             if a[1] > MAX_TASKS then return REFUSED_ARGUMENT
-            if !may_reach(i, a[0], a[1] * sizeof(TaskStats), true) then return REFUSED_BUFFER
+            val bytes = a[1] * sizeof(TaskStats)
+            if !may_reach(i, a[0], bytes, true) then return REFUSED_BUFFER
+            // A row holds a string, and a string may be written only over storage the compiler laid
+            // out or storage that is all zero, so the task's bytes are zeroed before the rows go in.
+            val raw: *u8 = ptr_cast(a[0])
+            for k in 0..<bytes
+                raw[k] = 0
             val p: *TaskStats = ptr_cast(a[0])
             task_stats(p[0..<a[1]])
         _ -> REFUSED_CALL
