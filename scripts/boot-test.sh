@@ -54,6 +54,10 @@ skiff: a lowered priority kept the inherited boost, and the lowered task yielded
 skiff: a stopped waiter left its wait list, a task stopped itself, and a new task took a stopped task's row
 skiff: a task spinning for 3 of 6 ticks was charged its share, and idle the rest
 skiff: a task recursing 8 deep lowered its stack high-water mark by its frames
+skiff: a reload timer fired every 3 ticks, and a late call did not move the ticks after it
+skiff: a one-shot timer fired once, and a timer stopped before its expiry never fired
+skiff: a timer started from an interrupt was active at once and fired 2 ticks later
+skiff: every timer callback ran in the timer service
 skiff: task deep overflowed its stack
 skiff: task null broke its memory protection
 skiff: mmfar 0x00000000

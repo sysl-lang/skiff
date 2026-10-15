@@ -49,6 +49,7 @@ run_tasks() -> never
     spawn_rmutex(&cortex)
     spawn_control(&cortex)
     spawn_stats(&cortex)
+    spawn_timers(&cortex)
     spawn_memory(&cortex)
     armv7m.enable_protection()
     kernel.protect(&protector)

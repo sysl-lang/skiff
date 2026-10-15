@@ -3,7 +3,7 @@
 
 import skiff.kernel
 import sysl.sync.Atomic
-import skiff.kernel.{RunCounter, Doorbell, Flags, Heap, Link, Machine, MessageBuffer, Mutex, NO_OWNER, NotifyAction, Pool, Port, Protection, Queue, RecursiveMutex, Ring, Semaphore, StreamBuffer}
+import skiff.kernel.{RunCounter, Doorbell, Flags, Heap, Link, Machine, MessageBuffer, Mutex, NO_OWNER, NotifyAction, Pool, Port, Protection, Queue, RecursiveMutex, Ring, Semaphore, StreamBuffer, Timer}
 
 struct Nothing
 end Nothing
@@ -75,6 +75,11 @@ private var flags: Flags = Flags(0)
 private var stream: StreamBuffer[16] = StreamBuffer([0; 16], 0, 0, 1)
 private var messages: MessageBuffer[16] = MessageBuffer(StreamBuffer([0; 16], 0, 0, 1))
 
+private expired(t: *Timer) -> unit
+    val _ = t.stop(0)
+
+private var timer: Timer = Timer("timer", 2, true, &expired, false, 0, null)
+
 private task() -> never
     kernel.yield_now()
     kernel.sleep(1)
@@ -126,6 +131,9 @@ private task() -> never
     val _ = kernel.task_stats(rows) + kernel.stack_high_water(me)
     val _ = kernel.total_run_time() + u64(kernel.idle_permille())
     kernel.reset_stats()
+    val _ = timer.start(1) && timer.stop(1) && timer.reset(1) && timer.change_period(3, 1)
+    val _ = timer.start_from_isr() && timer.stop_from_isr() && timer.reset_from_isr()
+    val _ = timer.change_period_from_isr(4) || timer.is_active()
     kernel.stop(me)
     kernel.sleep_forever()
 
@@ -139,6 +147,7 @@ probe() -> i32
     var p = NoPort()
     var stack: [32]u32 = [0; 32]
     var idle: [32]u32 = [0; 32]
+    var timer_stack: [32]u32 = [0; 32]
     var g = NoGuard()
     heap.init(arena)
     ring_out.reset()
@@ -147,6 +156,7 @@ probe() -> i32
         Some(r) -> r.reset()
         None -> ()
     kernel.spawn(&p, stack, &task, 1, "task")
+    kernel.start_timers(&p, timer_stack, 2)
     kernel.protect(&g)
     kernel.measure(&counter)
     kernel.run(&p, idle)

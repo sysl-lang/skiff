@@ -334,5 +334,6 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
   before the service runs, as the AN521 board does for finding 7); or make the callback a trait object
   (`*Expiry` over the address of a zero-sized struct per callback, which folds since finding 6), so that
   every callback needs a struct and an `impl` where C needs a function.
-- **Status:** open, reported for the release after alpha.13.
-- **What skiff does:** software timers wait on this finding.
+- **Status:** Fixed in 0.1.0. The reduction builds for `thumbv7em-freestanding`, and a function's
+  address is laid in as data.
+- **What skiff does:** software timers hold their callback's address in static storage.
