@@ -2,6 +2,7 @@ module board
 
 import sysl.sync.Atomic
 import skiff.arch.armv7m
+import skiff.chip.mps2
 import skiff.kernel
 import skiff.kernel.Machine
 
@@ -31,6 +32,7 @@ private var stack_idle: [128]u32 = [0; 128]
 private[board] var epoch: u32 = 0
 
 private var protector: armv7m.Protector = armv7m.Protector()
+private var cycles: Cycles = Cycles()
 
 // Spawn the tasks and run them with every stack guarded; the run ends in a bus fault, in the last
 // scenario.
@@ -46,9 +48,12 @@ run_tasks() -> never
     spawn_streams(&cortex)
     spawn_rmutex(&cortex)
     spawn_control(&cortex)
+    spawn_stats(&cortex)
     spawn_memory(&cortex)
     armv7m.enable_protection()
     kernel.protect(&protector)
+    mps2.counter_start()
+    kernel.measure(&cycles)
     kernel.run(&cortex, stack_idle)
 
 private task_a() -> never = take_turns("skiff: task A ", false)

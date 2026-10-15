@@ -1,0 +1,142 @@
+module skiff.kernel
+
+// Run-time statistics and stack high-water marks.
+//
+// **Run time.** With a `RunCounter` named by `measure`, every task's row counts the counter's counts it has
+// spent running. The running task is charged for the counts since the last charge at every switch,
+// before the next task is chosen, and on every tick, so a task running alone for a long time is still
+// charged before the 32-bit counter can wrap between two charges. A charge is a counter read, a
+// subtraction and an add; there is no division in the switch. The run times of every task, the idle
+// task's among them, add up to the counts since `run` or the last `reset_stats`, so the idle task's
+// share of that total is the time the processor had nothing to do.
+//
+// **Stack high-water marks.** Every task's stack is filled with `STACK_PAINT` when the task is added,
+// whether into a new row or a stopped task's, before its first frame is laid on top. A task's stack
+// grows down from the top, so the painted words left at the bottom are the ones it has never reached.
+// The scan starts above what the protection unit reserves at the bottom of the stack (its guard, or the
+// room below a stack limit), which no task may touch and which a running task may not even read.
+
+// A free-running counter: it counts up by one per unit of time and wraps at 2^32. The kernel only takes
+// differences between two readings, so it needs no particular start, but two charges must come less than
+// 2^32 counts apart: a tick charges, so a counter that wraps once per tick or more slowly is enough.
+trait RunCounter
+    count(*self) -> u32
+
+// What every word of a stack holds until the task reaches it.
+const STACK_PAINT: u32 = 0xa5a5_a5a5
+
+// The counter, once `measure` has named one; until then nothing is charged.
+private[kernel] var counter: Option[*RunCounter] = None
+
+// The counter's reading at the last charge.
+private var charged_at: u32 = 0
+
+// Count every task's run time with `c` from `run` on, or from now if the tasks already run.
+measure(c: *RunCounter)
+    val state = enter()
+    counter = Some(c)
+    charged_at = c.count()
+    leave(state)
+
+// Charge the running task for the counts since the last charge. Called with the kernel's interrupts
+// held off: by the switch, by the tick and by the queries below.
+private[kernel] charge()
+    counter match
+        Some(c) ->
+            val now = c.count()
+            scheduler.tasks[scheduler.running].run_time += u64(now - charged_at)
+            charged_at = now
+        None -> ()
+
+// Start counting from now, when the first task is about to run: what came before belongs to no task.
+private[kernel] start_counting()
+    counter match
+        Some(c) -> charged_at = c.count()
+        None -> ()
+
+// Set every task's run time back to 0 and count from now.
+reset_stats()
+    val state = enter()
+    for i in 0..<scheduler.count
+        scheduler.tasks[i].run_time = 0
+    start_counting()
+    leave(state)
+
+// The run time of every task in the table added up: the counts since `run` or `reset_stats`.
+total_run_time() -> u64
+    val state = enter()
+    if started() then charge()
+    var total: u64 = 0
+    for i in 0..<scheduler.count
+        total += scheduler.tasks[i].run_time
+    leave(state)
+    total
+
+// The idle task's share of `total_run_time`, in thousandths: 1000 less the processor's load. Answers 0
+// before anything has been counted.
+idle_permille() -> u32
+    val state = enter()
+    if started() then charge()
+    var total: u64 = 0
+    var idle: u64 = 0
+    for i in 0..<scheduler.count
+        val t = &scheduler.tasks[i]
+        total += t.run_time
+        if t.base == IDLE_PRIORITY then idle += t.run_time
+    leave(state)
+    if total == 0 then 0 else u32(idle * 1000 / total)
+
+// One task, as `task_stats` reports it.
+struct TaskStats
+    index: usize
+    name: string
+    run_time: u64       // counts of the `measure` counter spent running since `run` or `reset_stats`
+    state: TaskState
+    suspended: bool
+    priority: u8        // the effective priority, an inherited one included
+    stack_free: usize   // the stack's high-water mark: see `stack_high_water`
+
+val NO_STATS: TaskStats = TaskStats(0, "", 0, TaskState.Ready, false, 0, 0)
+
+// Fill `out` with a row per task in table order, stopped ones included, and answer how many tasks the
+// table holds. When `out` is shorter than that, only its length are filled, the first in table order,
+// and the answer says how long an array would have held them all. Nothing is allocated. The run times
+// are taken together, with the running task charged up to now; the stacks are scanned after, one by one.
+task_stats(out: []TaskStats) -> usize
+    val state = enter()
+    if started() then charge()
+    val count = scheduler.count
+    val n = if out.len < count then out.len else count
+    for i in 0..<n
+        val t = scheduler.tasks[i]
+        out[i] = TaskStats(i, t.name, t.run_time, t.state, t.suspended, t.priority, 0)
+    leave(state)
+    for i in 0..<n
+        out[i].stack_free = stack_high_water(i)
+    count
+
+// The bytes of task `i`'s stack it has never reached: the least room it has ever had left above what
+// the protection unit reserves at the bottom (all of it, without protection). It is a lower bound on
+// the room left, since a word a task wrote with `STACK_PAINT` itself reads as never reached. The stack
+// must have been added through `spawn` or `run`, which paint it.
+stack_high_water(i: usize) -> usize
+    if i >= scheduler.count then panic("skiff: no such task")
+    val base = scheduler.tasks[i].stack
+    val bytes = scheduler.tasks[i].stack_bytes
+    val reserved = protection match
+        Some(pr) -> pr.reserved(base, bytes)
+        None -> 0
+    val top = base + bytes
+    var at = (base + reserved + 3) & ~3usize
+    var free: usize = 0
+    while at < top
+        val word: *u32 = ptr_cast(at)
+        if *word != STACK_PAINT then break
+        free += 4
+        at += 4
+    free
+
+// Fill `stack` with `STACK_PAINT`.
+private[kernel] paint(stack: []u32)
+    for k in 0..<stack.len
+        stack[k] = STACK_PAINT

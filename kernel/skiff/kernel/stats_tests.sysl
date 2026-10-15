@@ -1,0 +1,261 @@
+module skiff.kernel
+@tests
+
+// Run-time statistics and stack high-water marks on the host. A port stands in for the processor: a
+// switch it is asked for is the kernel's own `switch_context`, made once, so the charge a real switch
+// makes is the one under test. A counter the test moves by hand stands in for the cycle counter.
+//
+// The port, the counter and the protection are module-level, never locals: the kernel keeps pointers to
+// them after a test returns, and a later test's tick or switch still reaches them.
+
+struct HandCounter
+    now: u32
+
+impl RunCounter for HandCounter
+    count(*self) -> u32 = self.now
+
+// A port whose switch is `switch_context`, made at most once per request, and whose new context is a
+// frame of eight zero words at the top of the stack, as a real port's would be.
+struct SwitchingPort
+    switches: u32
+    depth: u32
+
+impl Port for SwitchingPort
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize
+        for k in stack.len - 8..<stack.len
+            stack[k] = 0
+        usize(&stack[stack.len - 8])
+
+    request_switch(*self)
+        self.switches += 1
+        val _ = switch_context(0)
+
+    start_first(*self, sp: usize) -> never
+        loop
+            ()
+
+    mask(*self) -> u32
+        self.depth += 1
+        self.depth
+
+    restore(*self, state: u32)
+        if state != self.depth then panic("restored out of order")
+        self.depth -= 1
+
+    idle(*self) = ()
+
+// Protection that reserves a set number of bytes at the bottom of every stack.
+struct Reserving
+    bytes: usize
+
+impl Protection for Reserving
+    guard(*self, base: usize, bytes: usize) = ()
+    reserved(*self, base: usize, bytes: usize) -> usize = self.bytes
+
+private var hand: HandCounter = HandCounter(0)
+private var switcher: SwitchingPort = SwitchingPort(0, 0)
+private var reserving: Reserving = Reserving(0)
+
+private var stack_one: [64]u32 = [0; 64]
+private var stack_two: [64]u32 = [0; 64]
+
+private spin() -> never
+    loop
+        ()
+
+// An idle task and two of priority 1, the first of them running, counted by `hand` from `start`.
+private three_tasks(start: u32)
+    scheduler = empty_scheduler()
+    val _ = scheduler.add(0, 0)
+    val _ = scheduler.add(0, 1)
+    val _ = scheduler.add(0, 1)
+    scheduler.running = 1
+    port = Some(&switcher)
+    protection = Some(&reserving)
+    reserving.bytes = 0
+    hand.now = start
+    measure(&hand)
+
+// The run times of the three tasks, through the snapshot.
+private run_times() -> [3]u64
+    var rows: [3]TaskStats = [NO_STATS; 3]
+    assert_eq(task_stats(rows), 3)
+    [rows[0].run_time, rows[1].run_time, rows[2].run_time]
+
+@test("a switch charges the task it switches away from, not the one it switches to")
+switch_charges_the_outgoing_task()
+    three_tasks(1000)
+    hand.now += 100
+    val _ = switch_context(0)
+    assert_eq(scheduler.running, 2)
+    hand.now += 30
+    val _ = switch_context(0)
+    assert_eq(scheduler.running, 1)
+    hand.now += 7
+    val t = run_times()
+    assert_eq(t[0], 0)
+    assert_eq(t[1], 107)
+    assert_eq(t[2], 30)
+    assert_eq(total_run_time(), 137)
+
+@test("a tick charges the running task before its turn passes to the next")
+tick_charges_the_running_task()
+    three_tasks(0)
+    hand.now = 50
+    tick()
+    assert_eq(scheduler.running, 2)
+    hand.now = 70
+    tick()
+    assert_eq(scheduler.running, 1)
+    val t = run_times()
+    assert_eq(t[1], 50)
+    assert_eq(t[2], 20)
+
+@test("a task running alone for more than 2^32 counts is charged them all, a tick at a time")
+alone_past_the_wrap()
+    three_tasks(0)
+    scheduler.tasks[2].base = 0
+    scheduler.tasks[2].priority = 0
+    for k in 1u32..4
+        hand.now = k * 0x8000_0000
+        tick()
+        assert_eq(scheduler.running, 1)
+    hand.now = 0x10
+    assert_eq(run_times()[1], 0x2_0000_0010)
+
+@test("the time before the counter wraps and after it are both charged")
+counter_wraps()
+    three_tasks(0xffff_fff0)
+    hand.now = 0x10
+    val _ = switch_context(0)
+    assert_eq(run_times()[1], 0x20)
+
+@test("a reset sets every run time to 0, and counting starts again from the reset")
+reset_starts_again()
+    three_tasks(0)
+    hand.now = 500
+    val _ = switch_context(0)
+    hand.now = 800
+    reset_stats()
+    val zero = run_times()
+    assert_eq(zero[1] + zero[2], 0)
+    assert_eq(total_run_time(), 0)
+    hand.now = 860
+    val _ = switch_context(0)
+    val t = run_times()
+    assert_eq(t[1], 0)
+    assert_eq(t[2], 60)
+
+@test("with no counter named, nothing is charged")
+no_counter()
+    three_tasks(0)
+    counter = None
+    hand.now = 400
+    val _ = switch_context(0)
+    assert_eq(total_run_time(), 0)
+    assert_eq(idle_permille(), 0)
+
+@test("the idle task's share is in thousandths of the total, and 0 before anything is counted")
+idle_share()
+    three_tasks(0)
+    assert_eq(idle_permille(), 0)
+    scheduler.running = 0
+    hand.now = 750
+    val _ = switch_context(0)
+    assert_eq(scheduler.running, 1)
+    hand.now = 1000
+    assert_eq(idle_permille(), 750)
+    assert_eq(total_run_time(), 1000)
+
+@test("a snapshot into a short array fills what fits and answers how many there are")
+short_snapshot()
+    three_tasks(0)
+    hand.now = 9
+    var two: [2]TaskStats = [NO_STATS; 2]
+    assert_eq(task_stats(two), 3)
+    assert_eq(two[0].index, 0)
+    assert_eq(two[1].index, 1)
+    assert_eq(two[1].run_time, 9)
+    assert_eq(two[0].priority, 0)
+    assert_eq(two[1].priority, 1)
+    assert_eq(task_stats(two[0..<0]), 3)
+    var five: [5]TaskStats = [NO_STATS; 5]
+    five[3].index = 77
+    assert_eq(task_stats(five), 3)
+    assert_eq(five[2].index, 2)
+    assert_eq(five[3].index, 77)
+
+@test("a snapshot carries each task's state, suspension, effective priority and stack mark")
+snapshot_rows()
+    port = None
+    scheduler = empty_scheduler()
+    protection = Some(&reserving)
+    reserving.bytes = 16
+    spawn(&switcher, stack_one, &spin, 2, "one")
+    spawn(&switcher, stack_two, &spin, 3, "two")
+    scheduler.running = 0
+    scheduler.inherit(0, 5)
+    scheduler.tasks[1].suspended = true
+    scheduler.stop(1)
+    scheduler.tasks[1].suspended = true
+    var rows: [2]TaskStats = [NO_STATS; 2]
+    assert_eq(task_stats(rows), 2)
+    assert(rows[0].name == "one", "name")
+    assert(rows[0].state == TaskState.Ready, "ready")
+    assert(!rows[0].suspended, "not suspended")
+    assert_eq(rows[0].priority, 5)
+    assert(rows[1].state == TaskState.Stopped, "stopped")
+    assert(rows[1].suspended, "suspended")
+    assert_eq(rows[0].stack_free, 256 - 16 - 32)
+    assert_eq(rows[1].stack_free, stack_high_water(1))
+
+@test("a stack touched to a known depth reports the room left above the reserve")
+touched_depth()
+    port = None
+    scheduler = empty_scheduler()
+    protection = Some(&reserving)
+    reserving.bytes = 16
+    spawn(&switcher, stack_one, &spin, 1, "one")
+    assert_eq(stack_high_water(0), 256 - 16 - 32)
+    for k in 44..<56
+        stack_one[k] = 0
+    assert_eq(stack_high_water(0), 256 - 16 - 80)
+    stack_one[0] = 1
+    stack_one[3] = 1
+    assert_eq(stack_high_water(0), 256 - 16 - 80)
+    stack_one[4] = 1
+    assert_eq(stack_high_water(0), 0)
+
+@test("without protection the whole stack is measured")
+unprotected_stack()
+    port = None
+    scheduler = empty_scheduler()
+    spawn(&switcher, stack_one, &spin, 1, "one")
+    protection = None
+    assert_eq(stack_high_water(0), 256 - 32)
+
+@test("a stopped task's row and stack reused by a new task are measured afresh")
+reused_slot()
+    port = None
+    scheduler = empty_scheduler()
+    protection = Some(&reserving)
+    reserving.bytes = 0
+    spawn(&switcher, stack_one, &spin, 1, "one")
+    spawn(&switcher, stack_two, &spin, 1, "two")
+    for k in 8..<56
+        stack_one[k] = 0
+    assert_eq(stack_high_water(0), 32)
+    scheduler.running = 1
+    scheduler.stop(0)
+    spawn(&switcher, stack_one, &spin, 1, "again")
+    assert_eq(scheduler.count, 2)
+    assert(running_task().name == "two", "the running task is unchanged")
+    assert(scheduler.tasks[0].name == "again", "row 0 reused")
+    assert_eq(stack_high_water(0), 256 - 32)
+
+@test("the high-water mark of a task not in the table is refused", should_trap: "skiff: no such task")
+no_such_task()
+    port = None
+    scheduler = empty_scheduler()
+    val _ = scheduler.add(0, 1)
+    val _ = stack_high_water(1)

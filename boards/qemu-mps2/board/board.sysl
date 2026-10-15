@@ -3,7 +3,7 @@ module board
 import skiff.arch.armv7m
 import skiff.chip.mps2
 import skiff.kernel
-import skiff.kernel.Machine
+import skiff.kernel.{Machine, RunCounter}
 
 // The machine as the kernel sees it: the console is the chip's first UART, and the tick is SysTick on
 // the chip's clock.
@@ -14,6 +14,14 @@ impl Machine for Board
     write(*self, bytes: []const u8) = mps2.write(bytes)
     start_ticks(*self, hz: u32) = armv7m.systick_start(mps2.CLOCK_HZ / hz)
     idle(*self) = armv7m.wait_for_interrupt()
+
+// The kernel's run-time counter: the chip's timer 1, counting the 25 MHz clock (QEMU models no DWT
+// cycle counter).
+struct Cycles
+end Cycles
+
+impl RunCounter for Cycles
+    count(*self) -> u32 = mps2.counter_now()
 
 // Timer 0 interrupts through the NVIC within half a second (at 1 kHz it should take a millisecond).
 timer_interrupt(board: *Board)

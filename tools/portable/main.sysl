@@ -3,7 +3,7 @@
 
 import skiff.kernel
 import sysl.sync.Atomic
-import skiff.kernel.{Doorbell, Flags, Heap, Link, Machine, MessageBuffer, Mutex, NO_OWNER, NotifyAction, Pool, Port, Protection, Queue, RecursiveMutex, Ring, Semaphore, StreamBuffer}
+import skiff.kernel.{RunCounter, Doorbell, Flags, Heap, Link, Machine, MessageBuffer, Mutex, NO_OWNER, NotifyAction, Pool, Port, Protection, Queue, RecursiveMutex, Ring, Semaphore, StreamBuffer}
 
 struct Nothing
 end Nothing
@@ -33,6 +33,14 @@ end NoGuard
 
 impl Protection for NoGuard
     guard(*self, base: usize, bytes: usize) = ()
+    reserved(*self, base: usize, bytes: usize) -> usize = 0
+
+// A counter that never moves.
+struct NoCounter
+end NoCounter
+
+impl RunCounter for NoCounter
+    count(*self) -> u32 = 0
 
 struct Block
     a: u32
@@ -52,6 +60,8 @@ private var bell: NoBell = NoBell()
 private var link: Link[u32, 4] = Link(&ring_out, &ring_in, &bell, Flags(0))
 // So does a `Some` of an address.
 private var first_ring: Option[*Ring[u32, 4]] = Some(&ring_out)
+
+private var counter: NoCounter = NoCounter()
 
 private var pool: Pool[Block, 2] = Pool([Block(0); 2], [false; 2], 2)
 private var heap: Heap = Heap(0, 0)
@@ -112,6 +122,10 @@ private task() -> never
     kernel.suspend(me)
     kernel.resume(me)
     val _ = kernel.resume_from_isr(me) || kernel.suspended(me)
+    var rows: [4]kernel.TaskStats = [kernel.NO_STATS; 4]
+    val _ = kernel.task_stats(rows) + kernel.stack_high_water(me)
+    val _ = kernel.total_run_time() + u64(kernel.idle_permille())
+    kernel.reset_stats()
     kernel.stop(me)
     kernel.sleep_forever()
 
@@ -134,4 +148,5 @@ probe() -> i32
         None -> ()
     kernel.spawn(&p, stack, &task, 1, "task")
     kernel.protect(&g)
+    kernel.measure(&counter)
     kernel.run(&p, idle)

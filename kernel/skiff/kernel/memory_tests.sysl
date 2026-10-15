@@ -131,6 +131,8 @@ impl Protection for Recorder
         self.bytes = bytes
         self.calls += 1
 
+    reserved(*self, base: usize, bytes: usize) -> usize = 0
+
 // A port that builds nothing and switches nothing.
 struct HostPort
 end HostPort

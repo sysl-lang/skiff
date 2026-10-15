@@ -1,0 +1,107 @@
+module board
+
+import sysl.sync.Atomic
+import skiff.arch.armv7m
+import skiff.chip.mps2
+import skiff.kernel
+import skiff.kernel.TaskStats
+
+// The run-time and stack scenarios, after control.sysl's have finished and before memory.sysl's.
+//   - Tick 240, Watcher (7) sets every run time back to 0. From 241 to 244 Burner (5) spins, with nothing
+//     of its priority or above ready, and then sleeps for good. At 246 Watcher takes a snapshot: of the
+//     6 ticks' counts since the reset, Burner must have been charged 3 ticks' worth, give or take half a
+//     tick, and the idle task a share of the rest.
+//   - Tick 247, Diver (4) reads its own stack's high-water mark, recurses 8 deep with 64 bytes of locals
+//     in every frame, and reads it again: it must have dropped by the frames' locals at least and by no
+//     more than `DIVE_MOST` per frame. Diver's own stack is guarded while it scans it, so a scan that
+//     read the guard would stop it.
+
+private var stack_watcher: [256]u32 = [0; 256]
+private var stack_burner: [256]u32 = [0; 256]
+private var stack_diver: [1024]u32 = [0; 1024]
+
+spawn_stats(cortex: *armv7m.Cortex)
+    kernel.spawn(cortex, stack_watcher, &task_watcher, 7, "watcher")
+    kernel.spawn(cortex, stack_burner, &task_burner, 5, "burner")
+    kernel.spawn(cortex, stack_diver, &task_diver, 4, "diver")
+
+// The counter's counts in one tick.
+private const PER_TICK: u64 = u64(mps2.CLOCK_HZ / kernel.TICK_HZ)
+
+// A snapshot of every task, kept out of Watcher's stack.
+private var rows: [kernel.MAX_TASKS]TaskStats = [kernel.NO_STATS; kernel.MAX_TASKS]
+
+private var burner_index: Atomic[u32] = Atomic(0)
+
+private task_watcher() -> never
+    var board = Board()
+    kernel.sleep_until(epoch + 240)
+    kernel.reset_stats()
+    kernel.sleep_until(epoch + 246)
+    val n = kernel.task_stats(rows)
+    val idle_share = kernel.idle_permille()
+    var total: u64 = 0
+    var idle: u64 = 0
+    for i in 0..<n
+        total += rows[i].run_time
+        if rows[i].name == "idle" then idle = rows[i].run_time
+    val burnt = rows[usize(burner_index.load())].run_time
+    val fair = burnt * 2 >= 5 * PER_TICK && burnt * 2 <= 7 * PER_TICK
+    val whole = total * 2 >= 11 * PER_TICK && total * 2 <= 13 * PER_TICK
+    if fair && whole && idle > 0 && idle_share > 0
+        board.write("skiff: a task spinning for 3 of 6 ticks was charged its share, and idle the rest\n".bytes)
+    else
+        board.write("skiff: burner ran ".bytes)
+        kernel.write_dec(&board, u32(burnt))
+        board.write(" of ".bytes)
+        kernel.write_dec(&board, u32(total))
+        board.write(" counts, idle ".bytes)
+        kernel.write_dec(&board, u32(idle))
+        board.write(", idle share ".bytes)
+        kernel.write_dec(&board, idle_share)
+        board.write("\n".bytes)
+    kernel.sleep_forever()
+
+private task_burner() -> never
+    burner_index.store(u32(kernel.running_task().index))
+    kernel.sleep_until(epoch + 241)
+    while kernel.ticks() - epoch < 244
+        ()
+    kernel.sleep_forever()
+
+// How deep Diver recurses, the bytes of locals in each frame, and the most a frame may take in all.
+private const DIVE_DEPTH: u32 = 8
+private const DIVE_LOCALS: usize = 64
+private const DIVE_MOST: usize = 320
+
+// Recurse `depth` more frames, each with 16 words of its own that the next frame reads, so that every
+// frame's words stay on the stack until the frames below it return.
+private dive(depth: u32, above: []const u32) -> u32
+    var here: [16]u32 = [0; 16]
+    for k in 0..<16
+        here[k] = above[k] + depth + u32(k)
+    if depth == 0 then return here[3]
+    dive(depth - 1, here) + here[usize(depth % 16)]
+
+private var dive_result: Atomic[u32] = Atomic(0)
+
+private task_diver() -> never
+    var board = Board()
+    kernel.sleep_until(epoch + 247)
+    val me = kernel.running_task().index
+    val before = kernel.stack_high_water(me)
+    val seed: [16]u32 = [1; 16]
+    dive_result.store(dive(DIVE_DEPTH - 1, seed))
+    val after = kernel.stack_high_water(me)
+    val dropped = if after < before then before - after else 0
+    val least = usize(DIVE_DEPTH) * DIVE_LOCALS
+    val most = usize(DIVE_DEPTH) * DIVE_MOST
+    if after > 0 && after < before && dropped >= least && dropped <= most
+        board.write("skiff: a task recursing 8 deep lowered its stack high-water mark by its frames\n".bytes)
+    else
+        board.write("skiff: diver's high-water mark went from ".bytes)
+        kernel.write_dec(&board, u32(before))
+        board.write(" to ".bytes)
+        kernel.write_dec(&board, u32(after))
+        board.write("\n".bytes)
+    kernel.sleep_forever()

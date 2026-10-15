@@ -136,6 +136,16 @@ is run by hand until a flashing-and-serial harness exists.
 | 9 | Audio: SAI and DMA on the M4 with the board's codec, double-buffered; samples to the M7 through IPC | a WAV file recorded to the SD card plays back correctly on a PC: the recorder's first slice |
 | 10 | Low power: tickless idle, stop mode with a wake source | the idle current drops, measured on the board; timers stay correct across stop |
 
+## Kernel features beside the milestones
+
+| feature | done when |
+|---|---|
+| Task notifications | an interrupt's notification wakes a task at once; set bits, increment, overwrite, no-overwrite ✅ |
+| Stream and message buffers | bytes and framed messages cross the ring's end whole and in order, with a trigger level ✅ |
+| Recursive mutex | nested takes, a refused non-owner give, the hand-over on the last give ✅ |
+| Task control | suspend, resume (from an interrupt too), priorities with inherited boosts, stop, row reuse ✅ |
+| Run-time statistics and stack high-water marks | per-task run time from a board counter (CMSDK timer 1 on QEMU), a total, an idle share, a snapshot with no allocation, reset; painted stacks scanned above the guard ✅ |
+
 ## What skiff reuses rather than writes
 
 - **KFS** (`sysl-lang/kfs` once it leaves keel) and **FAT** (`sh.sysl.fat`): both freestanding, over

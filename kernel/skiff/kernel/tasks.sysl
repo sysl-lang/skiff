@@ -42,8 +42,12 @@ trait Protection
     // Guard the bottom of the stack at `base`, `bytes` long, for the task about to run.
     guard(*self, base: usize, bytes: usize)
 
+    // How many bytes at the bottom of the stack at `base`, `bytes` long, its task can never use: the
+    // guard and anything below it. A stack's high-water mark is measured above them.
+    reserved(*self, base: usize, bytes: usize) -> usize
+
 // How many tasks the table holds, the idle task included.
-const MAX_TASKS: usize = 40
+const MAX_TASKS: usize = 48
 
 // The idle task's priority; every other task's must be higher.
 const IDLE_PRIORITY: u8 = 0
@@ -76,9 +80,10 @@ struct Task
     note: u32           // its notification value (notify.sysl)
     noted: bool         // whether a notification is pending: sent and not yet waited for
     suspended: bool     // never chosen, whatever its state, until resumed (control.sysl)
+    run_time: u64       // counts spent running (stats.sysl)
 
 // An unused row of the table.
-val NO_TASK: Task = Task("", 0, 0, 0, 0, 0, 0, TaskState.Ready, 0, false, 0, false, 0, 0, false, 0, 0, false, false)
+val NO_TASK: Task = Task("", 0, 0, 0, 0, 0, 0, TaskState.Ready, 0, false, 0, false, 0, 0, false, 0, 0, false, false, 0)
 
 // The table and the choices made over it. It holds no hardware state, so the host tests drive one
 // directly; the kernel keeps one of its own, `scheduler`.
@@ -242,7 +247,7 @@ private[kernel] var scheduler: Scheduler = Scheduler([NO_TASK; MAX_TASKS], 0, 0)
 private[kernel] var port: Option[*Port] = None
 
 // The memory protection, if `protect` has named one: every task's stack is guarded while it runs.
-private var protection: Option[*Protection] = None
+private[kernel] var protection: Option[*Protection] = None
 
 // Add a task called `name` that starts at `entry` on `stack`, with `priority` above `IDLE_PRIORITY`.
 // Tasks are added before `run`, or by a running task, which reuses the row of a stopped task if there
@@ -256,6 +261,7 @@ spawn(p: *Port, stack: []u32, entry: *extern() -> never, priority: u8, name: str
     leave(state)
 
 private add_task(p: *Port, stack: []u32, entry: *extern() -> never, priority: u8, name: string) -> usize
+    paint(stack)
     val i = scheduler.add(p.new_context(stack, entry), priority)
     val t = &scheduler.tasks[i]
     t.name = name
@@ -275,6 +281,7 @@ run(p: *Port, idle_stack: []u32) -> never
     port = Some(p)
     val sp = scheduler.first()
     guard_running()
+    start_counting()
     p.start_first(sp)
 
 // Guard the running task's stack, if there is protection.
@@ -292,8 +299,9 @@ private idle_task() -> never
             None -> ()
 
 // Called by the port's switch with the running task's stack pointer; answers the next task's, with its
-// stack guarded.
+// stack guarded. The task switched away from is charged for its run time first.
 switch_context(sp: usize) -> usize
+    charge()
     val next = scheduler.switch(sp)
     guard_running()
     next
@@ -331,7 +339,7 @@ private[kernel] leave(state: u32)
         None -> ()
 
 // Whether `run` has started the tasks.
-private started() -> bool = port match
+private[kernel] started() -> bool = port match
     Some(_) -> true
     None -> false
 
@@ -378,6 +386,8 @@ sleep_forever() -> never
     loop
         sleep(FOREVER)
 
-// After a tick: ask the port for a switch if the scheduler wants one.
+// After a tick: charge the running task, and ask the port for a switch if the scheduler wants one.
 private[kernel] reschedule()
-    if started() && scheduler.tick(ticks()) then request_switch()
+    if !started() then return
+    charge()
+    if scheduler.tick(ticks()) then request_switch()
