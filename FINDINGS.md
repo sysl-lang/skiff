@@ -292,9 +292,10 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
   such an integer is one too", and the alpha.13 fix for finding 5 substitutes a module `val` whose own
   initializer folds. `whole` shows that `PAIR`'s initializer folds, so `named` should too, and so should
   the address of a field through it (the address of a field "at an index the compiler can fold").
-- **Status:** open, reported for the release after alpha.13.
-- **What skiff does:** nothing in place of it. The AN521 board keeps building its link at start-up, as
-  before finding 6 was fixed.
+- **Status:** Fixed in 0.1.1. `&RINGS.to_core1` through the `val` folds.
+- **What skiff does:** the AN521 board declares both cores' link ends as constant data,
+  `Link(&RINGS.to_core1, &RINGS.to_core0, &bell0, Flags(0))` and its mirror, and builds nothing at
+  start-up.
 
 ## 8. A function's address is not constant data
 
@@ -385,9 +386,9 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
 - **What the reference says:** memory.md § "What happens when a slice escapes" promotes "a slice of an
   array **this frame owns**" and a temporary the frame computed. `rows[i].words` is neither: it is module
   storage, which lasts the whole run, so nothing outlives it and nothing needs to move.
-- **Status:** open, reported for the release after alpha.13.
-- **What skiff does:** `isolate_running` takes the row's address first (`val m = &maps[i]`), the form the
-  kernel already uses for table rows (`val t = &scheduler.tasks[i]`).
+- **Status:** Fixed in 0.1.1.
+- **What skiff does:** `isolate_running` passes `maps[i].slots[0..<maps[i].len]` directly. The
+  `val m = &maps[i]` form was dropped: for one use on one line it read no better.
 
 ## 10. An enum's bare variant is not found through the expected type when the enum is another module's
 
@@ -428,9 +429,8 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
 - **What the reference says:** types.md § "A variant belongs to its enum": "What a bare name means is
   settled where it is used, by the type expected there — an argument, an annotated binding, a `return`
   and a field all supply one", and "**The expected type reaches across modules too**".
-- **Status:** open, reported for the release after alpha.13.
-- **What skiff does:** arch/pmsa writes the qualified form, `Err(RegionError.Empty)`, which the
-  reference gives as always valid.
+- **Status:** Fixed in 0.1.1.
+- **What skiff does:** arch/pmsa writes the bare variants, `Err(Empty)`.
 
 ## 11. An array literal passed where a slice is expected is heap-allocated even when the slice stays put
 
@@ -470,6 +470,48 @@ A finding is fixed in sysl, and the entry then says which release fixed it.
 - **What the reference says:** memory.md § "What happens when a slice escapes": a literal that must
   outlive the frame "costs an allocation there and **nothing at a call whose slice stays put**". And
   "Without an allocator it is always a compile error", not a call to a `malloc` the link cannot find.
-- **Status:** open, reported for the release after alpha.13.
-- **What skiff does:** nothing yet. The board scenarios stopped here, before naming each list in a
-  `val` of its own (the long way round), for a decision.
+- **Status:** Fixed in 0.1.1: `probe_literal` allocates nothing, and the images no longer reference
+  `malloc` or `free`. (The `memcpy` and `memset` in the link errors above are a different matter: the
+  standard library's `__aeabi_memcpy`/`__aeabi_memclr` call them, a structure copy reaches those, and
+  ffi.md and types.md say a freestanding board supplies both. The boards now do.)
+- **What skiff does:** the board scenarios and `tools/portable` pass their lists as literals, as
+  written: `spawn_unprivileged(…, [code, shared], [to_echo, from_echo])`.
+
+## 12. A module-level name private to one file stops a pattern binding that name in another
+
+- **What was being written:** the software timers' host tests, whose timers were first named `a`, `b`,
+  `c` at module level in `timer_tests.sysl`.
+- **Shortest input** (`sysl test p2`, 0.1.1 candidate), a package with module `x.m` in two files:
+
+  ```sysl
+  module x.m                       // one.sysl
+
+  pick(o: Option[u32]) -> u32 = o match
+      Some(a) -> a
+      None -> 0
+  ```
+
+  ```sysl
+  module x.m                       // two.sysl
+
+  private val a: u32 = 3
+
+  three() -> u32 = a
+  ```
+
+  ```
+  error: 'a' is a 'val', which is read while the program runs, so a bare name here would bind rather
+  than match — write it as '`a`' to test the value it holds, or bind a different name
+   --> one.sysl:4:10
+  ```
+
+  `one.sysl` cannot name that `a` at all: `four() -> u32 = a + 1` there is refused with "'x.m.a' is
+  private to '…/two.sysl', the file that declares it". The same happens with a `private var a` in a
+  `@tests` file, which the diagnostic also calls a 'val'. A `for b in xs` binding is not affected.
+- **What the reference says:** modules.md § "A file-private name is scoped to its file": a bare
+  `private` "restricts the namespace as well as the reach". The rule that a bare module `val` in a
+  pattern is an error (modules.md, the `static val limit` example) is about a name the pattern's file
+  can see; patterns.md says a bare name that is neither a nullary variant nor a constant binds. A name
+  out of scope in `one.sysl` should leave `Some(a)` a binding.
+- **Status:** open, reported for 0.1.1.
+- **What skiff does:** the timer tests name their timers `ta`, `tb`, `tc`.
