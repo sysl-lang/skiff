@@ -12,7 +12,8 @@ import skiff.board.unprivileged
 // from tick 45 on, are in waits.sysl; the unprivileged tasks, from tick 280, are the
 // skiff.board.unprivileged package's, which every board runs; the memory ones, from tick 300, are in
 // memory.sysl.
-//   - A and B share priority 1 and never yield: each prints a line and then waits for the next tick.
+//   - A and B share priority 1 and, from tick 2, never yield: each prints a line and then waits for
+//     the next tick.
 //     They alternate only because the tick takes turns between them. After three lines each, A
 //     sleeps for good and B spins until tick 40, never giving up the processor of its own accord.
 //   - P1 and P2, at priority 2, sleep for 15 ticks and then preempt B. Each fills s16-s31 with its own
@@ -72,11 +73,17 @@ run_tasks() -> never
 private task_a() -> never = take_turns("skiff: task A ", false)
 private task_b() -> never = take_turns("skiff: task B ", true)
 
-// Three lines, each followed by a wait for the next tick, then sleep for good, or spin until tick 40
-// first.
+// Both wait for tick 2, then print three lines, each followed by a wait for the next tick, then sleep
+// for good, or spin until tick 40 first.
+//
+// Tick 2 is a boundary both are woken on together, while nothing else is ready but the idle task, so
+// A, first in the table, has the first slice and a whole tick for its first line, as every later line
+// has. Started straight away instead, A's first slice would be whatever was left of the tick the tasks
+// started in, and a tick landing in it would hand the first line to B. The tasks have started well
+// before tick 2: everything between `epoch` and the first task takes a fraction of a tick.
 private take_turns(label: string, spin: bool) -> never
     var board = Board()
-    val start = kernel.ticks()
+    kernel.sleep_until(epoch + 2)
     for n in 1u32..3
         board.write(label.bytes)
         kernel.write_dec(&board, n)
@@ -85,7 +92,7 @@ private take_turns(label: string, spin: bool) -> never
         while kernel.ticks() == t
             ()
     if spin
-        while kernel.ticks() - start < 40
+        while kernel.ticks() - epoch < 40
             ()
     kernel.sleep_forever()
 
