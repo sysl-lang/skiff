@@ -1,42 +1,82 @@
 // skiff on QEMU's MPS2 AN521: one image, run by both Cortex-M33 cores. Both enter `_start`
 // (skiff.chip.an521) and then `skiff_main`, and tell themselves apart by core number. Core 0 releases
-// core 1 and, once core 1 has greeted and said so, stops the machine with status 0.
+// core 1, and each core greets and watches three of its own ticks. Then core 1 takes a fault on purpose,
+// which stops it alone. Core 0 sees it stopped, ticks on, checks that the time base counted its ticks
+// and no others, and stops the machine with status 0.
 
 import skiff.arch.armv7m
 import skiff.chip.an521
 import skiff.kernel
 import skiff.kernel.Machine
-import sysl.sync.{Atomic, Ordering}
 
-// Where core 0 sees that core 1 has finished: 1 once it has. It is in `.bss`, which core 0 clears before
-// it releases core 1.
-private var core1_done: Atomic[u32] = Atomic(0)
+// The bounds of `.shared`, from the link script.
+extern __shared_start: u8
+extern __shared_end: u8
 
 // The address of the vector table, at the start of the image, which core 1 is told to start from.
 private const VECTORS: usize = 0x1000_0000
 
-// The machine as the kernel sees it: two cores, each with the UART of its own number as its console.
+// An address with nothing behind it in the AN521's map: a load from it is a BusFault.
+private const NOWHERE: usize = 0xF000_0000
+
+private struct Word
+    v: volatile u32
+
+// The machine as the kernel sees it: two cores, each with the UART of its own number as its console and
+// its own SysTick as its tick.
 struct Board
 end Board
 
 impl Machine for Board
     write(*self, bytes: []const u8) = an521.write(an521.core_id(), bytes)
     cores(*self) -> u32 = 2
-    core(*self) -> u32 = an521.core_id()
+    core_id(*self) -> u32 = an521.core_id()
+    start_ticks(*self, hz: u32) = armv7m.systick_start(an521.CLOCK_HZ / hz)
+    idle(*self) = armv7m.wait_for_interrupt()
 
 @export("skiff_main")
 skiff_main() -> never
     val me = an521.core_id()
     if me == 0 then an521.release_core1(VECTORS)
     an521.console_init(me)
+    armv7m.enable_faults()
     var board = Board()
     val status = kernel.boot(&board)
+    if me == 0 && kernel.shared_within(usize(&__shared_start), usize(&__shared_end))
+        board.write("skiff: .shared holds the shared state\n".bytes)
+    kernel.start(&board)
+    for _ in 0..<3
+        val n = kernel.await_tick(&board)
+        board.write("skiff: core ".bytes)
+        kernel.write_dec(&board, me)
+        board.write(" tick ".bytes)
+        kernel.write_dec(&board, n)
+        board.write("\n".bytes)
     if me == 1
-        core1_done.store(1, Ordering.Release)
-        loop
-            armv7m.wait_for_interrupt()
-    while core1_done.load(Ordering.Acquire) == 0 do ()
+        val nothing: *Word = ptr_cast(NOWHERE)
+        kernel.write_hex(&board, nothing.v)
+    while !kernel.stopped(1) do kernel.await_tick(&board)
+    board.write("skiff: core 0 sees core 1 stopped\n".bytes)
+    for _ in 0..<3
+        kernel.await_tick(&board)
+    board.write("skiff: core 0 ticks on\n".bytes)
+    if kernel.ticks() == kernel.here(&board).own_ticks()
+        board.write("skiff: core 0 time base agrees\n".bytes)
     armv7m.halt(status)
+
+// SysTick, on either core: one tick for the kernel on that core.
+@export("skiff_systick")
+board_tick()
+    var board = Board()
+    kernel.tick(&board)
+
+// A fault stops only the core that took it, once the kernel has reported it on that core's console. The
+// other core runs on.
+@export("skiff_fault")
+board_fault(exception: u32) -> never
+    var board = Board()
+    kernel.fault(&board, armv7m.exception_name(exception))
+    armv7m.stop_core()
 
 @export("putchar")
 putchar(c: int) -> int

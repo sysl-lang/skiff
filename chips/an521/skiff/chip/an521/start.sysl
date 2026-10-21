@@ -5,7 +5,7 @@ module skiff.chip.an521
 // and
 //   - takes the top of its own stack, `_stack_top0` or `_stack_top1` from the link script;
 //   - grants itself the FPU (CPACR CP10/CP11 full access; the register is per core);
-//   - core 0 alone zeroes `.bss`, since core 1 is held in reset until core 0 releases it
+//   - core 0 alone zeroes `.bss` and `.shared`, since core 1 is held in reset until core 0 releases it
 //     (`release_core1`, sysctl.sysl) and may not touch what core 0 is clearing. `.data` needs no copy:
 //     the image is loaded into RAM where it runs;
 //   - calls `skiff_main`, which the board program exports and both cores run.
@@ -31,13 +31,19 @@ asm
         "isb"
         "cmp r4, #0"
         "bne 2f"
+        "movs r2, #0"
         "ldr r0, =__bss_start"
         "ldr r1, =__bss_end"
-        "movs r2, #0"
         "1: cmp r0, r1"
-        "beq 2f"
+        "beq 6f"
         "str r2, [r0], #4"
         "b 1b"
+        "6: ldr r0, =__shared_start"
+        "ldr r1, =__shared_end"
+        "7: cmp r0, r1"
+        "beq 2f"
+        "str r2, [r0], #4"
+        "b 7b"
         "2: bl skiff_main"
         "3: b 3b"
         ".ltorg"

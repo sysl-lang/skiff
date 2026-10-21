@@ -1,0 +1,24 @@
+module skiff.arch.armv7m
+
+// The tick on an Armv7-M core: SysTick, counting down on the processor clock and interrupting each time it
+// reaches zero. Each core has its own. Its exception goes to `skiff_systick` (vectors.sysl).
+
+private struct SysTick
+    csr: volatile u32           // 0xE000_E010 control and status
+    rvr: volatile u32           // 0x14 reload value
+    cvr: volatile u32           // 0x18 current value
+
+private const SYSTICK: usize = 0xE000_E010
+private const CSR_ENABLE: u32 = 1 << 0
+private const CSR_TICKINT: u32 = 1 << 1
+private const CSR_CLKSOURCE: u32 = 1 << 2      // the processor clock, not the external reference
+
+// Interrupt the running core every `cycles` processor cycles from now on. The reload register holds 24
+// bits, so a tick is at most 2^24 cycles long.
+systick_start(cycles: u32)
+    if cycles == 0 || cycles > 0x100_0000 then panic("skiff: a SysTick period outside 1 to 2^24 cycles")
+    val t: *SysTick = ptr_cast(SYSTICK)
+    t.csr = 0
+    t.rvr = cycles - 1
+    t.cvr = 0
+    t.csr = CSR_ENABLE | CSR_TICKINT | CSR_CLKSOURCE

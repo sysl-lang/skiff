@@ -24,6 +24,15 @@ SECTIONS {
     __bss_end = .;
   } > CODE
 
+  /* Everything another core can reach (the kernel's DESIGN.md, "The rule everything follows"). Core 0
+   * zeroes it with `.bss`, before it releases core 1. */
+  .shared (NOLOAD) : ALIGN(16) {
+    __shared_start = .;
+    KEEP(*(.shared*))
+    . = ALIGN(4);
+    __shared_end = .;
+  } > CODE
+
   /* The top of 1 MiB for core 0 and the top of the 2 MiB for core 1. The vector table's first word,
    * the stack pointer a core reads from it, is core 0's. */
   _stack_top0 = ORIGIN(CODE) + LENGTH(CODE) / 2;

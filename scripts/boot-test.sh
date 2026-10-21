@@ -16,13 +16,33 @@ limit=${SKIFF_TIMEOUT:-10}
 scratch="$root/scratch"
 mkdir -p "$scratch"
 
-# What each console must print. The MPS2 boots are one core and end through semihosting with status 0.
-mps2_expected="skiff: hello"
+# What each console must print. The MPS2 boots are one core: it finds the kernel's shared state inside
+# the link script's `.shared`, takes three ticks, finds the time base agreeing with its own count, and
+# ends through semihosting with status 0.
+mps2_expected="skiff: hello
+skiff: .shared holds the shared state
+skiff: core 0 tick 1
+skiff: core 0 tick 2
+skiff: core 0 tick 3
+skiff: core 0 time base agrees"
 
-# The AN521's two cores run one image, each greeting on the UART of its own number. Core 0 stops the
-# machine with status 0 once core 1 has greeted and said so.
-an521_core0_expected="skiff: hello from core 0"
-an521_core1_expected="skiff: hello from core 1"
+# The AN521's two cores run one image, each greeting and ticking on the UART of its own number. Core 1
+# then faults on purpose: it reports the fault on its own console and stops. Core 0 sees it stopped,
+# takes more ticks, finds that the time base counted its own ticks and none of core 1's, and stops the
+# machine with status 0.
+an521_core0_expected="skiff: hello from core 0
+skiff: .shared holds the shared state
+skiff: core 0 tick 1
+skiff: core 0 tick 2
+skiff: core 0 tick 3
+skiff: core 0 sees core 1 stopped
+skiff: core 0 ticks on
+skiff: core 0 time base agrees"
+an521_core1_expected="skiff: hello from core 1
+skiff: core 1 tick 1
+skiff: core 1 tick 2
+skiff: core 1 tick 3
+skiff: core 1 fault BusFault"
 
 failed=0
 

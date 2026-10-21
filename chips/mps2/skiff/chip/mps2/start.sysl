@@ -7,7 +7,7 @@ module skiff.chip.mps2
 //   - It grants the FPU (CPACR CP10/CP11 full access) before anything can use it. A hard-float build may
 //     use VFP registers anywhere, and a Cortex-M denies them until this write. On a core with no FPU the
 //     bits ignore writes.
-//   - It zeroes `.bss`, which on a bare machine nobody else does. `.data` needs no copy: the image is
+//   - It zeroes `.bss` and `.shared`, which on a bare machine nobody else does. `.data` needs no copy: the image is
 //     loaded into RAM where it runs.
 //   - It calls `skiff_main`, which the board program exports.
 asm
@@ -24,14 +24,23 @@ asm
         "str r1, [r0]"
         "dsb"
         "isb"
+        "movs r2, #0"
         "ldr r0, =__bss_start"
         "ldr r1, =__bss_end"
-        "movs r2, #0"
         "1: cmp r0, r1"
-        "beq 2f"
+        "beq 4f"
         "str r2, [r0], #4"
         "b 1b"
+        "4: ldr r0, =__shared_start"
+        "ldr r1, =__shared_end"
+        "5: cmp r0, r1"
+        "beq 2f"
+        "str r2, [r0], #4"
+        "b 5b"
         "2: bl skiff_main"
         "3: b 3b"
         ".ltorg"
     [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.mps2 is for Armv7-M cores"
+
+// The clock the core and SysTick run on: QEMU's MPS2 SYSCLK.
+const CLOCK_HZ: u32 = 25_000_000

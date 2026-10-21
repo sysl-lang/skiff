@@ -1,0 +1,58 @@
+module skiff.arch.armv7m
+
+// Faults. Each of the four has its own entry in the vector table, and each entry hands the exception's
+// number to `skiff_fault`, which the board exports: only the board knows its console and whether a fault
+// stops the machine or only the core that took it. The processor has already saved the caller-saved
+// registers on entry, so an ordinary function is a correct handler.
+
+private struct Word
+    v: volatile u32
+
+// SHCSR, the System Handler Control and State Register. Each core has its own.
+private const SHCSR: usize = 0xE000_ED24
+private const MEMFAULTENA: u32 = 1 << 16
+private const BUSFAULTENA: u32 = 1 << 17
+private const USGFAULTENA: u32 = 1 << 18
+
+private const HARDFAULT: u32 = 3
+private const MEMMANAGE: u32 = 4
+private const BUSFAULT: u32 = 5
+private const USAGEFAULT: u32 = 6
+
+// The board's fault handler: report the fault with exception number `exception` and stop.
+extern "skiff_fault" board_fault(exception: u32) -> never
+
+// Give the running core's MemManage, BusFault and UsageFault their own handlers. Left off, each arrives
+// as a HardFault.
+enable_faults()
+    val shcsr: *Word = ptr_cast(SHCSR)
+    shcsr.v = shcsr.v | MEMFAULTENA | BUSFAULTENA | USGFAULTENA
+
+@export("skiff_hardfault")
+hardfault() -> never = board_fault(HARDFAULT)
+
+@export("skiff_memmanage")
+memmanage() -> never = board_fault(MEMMANAGE)
+
+@export("skiff_busfault")
+busfault() -> never = board_fault(BUSFAULT)
+
+@export("skiff_usagefault")
+usagefault() -> never = board_fault(USAGEFAULT)
+
+// The name of exception `n`, as a fault report reads it.
+exception_name(n: u32) -> string = n match
+    3 -> "HardFault"
+    4 -> "MemManage"
+    5 -> "BusFault"
+    6 -> "UsageFault"
+    _ -> "exception"
+
+// Stop the running core for good and leave the others running: no interrupt is taken again, and the
+// core sleeps.
+stop_core() -> never
+    asm
+        [thumb] "cpsid i"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+    loop
+        wait_for_interrupt()

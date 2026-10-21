@@ -1,5 +1,5 @@
 // skiff on QEMU's MPS2 AN521: one image that both Cortex-M33 cores run. Core 0 starts first, clears
-// `.bss` and releases core 1; each core greets on its own UART.
+// `.bss` and `.shared` and releases core 1; each core greets on its own UART and ticks on its own SysTick.
 
 package {
   name    = "qemu-an521"
@@ -7,7 +7,7 @@ package {
 }
 
 dependencies {
-  kernel { workspace = true }
+  kernel { workspace = true, options = { cores = 2 } }
   armv7m { workspace = true }
   an521 { workspace = true }
 }

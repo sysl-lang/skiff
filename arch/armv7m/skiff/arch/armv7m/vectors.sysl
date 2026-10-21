@@ -5,8 +5,12 @@ module skiff.arch.armv7m
 // The table's first sixteen words are the architecture's: the initial stack pointer, the reset handler,
 // then the system exceptions. The chip's interrupts, when it has any, follow in `.vectors.irq`, which
 // belongs to the chip package; the board's link script puts that section straight after this one.
-// Every system exception goes to `skiff_exception`, so a fault stops the machine with `FAULT_STATUS`
-// where, with no handler, it would escalate to a HardFault and lock the core up somewhere meaningless.
+//   - The four faults go to their own entries (faults.sysl), which hand the board the exception's number.
+//   - SysTick goes to `skiff_systick`, which the board exports: it calls the kernel's tick with the
+//     board's machine.
+//   - Every other system exception goes to `skiff_exception`, so it stops the machine with
+//     `FAULT_STATUS` where, with no handler, it would escalate to a HardFault and lock the core up
+//     somewhere meaningless.
 //
 // `.word _start`, not `_start + 1`: the linker already sets the Thumb bit on a Thumb function symbol.
 // The section is opened in the assembly with its `"a"` flag: the assembler takes a section's flags from
@@ -17,10 +21,10 @@ asm
         ".word _stack_top"
         ".word _start"
         ".word skiff_exception"     // NMI
-        ".word skiff_exception"     // HardFault
-        ".word skiff_exception"     // MemManage
-        ".word skiff_exception"     // BusFault
-        ".word skiff_exception"     // UsageFault
+        ".word skiff_hardfault"
+        ".word skiff_memmanage"
+        ".word skiff_busfault"
+        ".word skiff_usagefault"
         ".word 0"
         ".word 0"
         ".word 0"
@@ -29,7 +33,7 @@ asm
         ".word skiff_exception"     // DebugMonitor
         ".word 0"
         ".word skiff_exception"     // PendSV
-        ".word skiff_exception"     // SysTick
+        ".word skiff_systick"
         ".text"
     [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
 

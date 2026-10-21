@@ -32,5 +32,15 @@ SECTIONS {
     __bss_end = .;
   } > CODE
 
+  /* Everything another core could reach (the kernel's DESIGN.md, "The rule everything follows"). With
+   * one core it is ordinary memory, kept in its own section so that every board lays it out the same
+   * way. The reset handler zeroes it with `.bss`. */
+  .shared (NOLOAD) : ALIGN(16) {
+    __shared_start = .;
+    KEEP(*(.shared*))
+    . = ALIGN(4);
+    __shared_end = .;
+  } > CODE
+
   _stack_top = ORIGIN(CODE) + LENGTH(CODE);
 }

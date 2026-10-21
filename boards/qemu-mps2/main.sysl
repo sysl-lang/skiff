@@ -1,26 +1,58 @@
 // skiff on QEMU's MPS2 AN500 and AN386: the kernel over the armv7m arch package and the mps2 chip.
-// It boots, then stops the machine with the status `boot` answers.
+// It boots, checks that the kernel's shared state is in `.shared`, watches three ticks and checks that
+// the time base kept count of them, then stops the machine with the status `boot` answers.
 
 import skiff.arch.armv7m
 import skiff.chip.mps2
 import skiff.kernel
 import skiff.kernel.Machine
 
-// The machine as the kernel sees it: one core, the first UART as its console.
+// The bounds of `.shared`, from the link script.
+extern __shared_start: u8
+extern __shared_end: u8
+
+// The machine as the kernel sees it: one core, the first UART as its console, SysTick as its tick.
 struct Board
 end Board
 
 impl Machine for Board
     write(*self, bytes: []const u8) = mps2.write(bytes)
     cores(*self) -> u32 = 1
-    core(*self) -> u32 = 0
+    core_id(*self) -> u32 = 0
+    start_ticks(*self, hz: u32) = armv7m.systick_start(mps2.CLOCK_HZ / hz)
+    idle(*self) = armv7m.wait_for_interrupt()
 
-// Called by the chip's reset handler once there is a stack and `.bss` is zero.
+// Called by the chip's reset handler once there is a stack and `.bss` and `.shared` are zero.
 @export("skiff_main")
 skiff_main() -> never
     mps2.console_init()
+    armv7m.enable_faults()
     var board = Board()
-    armv7m.halt(kernel.boot(&board))
+    val status = kernel.boot(&board)
+    if kernel.shared_within(usize(&__shared_start), usize(&__shared_end))
+        board.write("skiff: .shared holds the shared state\n".bytes)
+    kernel.start(&board)
+    for _ in 0..<3
+        val n = kernel.await_tick(&board)
+        board.write("skiff: core 0 tick ".bytes)
+        kernel.write_dec(&board, n)
+        board.write("\n".bytes)
+    if kernel.ticks() == kernel.here(&board).own_ticks()
+        board.write("skiff: core 0 time base agrees\n".bytes)
+    armv7m.halt(status)
+
+// SysTick: one tick for the kernel.
+@export("skiff_systick")
+board_tick()
+    var board = Board()
+    kernel.tick(&board)
+
+// A fault on the one core stops the machine, with `FAULT_STATUS`, once the kernel has reported it.
+@export("skiff_fault")
+board_fault(exception: u32) -> never
+    var board = Board()
+    kernel.fault(&board, armv7m.exception_name(exception))
+    armv7m.halt(armv7m.FAULT_STATUS)
 
 // The standard library's `print` writes through C's `putchar`, and a freestanding image has no C library
 // to supply it, so the console does.
