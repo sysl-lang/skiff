@@ -108,12 +108,11 @@ defect that must make it fail.
 | 2 | Tasks: per-core schedulers, generation handles, tables sized by `options` (sysl 0.3.7) | interleave, preempt and FP-survival scenarios on every core; a stale handle is refused |
 | 3 | Waits and locks: the wait queue, the lock trait, semaphore, mutex with inheritance, queue, flags, notifications | the skiff-old scenarios pass on one core; on the AN521 each object is given on one core and taken on the other |
 | 4 | Cross-core wakes: inboxes and doorbells; channels and the buffer pool | a priority-inversion scenario across cores completes in bounded time; buffers round-trip without a copy |
-| 5 | Protection: stack and null guards, unprivileged tasks with their own maps and kernel calls | the skiff-old protection scenarios, on every core |
-| 6 | Two images: the system description, ownership checked at build, the fingerprint handshake | the AN521 boots two images; mismatched layouts stop at the handshake |
-| 7 | The rest of the kernel on the wait queue: software timers, stream and message buffers, task control, statistics and stack high-water marks | skiff-old's scenarios for each |
-| 8 | Pico 2: `chips/rp2350`, `boards/pico2`, UF2 | the cross-core scenarios on the board |
-| 9 | The H747I-DISCO: clocks and power, HSEM, both images flashed, caches with the cache trait | milestones 4 and 6 on the board, caches on |
+| 5 | Pico 2, the first real silicon: `chips/rp2350`, `boards/pico2` (one image, both M33s), the SIO FIFO doorbell, the lock (spinlocks or exclusives, per erratum E2), UF2 | milestones 1–4's scenarios pass on the board |
+| 6 | Protection: stack and null guards, unprivileged tasks with their own maps and kernel calls | the skiff-old protection scenarios, on every core, the Pico 2 included |
+| 7 | Two images: the system description, ownership checked at build, the fingerprint handshake | the AN521 boots two images; mismatched layouts stop at the handshake |
+| 8 | The rest of the kernel on the wait queue: software timers, stream and message buffers, task control, statistics and stack high-water marks | skiff-old's scenarios for each |
+| 9 | The H747I-DISCO (needs the board): clocks and power, HSEM, both images flashed, caches with the cache trait | milestones 4 and 7 on the board, caches on |
 | 10 | Supervision and power: a watchdog per core, faults forwarded, one console, tickless idle, coordinated stop | a hung core is noticed; both cores enter Stop and wake |
 
-Milestones 0 and 1 can start before sysl 0.3.7; 2 on needs `options`, and 6 needs the explicit
-type-argument fix (both 0.3.7).
+Every milestone waits for sysl 0.3.7: 2 on needs `options`, and 7 needs the explicit type-argument fix.
