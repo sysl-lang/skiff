@@ -51,8 +51,13 @@ What that asks of the kernel:
 - **A wake on another core goes through that core's inbox.** The waker posts to the target core's
   lock-free inbox and rings its doorbell; a core never edits another core's ready set. The same path
   serves one image and two.
-- **Data both cores touch is placed, not assumed.** Kernel state shared across cores lives in a section
-  the board maps uncached on a core with a data cache (the M7); a core without one ignores it.
+- **The `.shared` rule (from milestone 1): anything another core can reach lives in `.shared` and names
+  tasks by handle, never by pointer.** That is the inboxes, every object usable from more than one core,
+  and its waiter records; a wake on another core always goes through that core's inbox. In one image
+  `.shared` is an ordinary section the board maps uncached on a core with a data cache (the M7). In two
+  images both link scripts place it at the same address, so the kernel's code is the same in both builds
+  and the two-image option stays a build setting. A pointer from `.shared` into a core's own memory
+  would make the option a rewrite; the review of every kernel change checks for one.
 - **One time base.** Timeouts that cross cores need one clock: a timer every core can read, or the tick
   from one core.
 
@@ -114,14 +119,14 @@ defect that must make it fail.
 | # | Milestone | Done when |
 |---|---|---|
 | 0 | The workspace, the gate, and boot on every QEMU machine: the arch and chip packages ported from skiff-old, an AN521 image that boots both cores and tells them apart | `skiff: hello` from the AN500, the AN386 and both AN521 cores; the controls fail |
-| 1 | Cores: the `Core` instance, ticks and faults per core, one time base | ticks on every core; a fault on one core is reported and the other runs on |
+| 1 | Cores: the `Core` instance, ticks and faults per core, one time base, the `.shared` section and its rule | ticks on every core; a fault on one core is reported and the other runs on; the inboxes are in `.shared` |
 | 2 | Tasks: per-core schedulers, generation handles, tables sized by `options` (sysl 0.3.7) | interleave, preempt and FP-survival scenarios on every core; a stale handle is refused |
 | 3 | Waits and locks: the wait queue, the lock trait, semaphore, mutex with inheritance, queue, flags, notifications | the skiff-old scenarios pass on one core; on the AN521 each object is given on one core and taken on the other |
 | 4 | Cross-core wakes: inboxes and doorbells; channels and the buffer pool | a priority-inversion scenario across cores completes in bounded time; buffers round-trip without a copy |
 | 5 | Pico 2, the first real silicon: `chips/rp2350`, `boards/pico2` (one image, both M33s), the SIO FIFO doorbell, the lock (spinlocks or exclusives, per erratum E2), UF2 | milestones 1–4's scenarios pass on the board |
 | 6 | Protection: stack and null guards, unprivileged tasks with their own maps and kernel calls | the skiff-old protection scenarios, on every core, the Pico 2 included |
 | 7 | The rest of the kernel on the wait queue: software timers, stream and message buffers, task control, statistics and stack high-water marks | skiff-old's scenarios for each |
-| 8 | Two images, the option: the system description, ownership checked at build, the fingerprint handshake | the AN521 boots two images; mismatched layouts stop at the handshake |
+| 8 | Two images, the option: board features (`split`, one per image) with `#if feature_…` choosing each image's tasks, a link script per image with `.shared` at one address, the system description, ownership checked at build, the fingerprint handshake | the AN521 boots two images from one board program; mismatched layouts stop at the handshake. First check that a link script can differ by feature; if not, that is a sysl finding |
 | 9 | The H747I-DISCO (needs the board): clocks and power, HSEM, one image on both cores with shared state uncached on the M7, then the two-image build with the cache trait | milestone 4's scenarios on the board in both builds, caches on |
 | 10 | Supervision and power: a watchdog per core, faults forwarded, one console, tickless idle, coordinated stop | a hung core is noticed; both cores enter Stop and wake |
 
