@@ -72,8 +72,8 @@ skiff_main() -> never
 
 private task_a() -> never = scenarios.take_turns(&Board(), "A", false)
 private task_b() -> never = scenarios.take_turns(&Board(), "B", true)
-private task_p1() -> never = scenarios.fp_task(&Board(), 0x1000, armv7m.has_fpu(), &entries)
-private task_p2() -> never = scenarios.fp_task(&Board(), 0x2000, armv7m.has_fpu(), &entries)
+private task_p1() -> never = scenarios.fp_task(&Board(), 0x1000, &entries)
+private task_p2() -> never = scenarios.fp_task(&Board(), 0x2000, &entries)
 private task_h() -> never = scenarios.wake_on_time(&Board())
 private meet() = scenarios.meet(&Board())
 

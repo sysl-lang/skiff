@@ -1,5 +1,6 @@
 // skiff on QEMU's MPS2 AN521: one image that both Cortex-M33 cores run. Core 0 starts first, clears
 // `.bss` and `.shared` and releases core 1; each core greets on its own UART and ticks on its own SysTick.
+// The image is built for no floating-point registers, since core 0 of the SSE-200 has none.
 
 package {
   name    = "qemu-an521"
@@ -14,7 +15,7 @@ dependencies {
 }
 
 targets {
-  thumb-freestanding {
+  thumb-freestanding-soft {
     linker_script = "link.ld"
     entry         = "_start"
   }

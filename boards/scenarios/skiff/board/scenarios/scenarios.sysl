@@ -13,7 +13,8 @@ import skiff.kernel.{Port, Task, TaskError, TaskState}
 //     between them. Then A exits, and B spins until tick 40 without ever giving up the processor.
 //   - P1 and P2, at priority 2, sleep until tick 15 and then preempt B. Each fills s16-s31 with its own
 //     values and yields to the other, which does the same, before checking that its own are intact. So
-//     the switch must keep the FPU registers a task uses. A core with no FPU says so instead.
+//     the switch must keep the FPU registers a task uses. A build with no floating-point registers
+//     creates neither.
 //   - H, at priority 3, sleeps until tick 30 and must run on the owner's tick that wakes it, although B
 //     never yields: B, asking H's state as it spins, must never find H ready.
 //   - R, at priority 4, at tick 45: A's handle, kept since A was created, is refused now that A has
@@ -53,8 +54,10 @@ private var kept: [kernel.CORES]Atomic[u32]
 create_tasks[P: Port](p: *P, core: u32, e: *Entries)
     handles[core] = created(kernel.create(p, core, stacks[core][0], e.a, 1))
     val _ = created(kernel.create(p, core, stacks[core][1], e.b, 1))
+#if fpu
     val _ = created(kernel.create(p, core, stacks[core][2], e.p1, 2))
     val _ = created(kernel.create(p, core, stacks[core][3], e.p2, 2))
+#endif
     high[core] = created(kernel.create(p, core, stacks[core][4], e.h, 3))
     val _ = created(kernel.create(p, core, stacks[core][5], e.r, 4))
 
@@ -88,7 +91,9 @@ take_turns[P: Port](p: *P, label: string, spin: bool) -> never
 
 // FPU registers through switches: `skiff_fp_probe` (below) writes `base`, `base + 1`, … into s16-s31,
 // calls `meet`, and answers how many of the sixteen still hold their value.
+#if fpu
 extern "skiff_fp_probe" fp_probe(base: u32, meet: *extern() -> unit) -> u32
+#endif
 
 // P1 and P2 meet here with their registers filled. Each yields at least once, and the first to arrive
 // keeps yielding until the second has, so each is switched out while the other's values are in the
@@ -100,23 +105,24 @@ meet[P: Port](p: *P)
     while arrived[me].load() < 2 do kernel.yield_now(p)
 
 // P1 and P2: at tick 15, fill the registers, meet, and count what survived. The second to finish
-// reports for both. On a core with no FPU (`fpu` false) there is nothing to fill, and that is reported
-// instead.
-fp_task[P: Port](p: *P, base: u32, fpu: bool, e: *Entries) -> never
+// reports for both. A build for a target with no floating-point registers creates neither task, and
+// has no probe to run.
+fp_task[P: Port](p: *P, base: u32, e: *Entries) -> never
+#if fpu
     val me = kernel.here_id(p)
     kernel.sleep_until(p, epochs[me] + 15)
-    if fpu
-        val _ = kept[me].add(fp_probe(base, e.meet))
+    val _ = kept[me].add(fp_probe(base, e.meet))
     if finished[me].add(1) == 1
-        if !fpu
-            say(p, "has no FPU\n")
-        else if kept[me].load() == 32
+        if kept[me].load() == 32
             say(p, "f32 registers survived the switches\n")
         else
             say(p, "f32 registers kept: ")
             kernel.write_dec(p, kept[me].load())
             p.write(" of 32\n".bytes)
     kernel.exit(p)
+#else
+    panic("skiff: this build has no floating-point registers to check")
+#endif
 
 // H: sleep until tick 30 and check that it ran on the owner's tick that woke it. B, which never yields,
 // asks for H's state all the while it spins: had it ever found H ready, H was waiting while B ran. The
@@ -161,6 +167,7 @@ private say[P: Port](p: *P, text: string)
     p.write(text.bytes)
 
 // s16-s31 are callee-saved, so the probe saves the caller's values and puts them back at the end.
+#if fpu
 asm
     [thumb]
         ".syntax unified"
@@ -189,3 +196,4 @@ asm
         "vpop {{s16-s31}}"
         "pop {{r4, r5, r6, pc}}"
     [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the probe is Armv7-M assembly"
+#endif

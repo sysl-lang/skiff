@@ -21,15 +21,16 @@ mkdir -p "$scratch"
 # runs the scenarios' tasks (boards/scenarios): two equal tasks taking turns on the tick, two keeping
 # their FPU registers across switches, a high-priority task running on the tick its sleep ends, and a
 # stale handle refused. It ends through semihosting with status 0.
+# tasks_expected <core> [<line the FPU tasks print>]: a build with no FPU registers has no such line.
 tasks_expected() {
     echo "skiff: core $1 task A 1
 skiff: core $1 task B 1
 skiff: core $1 task A 2
 skiff: core $1 task B 2
 skiff: core $1 task A 3
-skiff: core $1 task B 3
-skiff: core $1 $2
-skiff: core $1 high priority task ran on the tick that woke it
+skiff: core $1 task B 3"
+    if [ -n "${2:-}" ]; then echo "skiff: core $1 $2"; fi
+    echo "skiff: core $1 high priority task ran on the tick that woke it
 skiff: core $1 refuses a stale handle"
 }
 mps2_expected="skiff: hello
@@ -42,7 +43,8 @@ $(tasks_expected 0 "f32 registers survived the switches")"
 
 # The AN521's two cores run one image, each greeting and ticking on the UART of its own number, then
 # running its own tasks at once with the other. Core 0 has no FPU (the SSE-200's CPU0, in QEMU as on
-# the FPGA image), so only core 1 checks the FPU registers; core 0 may not create a task on core 1 once
+# the FPGA image), and one image serves both cores, so the image is built with no FPU registers and
+# neither core checks them; core 0 may not create a task on core 1 once
 # it runs. Core 1 then faults on purpose: it reports the fault on its own console and stops. Core 0 sees
 # it stopped, takes more ticks, finds that the time base counted its own ticks and none of core 1's, and
 # stops the machine with status 0.
@@ -51,7 +53,7 @@ skiff: .shared holds the shared state
 skiff: core 0 tick 1
 skiff: core 0 tick 2
 skiff: core 0 tick 3
-$(tasks_expected 0 "has no FPU")
+$(tasks_expected 0)
 skiff: core 0 may not create a task on core 1, which runs
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
@@ -60,7 +62,7 @@ an521_core1_expected="skiff: hello from core 1
 skiff: core 1 tick 1
 skiff: core 1 tick 2
 skiff: core 1 tick 3
-$(tasks_expected 1 "f32 registers survived the switches")
+$(tasks_expected 1)
 skiff: core 1 fault BusFault"
 
 failed=0
@@ -140,7 +142,7 @@ verdict mps2-an386 0
 # The AN521: one image run by both cores, under multi-threaded TCG so that the cores really run at once.
 # Core 0's console, UART0, is QEMU's stdio; core 1's, UART1, goes to a file of its own.
 image="$scratch/qemu-an521.elf"
-build thumb-freestanding qemu-an521 "$image"
+build thumb-freestanding-soft qemu-an521 "$image"
 rm -f "$scratch/an521-core1.log"
 run "$scratch/an521-core0.log" -M mps2-an521 -accel tcg,thread=multi -kernel "$image" \
     -serial mon:stdio -serial file:"$scratch/an521-core1.log"

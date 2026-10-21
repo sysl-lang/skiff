@@ -14,7 +14,8 @@ module skiff.arch.armv7m
 // EXC_RETURN bit 4 is clear, which says the task has used the FPU (the store also completes the lazy
 // s0-s15 save), then r4-r11 and the EXC_RETURN value. It passes the PSP to the board's `skiff_switch`,
 // which calls `kernel.switch_context` and answers the next task's, and unwinds that task's context the
-// same way. A task that has never used the FPU saves nothing for it.
+// same way. A task that has never used the FPU saves nothing for it. In a build for a target with no
+// floating-point registers (`fpu` false) the FPU part is not assembled at all.
 //
 // **The first task starts through SVC**: an exception return is the only way into thread mode on the
 // PSP with a task's xPSR and pc. `start_first` makes the call with the stack pointer in r0; the handler
@@ -30,22 +31,28 @@ module skiff.arch.armv7m
 asm
     [thumb]
         ".syntax unified"
+#if fpu
         ".fpu fpv4-sp-d16"
+#endif
         ".text"
         ".thumb_func"
         ".globl skiff_pendsv"
         "skiff_pendsv:"
         "mrs r0, psp"
         "isb"
+#if fpu
         "tst lr, #0x10"
         "it eq"
         "vstmdbeq r0!, {{s16-s31}}"
+#endif
         "stmdb r0!, {{r4-r11, lr}}"
         "bl skiff_switch"
         "ldmia r0!, {{r4-r11, lr}}"
+#if fpu
         "tst lr, #0x10"
         "it eq"
         "vldmiaeq r0!, {{s16-s31}}"
+#endif
         "msr psp, r0"
         "isb"
         "bx lr"
@@ -105,16 +112,6 @@ new_context(stack: []u32, entry: *extern() -> never) -> usize
         stack[i] = 0
     stack[top + 8] = EXC_RETURN_THREAD_PSP
     usize(&stack[top])
-
-// MVFR0, the first Media and VFP Feature Register: zero on a core with no FPU.
-private const MVFR0: usize = 0xE000_EF40
-
-// Whether the running core has an FPU. A core without one takes a UsageFault (NOCP) on its first
-// floating-point instruction, and its switch never saves FPU state, since EXC_RETURN bit 4 stays set.
-// The AN521's core 0 has none; its core 1 has one.
-has_fpu() -> bool
-    val mvfr0: *Word = ptr_cast(MVFR0)
-    mvfr0.v != 0
 
 // Ask for a switch on the running core: pend its PendSV.
 request_switch()
