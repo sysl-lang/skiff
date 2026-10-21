@@ -1,0 +1,11 @@
+// The tasks every QEMU board runs on each of its cores, and what each shows. A board gives each task
+// an entry of its own, which calls the scenario here over the board's port.
+
+package {
+  name    = "scenarios"
+  version = "0.0.1"
+}
+
+dependencies {
+  kernel { workspace = true }
+}

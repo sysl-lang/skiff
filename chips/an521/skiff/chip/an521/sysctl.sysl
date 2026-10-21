@@ -16,9 +16,13 @@ private const CPUWAIT_CORE1: u32 = 1 << 1
 // The clock both cores and SysTick run on: QEMU's AN521 SYSCLK.
 const CLOCK_HZ: u32 = 20_000_000
 
-// Start core 1 at the image whose vector table is at `vectors`.
+// Start core 1 at the image whose vector table is at `vectors`. Everything core 0 wrote to memory before
+// the call is visible to core 1 when it starts: the barrier completes those writes before the release.
 release_core1(vectors: usize)
     val svtor: *Word = ptr_cast(INITSVTOR1)
     svtor.v = u32(vectors)
+    asm
+        [thumb] "dsb"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.an521 is for the AN521's Cortex-M33 cores"
     val wait: *Word = ptr_cast(CPUWAIT)
     wait.v = wait.v & ~CPUWAIT_CORE1

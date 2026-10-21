@@ -7,7 +7,8 @@ module skiff.arch.armv7m
 // belongs to the chip package; the board's link script puts that section straight after this one.
 //   - The four faults go to their own entries (faults.sysl), which hand the board the exception's number.
 //   - SysTick goes to `skiff_systick`, which the board exports: it calls the kernel's tick with the
-//     board's machine.
+//     board's port.
+//   - SVCall and PendSV start and switch tasks (context.sysl).
 //   - Every other system exception goes to `skiff_exception`, so it stops the machine with
 //     `FAULT_STATUS` where, with no handler, it would escalate to a HardFault and lock the core up
 //     somewhere meaningless.
@@ -29,10 +30,10 @@ asm
         ".word 0"
         ".word 0"
         ".word 0"
-        ".word skiff_exception"     // SVCall
+        ".word skiff_svc"           // SVCall: starts the first task (context.sysl)
         ".word skiff_exception"     // DebugMonitor
         ".word 0"
-        ".word skiff_exception"     // PendSV
+        ".word skiff_pendsv"        // PendSV: the switch (context.sysl)
         ".word skiff_systick"
         ".text"
     [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"

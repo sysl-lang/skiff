@@ -1,29 +1,49 @@
-// The kernel instantiated over a machine with no hardware behind it (see package.hocon). Each piece of
-// the kernel that is generic over the machine is called from here as well. The kernel is built for two
-// cores, so the paths between cores are built for every CPU family too.
+// The kernel instantiated over a port with no hardware behind it (see package.hocon). Each piece of the
+// kernel that is generic over the port is called from here as well. The kernel is built for two cores,
+// so the paths between cores are built for every CPU family too.
 
 import skiff.kernel
-import skiff.kernel.Machine
+import skiff.kernel.Port
 
 struct Nothing
 end Nothing
 
-// A tick is taken by hand: sleeping takes one, as a real core's sleep ends at its tick.
-impl Machine for Nothing
+// A tick is taken by hand: sleeping takes one, as a real core's sleep ends at its tick. A context is the
+// stack's address, and no task ever runs.
+impl Port for Nothing
     write(*self, bytes: []const u8) = ()
     cores(*self) -> u32 = 2
     core_id(*self) -> u32 = 0
     start_ticks(*self, hz: u32) = ()
     idle(*self) = kernel.tick(self)
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize = usize(&stack[0])
+    request_switch(*self) = ()
+    start_first(*self, sp: usize) -> never = panic("no task runs here")
+    mask(*self) -> u32 = 0
+    restore(*self, state: u32) = ()
+
+private var stack: [64]u32 = [0; 64]
+
+private body() -> never
+    loop
+        ()
 
 @export("main")
 probe() -> i32
     var m = Nothing()
     kernel.write_dec(&m, 1)
     kernel.write_hex(&m, 1)
+    val t = kernel.create(&m, 1, stack, &body, 1)
     kernel.start(&m)
     kernel.await_tick(&m)
     kernel.fault(&m, "none")
     val here = kernel.here(&m)
     if !kernel.stopped(here.id) || kernel.expired(kernel.ticks(), 0) then return 1
+    if t.is_err() || kernel.delete(&m, t.unwrap()).is_ok() then return 1
+    if here.sched.started()
+        kernel.sleep(&m, 1)
+        kernel.sleep_until(&m, 1)
+        kernel.yield_now(&m)
+        if kernel.switch_context(&m, 0) == 0 || kernel.current(&m) == t.unwrap() then kernel.exit(&m)
+    if m.cores() > 2 then kernel.run(&m, stack, &body)
     kernel.boot(&m)

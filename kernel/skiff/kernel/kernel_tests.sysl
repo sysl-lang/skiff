@@ -3,18 +3,21 @@ module skiff.kernel
 
 import sysl.sync.Atomic
 
-// The kernel on the host, over a machine that records what it is asked to write. Every boot test on a
-// board checks the same banner through a real console.
+// The kernel on the host, over a port that records what it is asked to write and how many switches it
+// is asked for. Every boot test on a board checks the same banner through a real console.
 
-private struct Recorder
+private[kernel] struct Recorder
     bytes: [256]u8
     used: usize
     count: u32
     me: u32
     hz: u32
+    switches: u32       // how many switches the kernel has asked for
+    masked: u32         // how deep the kernel's masking is nested
 
-// The recorder's tick is taken by hand: `idle` takes one, as a real core's sleep ends at its tick.
-impl Machine for Recorder
+// The recorder's tick is taken by hand: `idle` takes one, as a real core's sleep ends at its tick. A new
+// task's context is only its stack's address, which is what the kernel keeps as its stack pointer.
+impl Port for Recorder
     write(*self, bytes: []const u8)
         for b in bytes
             self.bytes[self.used] = b
@@ -30,7 +33,21 @@ impl Machine for Recorder
     idle(*self)
         tick(self)
 
-private recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0)
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize = usize(&stack[0])
+
+    request_switch(*self)
+        self.switches += 1
+
+    start_first(*self, sp: usize) -> never = panic("the host runs no task")
+
+    mask(*self) -> u32
+        self.masked += 1
+        self.masked - 1
+
+    restore(*self, state: u32)
+        self.masked = state
+
+private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0)
 
 // Whether `r` recorded exactly `want`.
 private recorded(r: *Recorder, want: string) -> bool
@@ -87,8 +104,8 @@ deadline_across_wrap()
 @test("core 0's tick advances the time base and another core's does not")
 only_core_0_keeps_time()
     var time: Atomic[u32] = Atomic(0)
-    var first = Core(0, Atomic(0), false)
-    var second = Core(1, Atomic(0), false)
+    var first = Core(0, Atomic(0), false, EMPTY_SCHEDULER)
+    var second = Core(1, Atomic(0), false, EMPTY_SCHEDULER)
     first.tick(&time)
     second.tick(&time)
     second.tick(&time)
@@ -101,7 +118,7 @@ only_core_0_keeps_time()
 @test("the time base wraps from the largest u32 to 0")
 time_base_wraps()
     var time: Atomic[u32] = Atomic(0xffff_ffff)
-    var first = Core(0, Atomic(0xffff_ffff), false)
+    var first = Core(0, Atomic(0xffff_ffff), false, EMPTY_SCHEDULER)
     first.tick(&time)
     assert_eq(time.load(), 0)
     assert_eq(first.own_ticks(), 0)

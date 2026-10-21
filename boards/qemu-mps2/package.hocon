@@ -11,6 +11,7 @@ dependencies {
   kernel { workspace = true }
   armv7m { workspace = true }
   mps2 { workspace = true }
+  scenarios { workspace = true }
 }
 
 targets {

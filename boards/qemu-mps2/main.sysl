@@ -1,26 +1,39 @@
 // skiff on QEMU's MPS2 AN500 and AN386: the kernel over the armv7m arch package and the mps2 chip.
 // It boots, checks that the kernel's shared state is in `.shared`, watches three ticks and checks that
-// the time base kept count of them, then stops the machine with the status `boot` answers.
+// the time base kept count of them. Then it runs the scenarios' tasks (skiff.board.scenarios), and the
+// last of them stops the machine with the status `boot` answered.
 
 import skiff.arch.armv7m
+import skiff.board.scenarios
 import skiff.chip.mps2
 import skiff.kernel
-import skiff.kernel.Machine
+import skiff.kernel.Port
 
 // The bounds of `.shared`, from the link script.
 extern __shared_start: u8
 extern __shared_end: u8
 
-// The machine as the kernel sees it: one core, the first UART as its console, SysTick as its tick.
+// The core as the kernel sees it: one core, the first UART as its console, SysTick as its tick, and the
+// armv7m context switch.
 struct Board
 end Board
 
-impl Machine for Board
+impl Port for Board
     write(*self, bytes: []const u8) = mps2.write(bytes)
     cores(*self) -> u32 = 1
     core_id(*self) -> u32 = 0
     start_ticks(*self, hz: u32) = armv7m.systick_start(mps2.CLOCK_HZ / hz)
     idle(*self) = armv7m.wait_for_interrupt()
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize = armv7m.new_context(stack, entry)
+    request_switch(*self) = armv7m.request_switch()
+    start_first(*self, sp: usize) -> never = armv7m.start_first(sp)
+    mask(*self) -> u32 = armv7m.mask()
+    restore(*self, state: u32) = armv7m.restore(state)
+
+// The status `boot` answered, which the last task stops the machine with.
+private var status: i32 = 0
+
+private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet)
 
 // Called by the chip's reset handler once there is a stack and `.bss` and `.shared` are zero.
 @export("skiff_main")
@@ -28,9 +41,10 @@ skiff_main() -> never
     mps2.console_init()
     armv7m.enable_faults()
     var board = Board()
-    val status = kernel.boot(&board)
+    status = kernel.boot(&board)
     if kernel.shared_within(usize(&__shared_start), usize(&__shared_end))
         board.write("skiff: .shared holds the shared state\n".bytes)
+    scenarios.create_tasks(&board, 0, &entries)
     kernel.start(&board)
     for _ in 0..<3
         val n = kernel.await_tick(&board)
@@ -39,6 +53,23 @@ skiff_main() -> never
         board.write("\n".bytes)
     if kernel.ticks() == kernel.here(&board).own_ticks()
         board.write("skiff: core 0 time base agrees\n".bytes)
+    scenarios.run_tasks(&board, &entries)
+
+private task_a() -> never = scenarios.take_turns(&Board(), "A", false)
+private task_b() -> never = scenarios.take_turns(&Board(), "B", true)
+private task_p1() -> never = scenarios.fp_task(&Board(), 0x1000, armv7m.has_fpu(), &entries)
+private task_p2() -> never = scenarios.fp_task(&Board(), 0x2000, armv7m.has_fpu(), &entries)
+private task_h() -> never = scenarios.wake_on_time(&Board())
+private meet() = scenarios.meet(&Board())
+
+private task_idle() -> never
+    loop
+        armv7m.wait_for_interrupt()
+
+// R: the handle checks, then the end of the run.
+private task_r() -> never
+    var board = Board()
+    scenarios.check_handles(&board, &entries)
     armv7m.halt(status)
 
 // SysTick: one tick for the kernel.
@@ -46,6 +77,12 @@ skiff_main() -> never
 board_tick()
     var board = Board()
     kernel.tick(&board)
+
+// PendSV's switch: the kernel chooses the next task.
+@export("skiff_switch")
+board_switch(sp: usize) -> usize
+    var board = Board()
+    kernel.switch_context(&board, sp)
 
 // A fault on the one core stops the machine, with `FAULT_STATUS`, once the kernel has reported it.
 @export("skiff_fault")

@@ -31,21 +31,34 @@ Core (private, one per core)          .shared
   scheduler: ready set, running         inboxes:  [cores][cores] Ring of Message
   tasks:     [option_tasks]Tcb          waiters:  [cores][option_tasks] Waiter
   timeouts:  sorted list of slots       objects:  wherever the application declares them
-  port:      *Port
 ```
 
 - `here()` answers the running core's `Core` through `Port.core_id()`. With one core it is a constant
   and the lookup folds away.
+- **The kernel is generic over the port** (`[P: Port]`, `p: *P` on every call), so a `Core` holds no
+  `*Port`: the board passes its port to each kernel call, and its tick, switch and fault handlers do the
+  same. `Port` is `write`, `cores`, `core_id`, `start_ticks`, `idle`, `new_context`, `request_switch`,
+  `start_first`, `mask` and `restore`; the arch package supplies the last five. The idle task's body
+  is the board's (`kernel.run(p, idle_stack, idle)`), since a task entry takes no port.
 - Each core's start-up fills its own `Core`; core 0 zeroes `.bss` and `.shared` before releasing the
   others. A core announces itself ready in `.shared`; a message to a core not yet ready is a panic.
 
 ## Tasks and handles
 
 - **A `Task` handle is (core, slot, generation)** packed in a `u32` (8, 12 and 12 bits). The slot indexes
-  the owner's `tasks`; the generation is bumped every time the slot is reused.
+  the owner's `tasks`, `option_tasks` slots (default 16, range 2 to 4096, the idle task's among them).
+  The generation runs 1 to 4095 and is bumped every time the slot is freed, wrapping to 1, so the
+  handle 0 never names a task.
 - **Every operation that takes a handle checks it**: the core exists, the slot is in use, the generation
   matches. A stale handle is refused (`Err(Stale)`), never acted on: it named a task that is gone, and
-  the slot may hold another.
+  the slot may hold another. The other refusals are `Full`, `Priority` (outside 1 to 31), `NoCore`,
+  `Idle` (the idle task is never deleted) and `Remote`.
+- **Tasks are created on a named core.** A core creates on itself at any time; on another core only
+  before that core starts (`core_state` still offline), which is how core 0 gives every core its first
+  tasks at boot. Once the target runs, creating or deleting there is `Err(Remote)`: it would edit that
+  core's private state, and becomes a message (milestone 4).
+- A task ends by `exit`, which deletes it. The running task's freed slot is not handed out again until
+  the switch away from it, which still saves its stack pointer there.
 - A `Tcb` is private: saved stack pointer, base and effective priority, state, suspended, the stack's
   bounds, statistics, the MPU map. Nothing in `.shared` points at one.
 
@@ -55,7 +68,14 @@ Core (private, one per core)          .shared
   plus a FIFO list per priority, so choosing is one count-leading-zeros and switching is O(1).
 - Equal priorities take turns on the owner's tick. A task made ready that outranks the running one asks
   for a switch at once (PendSV on Arm).
+- The running task stays in its FIFO, at the front until its turn ends; a turn moves it to the back.
+  The owner's tick first wakes the sleepers whose deadline has come, then ends the running task's turn.
+- A sleeper waits in the owner's timeout list, sorted by deadline (equal deadlines in the order they
+  slept), and wakes on the owner's first tick at or after its deadline in the shared time base. On a
+  core other than core 0 that tick falls anywhere in core 0's period.
 - The ready set is private, so it is guarded by masking that core's interrupts, never by a spinlock.
+- The scheduler (`Scheduler`: the table, the bitmap, the FIFOs, the timeout list) holds no hardware
+  state, so the host tests drive one directly.
 
 ## Waiting: one primitive
 
@@ -163,8 +183,8 @@ The single-core boots stay in the gate so that stays true.
 
 ## Open questions
 
-- **32 priorities.** Enough for every RTOS application seen so far (FreeRTOS's default is 5-32); an
-  `option_priorities` up to 32 could shrink the lists.
+- **32 priorities, settled with no option.** The bitmap is one `u32` and the FIFOs cost two `u16` a
+  priority, so an `option_priorities` would save at most 120 bytes a core.
 - **A suspended task's wait.** skiff-old let it carry on (unlike FreeRTOS, which drops it); this design
   keeps that, since the outcome rule makes it safe.
 - **The H7's time base** in a two-image build: core 0's tick counter in `.shared` works; a shared

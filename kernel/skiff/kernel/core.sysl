@@ -3,13 +3,16 @@ module skiff.kernel
 import sysl.sync.{Atomic, Ordering}
 
 // The cores. Each core has a `Core` of its own in private memory, read and written by that core alone;
-// what the other cores may see of it (whether it is ready, whether it has stopped) is in `.shared`.
+// what the other cores may see of it (whether it is ready, whether it has stopped) is in `.shared`. The
+// one exception is before a core starts: core 0 may then give it its tasks, which is how a core's first
+// tasks are created at boot.
 
 // One core's own state.
 struct Core
     id: u32                 // the core's number, from 0
     ticks: Atomic[u32]      // the ticks this core has taken, counted by its own tick interrupt
     stopped: bool           // a fault has stopped the core
+    sched: Scheduler        // its tasks and the choices made over them (tasks.sysl)
 
 impl Core
     // Take one tick: count it, and on core 0 advance the time base `time` that every core reads.
@@ -24,42 +27,57 @@ impl Core
     // How many ticks this core has taken.
     own_ticks(*self) -> u32 = self.ticks.load(Ordering.Relaxed)
 
-private var cores_here: [option_cores]Core = [Core(0, Atomic(0), false); option_cores]
+// How many cores the kernel was built for: its `cores` option, for a board sizing tables of its own.
+const CORES: usize = option_cores
 
-// The running core's `Core`. With one core it is a constant, and the machine is not asked.
-here[M: Machine](m: *M) -> *Core = if option_cores == 1 then &cores_here[0] else &cores_here[m.core_id()]
+private var cores_here:[option_cores]Core = [Core(0, Atomic(0), false, EMPTY_SCHEDULER); option_cores]
+
+// The running core's `Core`. With one core it is a constant, and the port is not asked.
+here[P: Port](p: *P) -> *Core = if option_cores == 1 then &cores_here[0] else &cores_here[p.core_id()]
+
+// The running core's number. With one core it is the constant 0.
+here_id[P: Port](p: *P) -> u32 = if option_cores == 1 then 0 else p.core_id()
+
+// Core `n`'s `Core`, which only core `n` touches once it has started.
+private[kernel] core_at(n: u32) -> *Core = if option_cores == 1 then &cores_here[0] else &cores_here[n]
 
 // Bring the running core into the kernel: fill its `Core`, announce it ready in `.shared`, and start its
-// tick at `option_tick_hz`. A machine whose core count differs from the kernel's `cores` option is
-// refused, since every table the cores share is sized by the option.
-start[M: Machine](m: *M)
-    if m.cores() != u32(option_cores) then panic("skiff: the machine's core count is not the kernel's cores option")
-    val c = here(m)
-    c.id = m.core_id()
+// tick at `option_tick_hz`. A port whose core count differs from the kernel's `cores` option is refused,
+// since every table the cores share is sized by the option. Tasks created on the core before it starts
+// are kept.
+start[P: Port](p: *P)
+    if p.cores() != u32(option_cores) then panic("skiff: the machine's core count is not the kernel's cores option")
+    val c = here(p)
+    c.id = here_id(p)
     announce(c.id, CORE_READY)
-    m.start_ticks(option_tick_hz)
+    p.start_ticks(option_tick_hz)
 
-// One tick on the running core. The machine's tick interrupt calls it.
-tick[M: Machine](m: *M)
-    here(m).tick(time_base())
+// One tick on the running core: count it, wake the sleepers whose deadline it brings, and end the
+// running task's turn. The port's tick interrupt calls it.
+tick[P: Port](p: *P)
+    val c = here(p)
+    val state = p.mask()
+    c.tick(time_base())
+    if c.sched.started() && c.sched.tick(ticks()) then p.request_switch()
+    p.restore(state)
 
 // Idle until the running core takes its next tick, and answer how many it has taken.
-await_tick[M: Machine](m: *M) -> u32
-    val c = here(m)
+await_tick[P: Port](p: *P) -> u32
+    val c = here(p)
     val seen = c.own_ticks()
-    while c.own_ticks() == seen do m.idle()
+    while c.own_ticks() == seen do p.idle()
     c.own_ticks()
 
 // Report a fault on the running core's console, naming the core and `kind`, and mark the core stopped in
 // `.shared`, where the other cores can see it. The caller then stops this core; the others run on.
-fault[M: Machine](m: *M, kind: string)
-    val c = here(m)
+fault[P: Port](p: *P, kind: string)
+    val c = here(p)
     c.stopped = true
-    m.write("skiff: core ".bytes)
-    write_dec(m, c.id)
-    m.write(" fault ".bytes)
-    m.write(kind.bytes)
-    m.write("\n".bytes)
+    p.write("skiff: core ".bytes)
+    write_dec(p, c.id)
+    p.write(" fault ".bytes)
+    p.write(kind.bytes)
+    p.write("\n".bytes)
     announce(c.id, CORE_STOPPED)
 
 // Whether core `n` has started and not stopped.

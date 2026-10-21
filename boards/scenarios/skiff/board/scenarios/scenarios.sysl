@@ -1,0 +1,189 @@
+module skiff.board.scenarios
+
+import sysl.sync.Atomic
+import skiff.kernel
+import skiff.kernel.{Port, Task, TaskError}
+
+// The tasks each core runs, and what each shows. Every scenario starts at its own tick of the time base,
+// counted from the core's `epoch`, the tick its tasks started on, so that one has finished before the
+// next begins. Each core has its own tasks, stacks and counters, and prints on its own console.
+//
+//   - A and B share priority 1 and, from tick 2, never yield: each prints a line and then spins until
+//     the core's next tick, three times. They alternate only because the owner's tick takes turns
+//     between them. Then A exits, and B spins until tick 40 without ever giving up the processor.
+//   - P1 and P2, at priority 2, sleep until tick 15 and then preempt B. Each fills s16-s31 with its own
+//     values and yields to the other, which does the same, before checking that its own are intact. So
+//     the switch must keep the FPU registers a task uses. A core with no FPU says so instead.
+//   - H, at priority 3, sleeps until tick 30 and must run on the owner's tick its sleep ends on,
+//     although B never yields.
+//   - R, at priority 4, at tick 45: A's handle, kept since A was created, is refused now that A has
+//     exited, and still refused once a new task has A's slot. Core 0 of several may not create a task
+//     on core 1, which runs. Then the board ends the run.
+
+// How many words each task's stack holds: 2 KiB, enough for a kernel call at -O0.
+const STACK_WORDS: usize = 512
+
+// How many stacks each core has: A, B, P1, P2, H, R and the idle task.
+private const STACKS: usize = 7
+private const IDLE_STACK: usize = 6
+
+// The entries a board gives the tasks. Each calls the scenario of its name over the board's port; `meet`
+// returns, and is what the FPU probe calls with its registers filled.
+struct Entries
+    a: *extern() -> never
+    b: *extern() -> never
+    p1: *extern() -> never
+    p2: *extern() -> never
+    h: *extern() -> never
+    r: *extern() -> never
+    again: *extern() -> never
+    idle: *extern() -> never
+    meet: *extern() -> unit
+
+private var stacks: [kernel.CORES][STACKS][STACK_WORDS]u32
+private var epochs: [kernel.CORES]u32
+private var handles: [kernel.CORES]Task
+private var arrived: [kernel.CORES]Atomic[u32]
+private var finished: [kernel.CORES]Atomic[u32]
+private var kept: [kernel.CORES]Atomic[u32]
+
+// Create core `core`'s tasks. Core 0 calls it for every core before any other core starts.
+create_tasks[P: Port](p: *P, core: u32, e: *Entries)
+    handles[core] = created(kernel.create(p, core, stacks[core][0], e.a, 1))
+    val _ = created(kernel.create(p, core, stacks[core][1], e.b, 1))
+    val _ = created(kernel.create(p, core, stacks[core][2], e.p1, 2))
+    val _ = created(kernel.create(p, core, stacks[core][3], e.p2, 2))
+    val _ = created(kernel.create(p, core, stacks[core][4], e.h, 3))
+    val _ = created(kernel.create(p, core, stacks[core][5], e.r, 4))
+
+private created(result: Result[Task, TaskError]) -> Task = result match
+    Ok(t) -> t
+    Err(_) -> panic("skiff: a scenario task was refused")
+
+// Start the running core's tasks, counting the scenarios' ticks from now. Never returns.
+run_tasks[P: Port](p: *P, e: *Entries) -> never
+    val me = kernel.here_id(p)
+    epochs[me] = kernel.ticks()
+    kernel.run(p, stacks[me][IDLE_STACK], e.idle)
+
+// A and B: wait for tick 2, print three lines, each followed by a wait for the core's next tick, then
+// exit, or spin until tick 40 first.
+take_turns[P: Port](p: *P, label: string, spin: bool) -> never
+    val me = kernel.here_id(p)
+    kernel.sleep_until(p, epochs[me] + 2)
+    for n in 1u32..3
+        say(p, "task ")
+        p.write(label.bytes)
+        p.write(" ".bytes)
+        kernel.write_dec(p, n)
+        p.write("\n".bytes)
+        val t = kernel.here(p).own_ticks()
+        while kernel.here(p).own_ticks() == t do ()
+    if spin
+        while kernel.ticks() - epochs[me] < 40 do ()
+    kernel.exit(p)
+
+// FPU registers through switches: `skiff_fp_probe` (below) writes `base`, `base + 1`, … into s16-s31,
+// calls `meet`, and answers how many of the sixteen still hold their value.
+extern "skiff_fp_probe" fp_probe(base: u32, meet: *extern() -> unit) -> u32
+
+// P1 and P2 meet here with their registers filled. Each yields at least once, and the first to arrive
+// keeps yielding until the second has, so each is switched out while the other's values are in the
+// registers.
+meet[P: Port](p: *P)
+    val me = kernel.here_id(p)
+    val _ = arrived[me].add(1)
+    kernel.yield_now(p)
+    while arrived[me].load() < 2 do kernel.yield_now(p)
+
+// P1 and P2: at tick 15, fill the registers, meet, and count what survived. The second to finish
+// reports for both. On a core with no FPU (`fpu` false) there is nothing to fill, and that is reported
+// instead.
+fp_task[P: Port](p: *P, base: u32, fpu: bool, e: *Entries) -> never
+    val me = kernel.here_id(p)
+    kernel.sleep_until(p, epochs[me] + 15)
+    if fpu
+        val _ = kept[me].add(fp_probe(base, e.meet))
+    if finished[me].add(1) == 1
+        if !fpu
+            say(p, "has no FPU\n")
+        else if kept[me].load() == 32
+            say(p, "f32 registers survived the switches\n")
+        else
+            say(p, "f32 registers kept: ")
+            kernel.write_dec(p, kept[me].load())
+            p.write(" of 32\n".bytes)
+    kernel.exit(p)
+
+// H: sleep until tick 30 and check that it runs on the owner's tick its sleep ends on. Core 0 keeps the
+// time base, so there the tick is the deadline itself. Another core's tick falls anywhere in core 0's
+// period, so core 0 may have taken one more by the time the task reads the time base.
+wake_on_time[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    val due = epochs[me] + 30
+    kernel.sleep_until(p, due)
+    val late = kernel.ticks() - due
+    if late <= (if me == 0 then 0 else 1)
+        say(p, "high priority task woke on its tick\n")
+    else
+        say(p, "high priority task woke ")
+        kernel.write_dec(p, late)
+        p.write(" ticks late\n".bytes)
+    kernel.exit(p)
+
+// R, at tick 45: a stale handle is refused, before its slot is reused and after; and, on core 0 of
+// several, a task is not created on core 1, which runs. The board's own ending follows.
+check_handles[P: Port](p: *P, e: *Entries)
+    val me = kernel.here_id(p)
+    kernel.sleep_until(p, epochs[me] + 45)
+    val old = handles[me]
+    var refused = kernel.delete(p, old) == Err(TaskError.Stale)
+    val again = created(kernel.create(p, me, stacks[me][0], e.again, 1))
+    refused = refused && again.slot() == old.slot() && kernel.delete(p, old) == Err(TaskError.Stale)
+    refused = refused && kernel.delete(p, again).is_ok()
+    if refused then say(p, "refuses a stale handle\n") else say(p, "acted on a stale handle\n")
+    if kernel.CORES > 1 && me == 0
+        if kernel.create(p, 1, stacks[1][0], e.again, 1) == Err(TaskError.Remote)
+            say(p, "may not create a task on core 1, which runs\n")
+        else
+            say(p, "created a task on core 1, which runs\n")
+
+// The task that takes A's slot, deleted before it runs.
+again() -> never = panic("skiff: the task in A's slot ran")
+
+// Write `skiff: core <n> ` and `text` on the running core's console.
+private say[P: Port](p: *P, text: string)
+    p.write("skiff: core ".bytes)
+    kernel.write_dec(p, kernel.here_id(p))
+    p.write(" ".bytes)
+    p.write(text.bytes)
+
+// s16-s31 are callee-saved, so the probe saves the caller's values and puts them back at the end.
+asm
+    [thumb]
+        ".syntax unified"
+        ".fpu fpv4-sp-d16"
+        ".text"
+        ".thumb_func"
+        ".globl skiff_fp_probe"
+        "skiff_fp_probe:"
+        "push {{r4, r5, r6, lr}}"
+        "vpush {{s16-s31}}"
+        "mov r4, r0"
+        "mov r5, r1"
+        ".irp n, 16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31"
+        "vmov s\\n, r0"
+        "adds r0, #1"
+        ".endr"
+        "blx r5"
+        "movs r0, #0"
+        ".irp n, 16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31"
+        "vmov r1, s\\n"
+        "cmp r1, r4"
+        "it eq"
+        "addeq r0, #1"
+        "adds r4, #1"
+        ".endr"
+        "vpop {{s16-s31}}"
+        "pop {{r4, r5, r6, pc}}"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the probe is Armv7-M assembly"

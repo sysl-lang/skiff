@@ -1,0 +1,360 @@
+module skiff.kernel
+
+// Tasks. Every task belongs to one core, its owner, and runs nowhere else. Each core keeps its tasks in a
+// table of `option_tasks` slots in its private `Core`, and schedules them itself:
+//
+//   - The highest-priority ready task runs. The ready set is a `u32` bitmap of the priorities that have
+//     a ready task, plus a FIFO of ready tasks for each priority, so choosing is one count of leading
+//     zeros. The running task stays in its FIFO, at the front until its turn ends.
+//   - Tasks of equal priority take turns, one of the owner's ticks each.
+//   - A task made ready that outranks the running one asks for a switch at once.
+//   - A sleeping task waits in the core's timeout list, sorted by deadline, which each tick of the owner
+//     compares with the shared time base.
+//   - The idle task, at priority 0, runs when nothing else is ready.
+//
+// The ready set is private to its core, so it is guarded by masking that core's interrupts. A task
+// outside the kernel names a task by a `Task` handle, never by a pointer.
+
+// How many priorities there are: 0, the idle task's, to 31.
+const PRIORITIES: usize = 32
+
+// The idle task's priority; every other task's is higher.
+const IDLE_PRIORITY: u8 = 0
+
+// A sleep that never ends.
+const FOREVER: u32 = 0xffff_ffff
+
+// No slot: the end of a list, or no running task before the core runs its first.
+private[kernel] const NONE: u16 = 0xffff
+
+// The generation field of a handle: 12 bits.
+private const GENERATIONS: u16 = 0xfff
+
+// A task's handle: its owner core (8 bits), its slot in the owner's table (12) and the slot's generation
+// (12), packed in a `u32`. The generation changes every time the slot is freed, so a handle kept after
+// its task is gone no longer matches, even once another task has the slot. A generation is never 0, so
+// the handle 0 names no task.
+struct Task derives Eq
+    bits: u32
+
+impl Task
+    // The core the task belongs to.
+    core(self) -> u32 = self.bits >> 24
+
+    // The task's slot in its core's table.
+    slot(self) -> usize = usize((self.bits >> 12) & 0xfff)
+
+    // The generation of the slot the handle was made in.
+    generation(self) -> u16 = u16(self.bits & 0xfff)
+
+// The handle for slot `slot` of core `core`'s table in generation `generation`.
+task_handle(core: u32, slot: usize, generation: u16) -> Task = Task((core << 24) | (u32(slot) << 12) | u32(generation))
+
+// Why an operation on a task was refused.
+enum TaskError
+    Stale           // the handle names no task: its core does not exist, its slot is free, or the slot has been reused
+    Full            // the core's table has no free slot
+    Priority        // a priority outside 1 to 31: 0 is the idle task's
+    Remote          // the task is another core's and that core runs: only the owner changes its tasks
+    NoCore          // the machine has no such core
+    Idle            // the idle task is never deleted
+
+// What a slot holds.
+enum TaskState
+    Free            // no task
+    Ready           // in its priority's FIFO; the running task is ready too
+    Sleeping        // in the timeout list, or asleep for good
+
+// One slot of a core's table: private to the core, and never pointed at from `.shared`.
+struct Tcb
+    sp: usize           // the stack pointer, saved while the task is not running
+    priority: u8
+    state: TaskState
+    generation: u16     // 1 to 4095, changed whenever the slot is freed
+    prev: u16           // the neighbours in its priority's FIFO
+    next: u16
+    deadline: u32       // the tick a sleep ends on
+    later: u16          // the next sleeper in the timeout list
+
+// An empty slot, in its first generation.
+private[kernel] val FREE_TCB: Tcb = Tcb(0, 0, TaskState.Free, 1, NONE, NONE, 0, NONE)
+
+// One core's table and the choices made over it. It holds no hardware state, so the host tests drive
+// one directly; each core's is in its `Core`.
+struct Scheduler
+    tasks: [option_tasks]Tcb
+    ready: u32                  // bit p is set while priority p's FIFO holds a task
+    heads: [PRIORITIES]u16      // each priority's FIFO, through `prev` and `next`
+    tails: [PRIORITIES]u16
+    running: u16                // NONE until the core runs its first task
+    timeouts: u16               // the first sleeper, in deadline order
+
+// A table with no tasks in it.
+private[kernel] val EMPTY_SCHEDULER: Scheduler = Scheduler([FREE_TCB; option_tasks], 0, [NONE; PRIORITIES], [NONE; PRIORITIES], NONE, NONE)
+
+impl Scheduler
+    // Whether the core runs its tasks.
+    started(*self) -> bool = self.running != NONE
+
+    // The first free slot other than the running task's, or None when there is none. The running
+    // task's slot is free only between its exit and the switch away from it, which still saves its
+    // stack pointer there, so it is never given out.
+    free_slot(*self) -> Option[usize]
+        for i in 0..<option_tasks
+            if self.tasks[i].state == TaskState.Free && i != usize(self.running) then return Some(i)
+        None
+
+    // Put a ready task in free slot `i`, its saved stack pointer `sp`.
+    add_at(*self, i: usize, sp: usize, priority: u8)
+        self.tasks[i].sp = sp
+        self.tasks[i].priority = priority
+        self.tasks[i].state = TaskState.Ready
+        self.push(i)
+
+    // The handle of the task in slot `i`, on core `core`.
+    handle(*self, core: u32, i: usize) -> Task = task_handle(core, i, self.tasks[i].generation)
+
+    // The slot `t` names, if it still names a task here: the slot in range and in use, in the handle's
+    // generation. The caller has checked the core.
+    check(*self, t: Task) -> Result[usize, TaskError]
+        val i = t.slot()
+        if i >= option_tasks || self.tasks[i].state == TaskState.Free || self.tasks[i].generation != t.generation()
+            return Err(TaskError.Stale)
+        Ok(i)
+
+    // Delete the task `t` names, freeing its slot for the next task and changing the slot's generation.
+    // Answers whether it was the running task, which the caller then switches away from.
+    delete(*self, t: Task) -> Result[bool, TaskError]
+        val i = self.check(t)?
+        if self.tasks[i].priority == IDLE_PRIORITY then return Err(TaskError.Idle)
+        if self.tasks[i].state == TaskState.Ready
+            self.unlink(i)
+        else
+            self.remove_timeout(i)
+        self.tasks[i].state = TaskState.Free
+        self.tasks[i].generation = next_generation(self.tasks[i].generation)
+        Ok(i == usize(self.running))
+
+    // The task to run: the first in the FIFO of the highest priority with a ready task, or NONE when no
+    // task is ready.
+    highest(*self) -> u16
+        if self.ready == 0 then return NONE
+        self.heads[usize(31 - self.ready.leading_zeros())]
+
+    // Whether task `i` outranks the running task, so that a switch to it is due at once.
+    outranks_running(*self, i: usize) -> bool
+        if !self.started() then return false
+        self.tasks[i].priority > self.tasks[usize(self.running)].priority
+
+    // Make the first task run, answering its stack pointer.
+    first(*self) -> usize
+        self.running = self.highest()
+        self.tasks[usize(self.running)].sp
+
+    // Switch: keep `sp`, the running task's stack pointer, unless its slot has been freed, choose the
+    // next task and answer its stack pointer.
+    switch(*self, sp: usize) -> usize
+        val r = usize(self.running)
+        if self.tasks[r].state != TaskState.Free then self.tasks[r].sp = sp
+        self.running = self.highest()
+        self.tasks[usize(self.running)].sp
+
+    // The running task sleeps until tick `deadline`.
+    sleep(*self, deadline: u32)
+        val i = usize(self.running)
+        self.unlink(i)
+        self.tasks[i].state = TaskState.Sleeping
+        self.add_timeout(i, deadline)
+
+    // The running task sleeps for good: it waits in no list.
+    sleep_forever(*self)
+        val i = usize(self.running)
+        self.unlink(i)
+        self.tasks[i].state = TaskState.Sleeping
+        self.tasks[i].later = NONE
+
+    // One of the owner's ticks, at time `now`: wake every sleeper whose deadline has come, then end the
+    // running task's turn if another of its priority is ready. Answers whether to switch.
+    tick(*self, now: u32) -> bool
+        val woke = self.expire(now)
+        val turned = self.rotate()
+        woke || turned
+
+    // Wake every sleeper whose deadline has come at `now`, in deadline order. Answers whether one of them
+    // outranks the running task.
+    expire(*self, now: u32) -> bool
+        var outranks = false
+        while self.timeouts != NONE && expired(self.tasks[usize(self.timeouts)].deadline, now)
+            val i = usize(self.timeouts)
+            self.timeouts = self.tasks[i].later
+            if self.make_ready(i) then outranks = true
+        outranks
+
+    // Make task `i` ready. Answers whether it outranks the running task.
+    make_ready(*self, i: usize) -> bool
+        self.tasks[i].state = TaskState.Ready
+        self.push(i)
+        self.outranks_running(i)
+
+    // End the running task's turn: move it behind the other ready tasks of its priority. Answers whether
+    // there were any, so that a switch is due.
+    rotate(*self) -> bool
+        if !self.started() then return false
+        val r = usize(self.running)
+        if self.tasks[r].state != TaskState.Ready then return false
+        val p = usize(self.tasks[r].priority)
+        if self.heads[p] == self.tails[p] then return false
+        self.unlink(r)
+        self.push(r)
+        true
+
+    // Append task `i` to its priority's FIFO.
+    private[kernel] push(*self, i: usize)
+        val p = usize(self.tasks[i].priority)
+        val last = self.tails[p]
+        self.tasks[i].prev = last
+        self.tasks[i].next = NONE
+        if last == NONE then self.heads[p] = u16(i) else self.tasks[usize(last)].next = u16(i)
+        self.tails[p] = u16(i)
+        self.ready = self.ready | priority_bit(p)
+
+    // Take task `i` out of its priority's FIFO.
+    private[kernel] unlink(*self, i: usize)
+        val p = usize(self.tasks[i].priority)
+        val prev = self.tasks[i].prev
+        val next = self.tasks[i].next
+        if prev == NONE then self.heads[p] = next else self.tasks[usize(prev)].next = next
+        if next == NONE then self.tails[p] = prev else self.tasks[usize(next)].prev = prev
+        if self.heads[p] == NONE then self.ready = self.ready & ~priority_bit(p)
+
+    // Insert task `i` into the timeout list at `deadline`, after every sleeper due no later.
+    private add_timeout(*self, i: usize, deadline: u32)
+        self.tasks[i].deadline = deadline
+        var before = NONE
+        var at = self.timeouts
+        while at != NONE && expired(self.tasks[usize(at)].deadline, deadline)
+            before = at
+            at = self.tasks[usize(at)].later
+        self.tasks[i].later = at
+        if before == NONE then self.timeouts = u16(i) else self.tasks[usize(before)].later = u16(i)
+
+    // Take task `i` out of the timeout list, if it is in it.
+    private remove_timeout(*self, i: usize)
+        var before = NONE
+        var at = self.timeouts
+        while at != NONE && usize(at) != i
+            before = at
+            at = self.tasks[usize(at)].later
+        if at == NONE then return
+        val after = self.tasks[i].later
+        if before == NONE then self.timeouts = after else self.tasks[usize(before)].later = after
+
+// The bit for priority `p` in the ready bitmap.
+private priority_bit(p: usize) -> u32 = 1 << u32(p)
+
+// The generation after `g`: 1 to 4095, then 1 again.
+private[kernel] next_generation(g: u16) -> u16 = if g == GENERATIONS then 1 else g + 1
+
+// Whether a task for core `core` must be refused to core `me` because `core` already runs: from then on
+// only `core` changes its own tasks. `state` is `core`'s state in `.shared`.
+private[kernel] remote(core: u32, me: u32, state: u32) -> bool = core != me && state != CORE_OFFLINE
+
+// Create a task on core `core`, ready to run `entry` on `stack` at `priority` (1 to 31), and answer its
+// handle. A core creates tasks on itself at any time; on another core only before that core starts,
+// which is how core 0 gives the other cores their tasks at boot. A task that outranks the running one
+// runs at once.
+create[P: Port](p: *P, core: u32, stack: []u32, entry: *extern() -> never, priority: u8) -> Result[Task, TaskError]
+    if priority == IDLE_PRIORITY || usize(priority) >= PRIORITIES then return Err(TaskError.Priority)
+    if usize(core) >= option_cores then return Err(TaskError.NoCore)
+    val me = here_id(p)
+    if remote(core, me, core_state(core)) then return Err(TaskError.Remote)
+    val c = core_at(core)
+    val state = p.mask()
+    val result = c.sched.free_slot() match
+        Some(i) ->
+            c.sched.add_at(i, p.new_context(stack, entry), priority)
+            if core == me && c.sched.outranks_running(i) then p.request_switch()
+            Ok(c.sched.handle(core, i))
+        None -> Err(TaskError.Full)
+    p.restore(state)
+    result
+
+// Delete the task `t` names: it never runs again, and its slot is free for another. A task deleting
+// itself is switched away from at once. Only the owner deletes its tasks.
+delete[P: Port](p: *P, t: Task) -> Result[unit, TaskError]
+    if usize(t.core()) >= option_cores then return Err(TaskError.Stale)
+    if t.core() != here_id(p) then return Err(TaskError.Remote)
+    val c = here(p)
+    val state = p.mask()
+    val result = c.sched.delete(t) match
+        Ok(running) ->
+            if running then p.request_switch()
+            Ok(())
+        Err(e) -> Err(e)
+    p.restore(state)
+    result
+
+// The running task's handle.
+current[P: Port](p: *P) -> Task
+    val c = here(p)
+    c.sched.handle(here_id(p), usize(c.sched.running))
+
+// The running task ends: what a task with no more to do ends in, since a task's entry never returns.
+exit[P: Port](p: *P) -> never
+    val _ = delete(p, current(p))
+    loop
+        p.idle()
+
+// The running task sleeps for `count` ticks of the time base, or for good with `FOREVER`. It wakes on
+// its owner's first tick at or after the deadline.
+sleep[P: Port](p: *P, count: u32)
+    val c = running_core(p)
+    val state = p.mask()
+    if count == FOREVER then c.sched.sleep_forever() else c.sched.sleep(ticks() + count)
+    p.request_switch()
+    p.restore(state)
+
+// The running task sleeps until tick `tick` of the time base, and does not sleep at all if that tick
+// has come. Ticks compare modulo 2^32, so `tick` may be up to 2^31 - 1 ticks ahead.
+sleep_until[P: Port](p: *P, tick: u32)
+    val c = running_core(p)
+    val state = p.mask()
+    if !expired(tick, ticks())
+        c.sched.sleep(tick)
+        p.request_switch()
+    p.restore(state)
+
+// The running task gives up the processor to the next ready task of its priority, if there is one.
+yield_now[P: Port](p: *P)
+    val c = running_core(p)
+    val state = p.mask()
+    if c.sched.rotate() then p.request_switch()
+    p.restore(state)
+
+// Start running this core's tasks, adding its idle task, which runs `idle` on `idle_stack`. Never
+// returns. The kernel's interrupts are masked from here until the first task runs, which starts with
+// them unmasked.
+run[P: Port](p: *P, idle_stack: []u32, idle: *extern() -> never) -> never
+    val c = here(p)
+    if c.sched.started() then panic("skiff: the core already runs its tasks")
+    val _ = p.mask()
+    c.sched.free_slot() match
+        Some(i) -> c.sched.add_at(i, p.new_context(idle_stack, idle), IDLE_PRIORITY)
+        None -> panic("skiff: no slot left for the idle task")
+    p.start_first(c.sched.first())
+
+// The switch: called by the port with the running task's stack pointer `sp`; answers the stack pointer
+// of the task to run next.
+switch_context[P: Port](p: *P, sp: usize) -> usize
+    val c = here(p)
+    val state = p.mask()
+    val next = c.sched.switch(sp)
+    p.restore(state)
+    next
+
+// The running core's `Core`, from a task: refused before the core runs its tasks, when there is no
+// running task to sleep or yield.
+private running_core[P: Port](p: *P) -> *Core
+    val c = here(p)
+    if !c.sched.started() then panic("skiff: a task call before the core runs its tasks")
+    c

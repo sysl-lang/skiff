@@ -1,0 +1,284 @@
+module skiff.kernel
+@tests
+
+// Tasks on the host: handles, the ready set, the timeout list, and the kernel's task calls over the
+// recording port (kernel_tests.sysl). A host test runs no task, so where a running task matters the test
+// makes the scheduler's first choice itself.
+
+private body() -> never
+    loop
+        ()
+
+// A scheduler with tasks at `priorities`, in slots 0, 1, … in that order, each with its slot as its
+// stack pointer.
+private scheduler_with(priorities: []const u8) -> Scheduler
+    var s = EMPTY_SCHEDULER
+    for p in priorities
+        val i = s.free_slot().unwrap()
+        s.add_at(i, i, p)
+    s
+
+// The slots of priority `p`'s FIFO, front first, written as digits: "012".
+private fifo(s: *Scheduler, p: usize) -> u32
+    var digits: u32 = 0
+    var at = s.heads[p]
+    while at != NONE
+        digits = digits * 10 + u32(at) + 1
+        at = s.tasks[usize(at)].next
+    digits
+
+@test("a handle packs core, slot and generation into 8, 12 and 12 bits")
+handle_packing()
+    val t = task_handle(3, 0xabc, 0x123)
+    assert_eq(t.bits, 0x03ab_c123)
+    assert_eq(t.core(), 3)
+    assert_eq(t.slot(), 0xabc)
+    assert_eq(t.generation(), 0x123)
+    val top = task_handle(255, 4095, 4095)
+    assert_eq(top.bits, 0xffff_ffff)
+    assert_eq(top.core(), 255)
+    assert_eq(top.slot(), 4095)
+    assert_eq(top.generation(), 4095)
+
+@test("a generation runs 1 to 4095 and wraps to 1, never 0")
+generation_wraps()
+    assert_eq(next_generation(1), 2)
+    assert_eq(next_generation(4094), 4095)
+    assert_eq(next_generation(4095), 1)
+    var s = scheduler_with([1, 1])
+    var gens: u32 = 0
+    for _ in 0..<4095
+        assert(s.delete(s.handle(0, 1)).is_ok(), "the live handle deletes")
+        s.add_at(1, 1, 1)
+        assert(s.tasks[1].generation != 0, "never generation 0")
+        gens += 1
+    assert_eq(gens, 4095)
+    assert_eq(s.tasks[1].generation, 1)
+    assert_eq(s.tasks[0].generation, 1)
+
+@test("reusing a slot makes the old handle stale and the new one live")
+reuse_makes_stale()
+    var s = scheduler_with([1, 2])
+    val old = s.handle(0, 0)
+    assert(s.delete(old) == Ok(false), "deleted, not the running task")
+    assert(s.check(old) == Err(TaskError.Stale), "stale once its slot is free")
+    assert_eq(s.free_slot().unwrap(), 0)
+    s.add_at(0, 99, 1)
+    val again = s.handle(0, 0)
+    assert_eq(again.slot(), old.slot())
+    assert(again.generation() != old.generation(), "a new generation")
+    assert(s.check(old) == Err(TaskError.Stale), "the old handle is stale after reuse")
+    assert(s.delete(old) == Err(TaskError.Stale), "and deletes nothing")
+    assert(s.check(again) == Ok(0), "the new handle is live")
+
+@test("a free slot, a slot beyond the table and the handle 0 name no task")
+free_slot_is_stale()
+    var s = scheduler_with([1])
+    assert(s.check(s.handle(0, 0)) == Ok(0), "slot 0 holds a task")
+    assert(s.check(task_handle(0, 1, 1)) == Err(TaskError.Stale), "slot 1 is free")
+    assert(s.check(task_handle(0, 4095, 1)) == Err(TaskError.Stale), "slot 4095 is beyond the table")
+    assert(s.check(Task(0)) == Err(TaskError.Stale), "the handle 0")
+    assert(s.check(task_handle(0, 0, 2)) == Err(TaskError.Stale), "the right slot in another generation")
+
+@test("a handle for a core the machine does not have is stale, and a task is not created there")
+bad_core()
+    var r = recorder(1, 0)
+    var stack: [64]u32 = [0; 64]
+    assert(delete(&r, task_handle(1, 0, 1)) == Err(TaskError.Stale), "core 1 of one")
+    assert(delete(&r, task_handle(255, 0, 1)) == Err(TaskError.Stale), "core 255")
+    assert(create(&r, 1, stack, &body, 1) == Err(TaskError.NoCore), "creating on core 1 of one")
+
+@test("a task is created at priority 1 to 31 only")
+create_priorities()
+    var r = recorder(1, 0)
+    var stack: [64]u32 = [0; 64]
+    assert(create(&r, 0, stack, &body, 0) == Err(TaskError.Priority), "the idle task's priority")
+    assert(create(&r, 0, stack, &body, 32) == Err(TaskError.Priority), "above 31")
+    val t = create(&r, 0, stack, &body, 31).unwrap()
+    assert_eq(t.core(), 0)
+    assert_eq(here(&r).sched.tasks[t.slot()].sp, usize(&stack[0]))
+    assert_eq(r.masked, 0)
+
+@test("a full table refuses a task, and the idle task is never deleted")
+full_and_idle()
+    var r = recorder(1, 0)
+    var stack: [64]u32 = [0; 64]
+    for _ in 0..<option_tasks
+        assert(create(&r, 0, stack, &body, 1).is_ok(), "room")
+    assert(create(&r, 0, stack, &body, 1) == Err(TaskError.Full), "full")
+    var s = scheduler_with([0, 1])
+    assert(s.delete(s.handle(0, 0)) == Err(TaskError.Idle), "the idle task")
+
+@test("a core creates on another only before that core starts")
+remote_creation()
+    assert(!remote(0, 0, CORE_READY), "on itself, running")
+    assert(!remote(1, 0, CORE_OFFLINE), "on core 1 before it starts")
+    assert(remote(1, 0, CORE_READY), "on core 1 once it runs")
+    assert(remote(1, 0, CORE_STOPPED), "on core 1 once it has stopped")
+    assert(remote(0, 1, CORE_READY), "core 1 on core 0")
+
+@test("the highest priority with a ready task runs, and the bitmap holds exactly the ready priorities")
+highest_first()
+    var s = scheduler_with([1, 3, 2, 0])
+    assert_eq(s.ready, 0b1111)
+    assert_eq(s.highest(), 1)
+    assert_eq(s.first(), 1)
+    s.sleep(10)
+    assert_eq(s.ready, 0b0111)
+    assert_eq(s.highest(), 2)
+    var empty = EMPTY_SCHEDULER
+    assert_eq(empty.highest(), NONE)
+    assert(!empty.started(), "nothing runs")
+
+@test("equal priorities queue in the order they became ready, and a turn moves the front to the back")
+fifo_order()
+    var s = scheduler_with([2, 2, 2, 0])
+    assert_eq(fifo(&s, 2), 123)
+    assert_eq(s.first(), 0)
+    assert(s.rotate(), "others are ready")
+    assert_eq(fifo(&s, 2), 231)
+    assert_eq(s.switch(100), 1)
+    assert_eq(s.tasks[0].sp, 100)
+    assert(s.rotate(), "others are ready")
+    assert_eq(fifo(&s, 2), 312)
+    assert_eq(s.switch(101), 2)
+    assert(s.rotate(), "others are ready")
+    assert_eq(s.switch(102), 100)
+    assert_eq(s.running, 0)
+    assert_eq(fifo(&s, 2), 123)
+
+@test("the owner's tick takes turns among equals, and not when the running task is alone")
+round_robin_on_tick()
+    var s = scheduler_with([1, 1, 0])
+    s.first()
+    assert(s.tick(1), "a turn for task 1")
+    assert_eq(s.switch(0), 1)
+    assert(s.tick(2), "a turn for task 0")
+    assert_eq(s.switch(1), 0)
+    var alone = scheduler_with([1, 0])
+    alone.first()
+    assert(!alone.tick(1), "task 0 is alone at its priority")
+    assert(!alone.tick(2), "still alone")
+
+@test("a sleeper that outranks the running task asks for a switch on the tick it wakes")
+preempt_on_wake()
+    var s = scheduler_with([3, 1, 0])
+    assert_eq(s.first(), 0)
+    s.sleep(5)
+    assert_eq(s.switch(0), 1)
+    assert(!s.tick(4), "not due yet")
+    assert(s.tick(5), "due: it outranks task 1")
+    assert_eq(s.switch(1), 0)
+    var low = scheduler_with([3, 1, 0])
+    low.first()
+    low.sleep(5)
+    low.switch(0)
+    assert_eq(low.running, 1)
+    low.sleep(7)
+    low.switch(0)
+    assert_eq(low.running, 2)
+    assert(low.tick(5), "task 0 outranks the idle task")
+    low.switch(0)
+    assert_eq(low.running, 0)
+    assert(!low.tick(7), "task 1 is due and does not outrank task 0")
+    assert_eq(low.ready, 0b1011)
+    assert_eq(fifo(&low, 1), 2)
+
+@test("sleepers wake in deadline order whatever order they slept in, equal deadlines first come first")
+timeout_order()
+    var s = scheduler_with([1, 1, 1, 1, 0])
+    for deadline in [30u32, 10, 20, 10]
+        s.first()
+        s.sleep(deadline)
+    var order: u32 = 0
+    var at = s.timeouts
+    while at != NONE
+        order = order * 10 + u32(at) + 1
+        at = s.tasks[usize(at)].later
+    assert_eq(order, 2431)
+    s.first()
+    assert(s.tick(10), "two wake at 10")
+    assert_eq(fifo(&s, 1), 24)
+    s.tick(19)
+    assert_eq(fifo(&s, 1), 24)
+    s.tick(20)
+    assert_eq(fifo(&s, 1), 243)
+    s.tick(30)
+    assert_eq(s.timeouts, NONE)
+
+@test("the timeout list orders deadlines across the time base's wrap")
+timeout_across_wrap()
+    var s = scheduler_with([1, 1, 0])
+    s.first()
+    s.sleep(3)
+    s.first()
+    s.sleep(0xffff_fffe)
+    assert_eq(s.timeouts, 1)
+    s.first()
+    s.tick(0xffff_ffff)
+    assert_eq(fifo(&s, 1), 2)
+    s.tick(2)
+    assert_eq(fifo(&s, 1), 2)
+    s.tick(3)
+    assert_eq(fifo(&s, 1), 21)
+
+@test("a deleted sleeper leaves the timeout list, and a deleted ready task its FIFO")
+delete_unlinks()
+    var s = scheduler_with([1, 1, 2, 0])
+    s.first()
+    s.sleep(5)
+    s.switch(0)
+    assert_eq(s.running, 0)
+    assert(s.delete(s.handle(0, 2)) == Ok(false), "the sleeper")
+    assert_eq(s.timeouts, NONE)
+    assert(s.delete(s.handle(0, 1)) == Ok(false), "a ready task")
+    assert_eq(fifo(&s, 1), 1)
+    assert_eq(s.ready, 0b0011)
+    assert(!s.tick(5), "nothing wakes")
+
+@test("a task deleting itself is switched away from, and its slot is not given out before the switch")
+delete_running()
+    var s = scheduler_with([2, 1, 0])
+    assert_eq(s.first(), 0)
+    assert(s.delete(s.handle(0, 0)) == Ok(true), "the running task")
+    assert_eq(s.free_slot().unwrap(), 3)
+    assert_eq(s.switch(500), 1)
+    assert_eq(s.tasks[0].sp, 0)
+    assert_eq(s.free_slot().unwrap(), 0)
+
+@test("creating a task that outranks the running one asks for a switch; one that does not, does not")
+create_preempts()
+    var r = recorder(1, 0)
+    var stack: [64]u32 = [0; 64]
+    val low = create(&r, 0, stack, &body, 1).unwrap()
+    assert_eq(r.switches, 0)
+    here(&r).sched.first()
+    assert(current(&r).bits == low.bits, "the running task's handle")
+    create(&r, 0, stack, &body, 1).unwrap()
+    assert_eq(r.switches, 0)
+    create(&r, 0, stack, &body, 2).unwrap()
+    assert_eq(r.switches, 1)
+    assert_eq(r.masked, 0)
+
+@test("sleep takes the running task out of the ready set until the tick its deadline comes")
+sleep_until_deadline()
+    var r = recorder(1, 0)
+    var stack: [64]u32 = [0; 64]
+    start(&r)
+    val t = create(&r, 0, stack, &body, 1).unwrap()
+    here(&r).sched.add_at(1, 77, IDLE_PRIORITY)
+    here(&r).sched.first()
+    sleep(&r, 2)
+    assert_eq(r.switches, 1)
+    assert(here(&r).sched.tasks[t.slot()].state == TaskState.Sleeping, "asleep")
+    assert_eq(here(&r).sched.switch(55), 77)
+    tick(&r)
+    assert_eq(r.switches, 1)
+    tick(&r)
+    assert_eq(r.switches, 2)
+    assert_eq(here(&r).sched.switch(66), 55)
+    sleep_until(&r, ticks())
+    assert_eq(r.switches, 2)
+    assert(delete(&r, t).is_ok(), "deleted")
+    assert(delete(&r, t) == Err(TaskError.Stale), "and stale")
+    assert_eq(r.masked, 0)

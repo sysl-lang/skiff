@@ -10,6 +10,7 @@ dependencies {
   kernel { workspace = true, options = { cores = 2 } }
   armv7m { workspace = true }
   an521 { workspace = true }
+  scenarios { workspace = true }
 }
 
 targets {

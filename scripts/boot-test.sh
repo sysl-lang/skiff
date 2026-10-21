@@ -17,24 +17,42 @@ scratch="$root/scratch"
 mkdir -p "$scratch"
 
 # What each console must print. The MPS2 boots are one core: it finds the kernel's shared state inside
-# the link script's `.shared`, takes three ticks, finds the time base agreeing with its own count, and
-# ends through semihosting with status 0.
+# the link script's `.shared`, takes three ticks, finds the time base agreeing with its own count, then
+# runs the scenarios' tasks (boards/scenarios): two equal tasks taking turns on the tick, two keeping
+# their FPU registers across switches, a high-priority task running on the tick its sleep ends, and a
+# stale handle refused. It ends through semihosting with status 0.
+tasks_expected() {
+    echo "skiff: core $1 task A 1
+skiff: core $1 task B 1
+skiff: core $1 task A 2
+skiff: core $1 task B 2
+skiff: core $1 task A 3
+skiff: core $1 task B 3
+skiff: core $1 $2
+skiff: core $1 high priority task woke on its tick
+skiff: core $1 refuses a stale handle"
+}
 mps2_expected="skiff: hello
 skiff: .shared holds the shared state
 skiff: core 0 tick 1
 skiff: core 0 tick 2
 skiff: core 0 tick 3
-skiff: core 0 time base agrees"
+skiff: core 0 time base agrees
+$(tasks_expected 0 "f32 registers survived the switches")"
 
-# The AN521's two cores run one image, each greeting and ticking on the UART of its own number. Core 1
-# then faults on purpose: it reports the fault on its own console and stops. Core 0 sees it stopped,
-# takes more ticks, finds that the time base counted its own ticks and none of core 1's, and stops the
-# machine with status 0.
+# The AN521's two cores run one image, each greeting and ticking on the UART of its own number, then
+# running its own tasks at once with the other. Core 0 has no FPU (the SSE-200's CPU0, in QEMU as on
+# the FPGA image), so only core 1 checks the FPU registers; core 0 may not create a task on core 1 once
+# it runs. Core 1 then faults on purpose: it reports the fault on its own console and stops. Core 0 sees
+# it stopped, takes more ticks, finds that the time base counted its own ticks and none of core 1's, and
+# stops the machine with status 0.
 an521_core0_expected="skiff: hello from core 0
 skiff: .shared holds the shared state
 skiff: core 0 tick 1
 skiff: core 0 tick 2
 skiff: core 0 tick 3
+$(tasks_expected 0 "has no FPU")
+skiff: core 0 may not create a task on core 1, which runs
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
 skiff: core 0 time base agrees"
@@ -42,6 +60,7 @@ an521_core1_expected="skiff: hello from core 1
 skiff: core 1 tick 1
 skiff: core 1 tick 2
 skiff: core 1 tick 3
+$(tasks_expected 1 "f32 registers survived the switches")
 skiff: core 1 fault BusFault"
 
 failed=0

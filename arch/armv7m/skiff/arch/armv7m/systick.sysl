@@ -13,10 +13,16 @@ private const CSR_ENABLE: u32 = 1 << 0
 private const CSR_TICKINT: u32 = 1 << 1
 private const CSR_CLKSOURCE: u32 = 1 << 2      // the processor clock, not the external reference
 
-// Interrupt the running core every `cycles` processor cycles from now on. The reload register holds 24
-// bits, so a tick is at most 2^24 cycles long.
+private struct Priority
+    v: volatile u8
+
+// Interrupt the running core every `cycles` processor cycles from now on, at the kernel's handler
+// priority, the lowest, which `mask` holds off. The reload register holds 24 bits, so a tick is at most
+// 2^24 cycles long.
 systick_start(cycles: u32)
     if cycles == 0 || cycles > 0x100_0000 then panic("skiff: a SysTick period outside 1 to 2^24 cycles")
+    val priority: *Priority = ptr_cast(SYSTICK_PRIORITY)
+    priority.v = KERNEL_HANDLER_PRIORITY
     val t: *SysTick = ptr_cast(SYSTICK)
     t.csr = 0
     t.rvr = cycles - 1
