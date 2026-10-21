@@ -130,4 +130,5 @@ defect that must make it fail.
 | 9 | The H747I-DISCO (needs the board): clocks and power, HSEM, one image on both cores with shared state uncached on the M7, then the two-image build with the cache trait | milestone 4's scenarios on the board in both builds, caches on |
 | 10 | Supervision and power: a watchdog per core, faults forwarded, one console, tickless idle, coordinated stop | a hung core is noticed; both cores enter Stop and wake |
 
-Every milestone waits for sysl 0.3.7: 2 on needs `options`, and 8 needs the explicit type-argument fix.
+skiff needs sysl 0.3.7 or later: milestone 1 on uses `options`, and 8 uses the explicit type-argument
+fix and a link script per feature.
