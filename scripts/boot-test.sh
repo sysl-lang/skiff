@@ -29,7 +29,7 @@ skiff: core $1 task B 2
 skiff: core $1 task A 3
 skiff: core $1 task B 3
 skiff: core $1 $2
-skiff: core $1 high priority task woke on its tick
+skiff: core $1 high priority task ran on the tick that woke it
 skiff: core $1 refuses a stale handle"
 }
 mps2_expected="skiff: hello

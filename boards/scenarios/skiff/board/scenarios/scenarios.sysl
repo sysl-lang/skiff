@@ -2,7 +2,7 @@ module skiff.board.scenarios
 
 import sysl.sync.Atomic
 import skiff.kernel
-import skiff.kernel.{Port, Task, TaskError}
+import skiff.kernel.{Port, Task, TaskError, TaskState}
 
 // The tasks each core runs, and what each shows. Every scenario starts at its own tick of the time base,
 // counted from the core's `epoch`, the tick its tasks started on, so that one has finished before the
@@ -14,8 +14,8 @@ import skiff.kernel.{Port, Task, TaskError}
 //   - P1 and P2, at priority 2, sleep until tick 15 and then preempt B. Each fills s16-s31 with its own
 //     values and yields to the other, which does the same, before checking that its own are intact. So
 //     the switch must keep the FPU registers a task uses. A core with no FPU says so instead.
-//   - H, at priority 3, sleeps until tick 30 and must run on the owner's tick its sleep ends on,
-//     although B never yields.
+//   - H, at priority 3, sleeps until tick 30 and must run on the owner's tick that wakes it, although B
+//     never yields: B, asking H's state as it spins, must never find H ready.
 //   - R, at priority 4, at tick 45: A's handle, kept since A was created, is refused now that A has
 //     exited, and still refused once a new task has A's slot. Core 0 of several may not create a task
 //     on core 1, which runs. Then the board ends the run.
@@ -43,6 +43,8 @@ struct Entries
 private var stacks: [kernel.CORES][STACKS][STACK_WORDS]u32
 private var epochs: [kernel.CORES]u32
 private var handles: [kernel.CORES]Task
+private var high: [kernel.CORES]Task
+private var overtaken: [kernel.CORES]bool
 private var arrived: [kernel.CORES]Atomic[u32]
 private var finished: [kernel.CORES]Atomic[u32]
 private var kept: [kernel.CORES]Atomic[u32]
@@ -53,7 +55,7 @@ create_tasks[P: Port](p: *P, core: u32, e: *Entries)
     val _ = created(kernel.create(p, core, stacks[core][1], e.b, 1))
     val _ = created(kernel.create(p, core, stacks[core][2], e.p1, 2))
     val _ = created(kernel.create(p, core, stacks[core][3], e.p2, 2))
-    val _ = created(kernel.create(p, core, stacks[core][4], e.h, 3))
+    high[core] = created(kernel.create(p, core, stacks[core][4], e.h, 3))
     val _ = created(kernel.create(p, core, stacks[core][5], e.r, 4))
 
 private created(result: Result[Task, TaskError]) -> Task = result match
@@ -80,7 +82,8 @@ take_turns[P: Port](p: *P, label: string, spin: bool) -> never
         val t = kernel.here(p).own_ticks()
         while kernel.here(p).own_ticks() == t do ()
     if spin
-        while kernel.ticks() - epochs[me] < 40 do ()
+        while kernel.ticks() - epochs[me] < 40
+            if kernel.state(p, high[me]) == Ok(TaskState.Ready) then overtaken[me] = true
     kernel.exit(p)
 
 // FPU registers through switches: `skiff_fp_probe` (below) writes `base`, `base + 1`, … into s16-s31,
@@ -115,20 +118,19 @@ fp_task[P: Port](p: *P, base: u32, fpu: bool, e: *Entries) -> never
             p.write(" of 32\n".bytes)
     kernel.exit(p)
 
-// H: sleep until tick 30 and check that it runs on the owner's tick its sleep ends on. Core 0 keeps the
-// time base, so there the tick is the deadline itself. Another core's tick falls anywhere in core 0's
-// period, so core 0 may have taken one more by the time the task reads the time base.
+// H: sleep until tick 30 and check that it ran on the owner's tick that woke it. B, which never yields,
+// asks for H's state all the while it spins: had it ever found H ready, H was waiting while B ran. The
+// check reads no clock, so it holds however late QEMU delivers a core's tick.
 wake_on_time[P: Port](p: *P) -> never
     val me = kernel.here_id(p)
     val due = epochs[me] + 30
     kernel.sleep_until(p, due)
-    val late = kernel.ticks() - due
-    if late <= (if me == 0 then 0 else 1)
-        say(p, "high priority task woke on its tick\n")
+    if overtaken[me]
+        say(p, "high priority task waited while a lower one ran\n")
+    else if !kernel.expired(due, kernel.ticks())
+        say(p, "high priority task woke before its deadline\n")
     else
-        say(p, "high priority task woke ")
-        kernel.write_dec(p, late)
-        p.write(" ticks late\n".bytes)
+        say(p, "high priority task ran on the tick that woke it\n")
     kernel.exit(p)
 
 // R, at tick 45: a stale handle is refused, before its slot is reused and after; and, on core 0 of

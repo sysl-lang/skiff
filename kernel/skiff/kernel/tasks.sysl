@@ -282,8 +282,7 @@ create[P: Port](p: *P, core: u32, stack: []u32, entry: *extern() -> never, prior
 // Delete the task `t` names: it never runs again, and its slot is free for another. A task deleting
 // itself is switched away from at once. Only the owner deletes its tasks.
 delete[P: Port](p: *P, t: Task) -> Result[unit, TaskError]
-    if usize(t.core()) >= option_cores then return Err(TaskError.Stale)
-    if t.core() != here_id(p) then return Err(TaskError.Remote)
+    owned(p, t)?
     val c = here(p)
     val state = p.mask()
     val result = c.sched.delete(t) match
@@ -293,6 +292,24 @@ delete[P: Port](p: *P, t: Task) -> Result[unit, TaskError]
         Err(e) -> Err(e)
     p.restore(state)
     result
+
+// The state of the task `t` names: `Ready`, which the running task is too, or `Sleeping`. Only the
+// owner asks.
+state[P: Port](p: *P, t: Task) -> Result[TaskState, TaskError]
+    owned(p, t)?
+    val c = here(p)
+    val mask = p.mask()
+    val result = c.sched.check(t) match
+        Ok(i) -> Ok(c.sched.tasks[i].state)
+        Err(e) -> Err(e)
+    p.restore(mask)
+    result
+
+// Whether `t` names a core the running core may act for: one that exists, and is the running core.
+private owned[P: Port](p: *P, t: Task) -> Result[unit, TaskError]
+    if usize(t.core()) >= option_cores then return Err(TaskError.Stale)
+    if t.core() != here_id(p) then return Err(TaskError.Remote)
+    Ok(())
 
 // The running task's handle.
 current[P: Port](p: *P) -> Task

@@ -44,6 +44,7 @@ probe() -> i32
         kernel.sleep(&m, 1)
         kernel.sleep_until(&m, 1)
         kernel.yield_now(&m)
+        if kernel.state(&m, t.unwrap()).is_ok() then return 1
         if kernel.switch_context(&m, 0) == 0 || kernel.current(&m) == t.unwrap() then kernel.exit(&m)
     if m.cores() > 2 then kernel.run(&m, stack, &body)
     kernel.boot(&m)
