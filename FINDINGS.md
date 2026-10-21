@@ -34,5 +34,6 @@ Status: sent to `sysl` for 0.3.7.
 images share one target, so nothing can choose between the scripts. `--features m4` still links with the
 target's one script.
 
-Status: sent to `sysl` for 0.3.7; the shape (a target entry with `when = <feature>`, or a features
-block inside the target) is the user's call.
+Status: sent to `sysl` for 0.3.7. The shape is a `targets` entry with `when = <feature>` whose keys
+override the plain entry's while the feature is on. An OS is one program, never one workspace member per
+image.
