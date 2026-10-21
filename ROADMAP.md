@@ -25,9 +25,9 @@ Its kernel is not.
 
 ## Many cores: partitioned, not global
 
-**Each core runs its own scheduler, and every task belongs to one core.** There is no run queue shared by
-all cores. That is the only model the STM32H747 allows (its M7 and M4 differ in instruction set, FPU and
-cache), and on identical cores it is still the better real-time model: each core's worst case is analysed
+**Each core runs its own scheduler, and every task belongs to one core** (partitioned fixed-priority
+scheduling). There is no run queue shared by all cores. It suits cores that differ (the STM32H747's M7
+and M4 differ in FPU and cache), and on identical cores it is still the better real-time model: each core's worst case is analysed
 alone, nothing migrates, and no lock is held across the whole kernel. A task pinned to core 1 to feed a
 PIO or an I2S stream is the ordinary case, not a special one. Explicit migration may come later; a global
 run queue is not planned.
@@ -50,16 +50,26 @@ What that asks of the kernel:
   the STM32H7. `sysl.sync`'s `Lock`, `IrqLock` and `Guarded` are the base.
 - **A wake on another core goes through that core's inbox.** The waker posts to the target core's
   lock-free inbox and rings its doorbell; a core never edits another core's ready set. The same path
-  serves cores in one image and cores in two.
+  serves one image and two.
+- **Data both cores touch is placed, not assumed.** Kernel state shared across cores lives in a section
+  the board maps uncached on a core with a data cache (the M7); a core without one ignores it.
 - **One time base.** Timeouts that cross cores need one clock: a timer every core can read, or the tick
   from one core.
 
-## One image or two
+## One image, everywhere by default
 
-- **One image** (RP2350, the AN521, any identical cores sharing coherent memory): every kernel object may
-  be used from any core.
-- **Two images** (the STM32H747; later anything with a second core of another kind): an object used from
-  both is declared in a **system description**, one sysl module both images import. It holds:
+**A multicore program is one image**: one program, one `sysl build`, one binary. Every core enters the same
+reset handler, reads its core number and starts its own scheduler, and every kernel object may be used
+from any core.
+
+That holds on the STM32H747 as well. Its M7 and M4 are both Armv7E-M and run the same Thumb-2 code; an
+image built for the M4 (`thumbv7em-freestanding`, single-precision FPU) runs on the M7 unchanged. One image
+costs the M7 two things: `f64` arithmetic becomes library calls, and memory both cores touch must be
+memory the M7 does not cache (the M7 still caches code and the data only it uses, placed explicitly).
+
+**Two images are an option for when the M7's extras matter** (hardware doubles, the cache everywhere),
+as a build setting rather than a different program design. Then an object used from both is declared in
+a **system description**, one sysl module both images import. It holds:
   - the shared memory's layout, and which objects live there;
   - which core owns each peripheral and each interrupt (EXTI has a mask per core, RCC an enable per
     core); owning one from both is a build error;
@@ -77,7 +87,7 @@ What that asks of the kernel:
 kernel/          the portable kernel: cores, tasks, waits, objects, channels, the traits below
 arch/<family>/   armv7m, armv8m, pmsa (MPU encoders), armv6m later: context switch, faults, the MPU
 chips/<chip>/    mps2, an521, rp2350, stm32h747: memory map, clocks, IRQ numbers, doorbell, lock
-boards/<board>/  one program per board and image: link script, entry, the system description
+boards/<board>/  one program per board (two only for a two-image build): link script, entry
 tools/portable/  the gate's proof that the kernel builds for every CPU family
 ```
 
@@ -92,9 +102,9 @@ A dependency only points down the list. `kernel/` names no register, interrupt n
 |---|---|---|
 | host, `sysl test kernel` | the kernel's decisions over fake ports, with N fake cores | edge cases no boot reaches |
 | QEMU `mps2-an500` / `mps2-an386` | one core, M7 and M4 | the single-core kernel |
-| QEMU `mps2-an521` | one image on both M33s, and two images | cross-core waits, the inbox, locks, the handshake, under multi-threaded TCG |
+| QEMU `mps2-an521` | one image on both M33s; two images for the option | cross-core waits, the inbox, locks, the handshake, under multi-threaded TCG |
 | Pico 2 (RP2350) | one image, two M33s | real silicon, the SIO FIFO doorbell, the spinlocks (erratum E2) |
-| H747I-DISCO | two images, M7 + M4 | HSEM, clocks and power, the M7's caches |
+| H747I-DISCO | one image on M7 + M4, then two | HSEM, clocks and power, the M7's caches, uncached shared state |
 
 Every milestone has a test that passes or fails on what the machine prints, and controls: a deliberate
 defect that must make it fail.
@@ -110,9 +120,9 @@ defect that must make it fail.
 | 4 | Cross-core wakes: inboxes and doorbells; channels and the buffer pool | a priority-inversion scenario across cores completes in bounded time; buffers round-trip without a copy |
 | 5 | Pico 2, the first real silicon: `chips/rp2350`, `boards/pico2` (one image, both M33s), the SIO FIFO doorbell, the lock (spinlocks or exclusives, per erratum E2), UF2 | milestones 1–4's scenarios pass on the board |
 | 6 | Protection: stack and null guards, unprivileged tasks with their own maps and kernel calls | the skiff-old protection scenarios, on every core, the Pico 2 included |
-| 7 | Two images: the system description, ownership checked at build, the fingerprint handshake | the AN521 boots two images; mismatched layouts stop at the handshake |
-| 8 | The rest of the kernel on the wait queue: software timers, stream and message buffers, task control, statistics and stack high-water marks | skiff-old's scenarios for each |
-| 9 | The H747I-DISCO (needs the board): clocks and power, HSEM, both images flashed, caches with the cache trait | milestones 4 and 7 on the board, caches on |
+| 7 | The rest of the kernel on the wait queue: software timers, stream and message buffers, task control, statistics and stack high-water marks | skiff-old's scenarios for each |
+| 8 | Two images, the option: the system description, ownership checked at build, the fingerprint handshake | the AN521 boots two images; mismatched layouts stop at the handshake |
+| 9 | The H747I-DISCO (needs the board): clocks and power, HSEM, one image on both cores with shared state uncached on the M7, then the two-image build with the cache trait | milestone 4's scenarios on the board in both builds, caches on |
 | 10 | Supervision and power: a watchdog per core, faults forwarded, one console, tickless idle, coordinated stop | a hung core is noticed; both cores enter Stop and wake |
 
-Every milestone waits for sysl 0.3.7: 2 on needs `options`, and 7 needs the explicit type-argument fix.
+Every milestone waits for sysl 0.3.7: 2 on needs `options`, and 8 needs the explicit type-argument fix.
