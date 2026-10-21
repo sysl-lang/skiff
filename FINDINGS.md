@@ -39,3 +39,12 @@ Status: fixed in sysl 0.3.7. The spelling is a `features` block inside the targe
 `thumb-freestanding { linker_script = "one.ld", features { m4 { linker_script = "m4.ld" } } }`. An enabled
 feature's entry overrides the target's keys; two enabled features setting one key are refused; an
 undeclared feature is refused. An OS is one program, never one workspace member per image.
+
+## FINDINGS 5 — an `if` is never a constant expression
+
+`const A = if N > 1 then N else 0` is refused ("the value of 'A' is not a constant expression"), and so is
+the same `if` in an array length or an `@assert`. The same `if` as the body of a `const` function folds. The
+inbox array is sized `option_cores` when there is more than one core and 0 otherwise, so today it goes
+through the helper `inbox_cores` in `kernel/skiff/kernel/shared.sysl`, which is inlined once `if` folds.
+
+Status: sent to `sysl` (found on 0.3.7).
