@@ -1,6 +1,8 @@
 module skiff.kernel
 @tests
 
+import sysl.sync.Atomic
+
 // The kernel on the host, over a machine that records what it is asked to write. Every boot test on a
 // board checks the same banner through a real console.
 
@@ -9,7 +11,9 @@ private struct Recorder
     used: usize
     count: u32
     me: u32
+    hz: u32
 
+// The recorder's tick is taken by hand: `idle` takes one, as a real core's sleep ends at its tick.
 impl Machine for Recorder
     write(*self, bytes: []const u8)
         for b in bytes
@@ -18,9 +22,15 @@ impl Machine for Recorder
 
     cores(*self) -> u32 = self.count
 
-    core(*self) -> u32 = self.me
+    core_id(*self) -> u32 = self.me
 
-private recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me)
+    start_ticks(*self, hz: u32)
+        self.hz = hz
+
+    idle(*self)
+        tick(self)
+
+private recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0)
 
 // Whether `r` recorded exactly `want`.
 private recorded(r: *Recorder, want: string) -> bool
@@ -57,3 +67,93 @@ hex_digits()
     write_hex(&r, 0x0000_8200)
     write_hex(&r, 0xdead_beef)
     assert(recorded(&r, "0x000000000x000082000xdeadbeef"), "hexadecimal digits")
+
+@test("a deadline has come when it is now or past, and not before")
+deadline_either_side()
+    assert(expired(100, 100), "a deadline of now")
+    assert(expired(100, 101), "a deadline one tick past")
+    assert(!expired(101, 100), "a deadline one tick ahead")
+    assert(!expired(0x7fff_ffff, 0), "a deadline 2^31 - 1 ticks ahead")
+
+@test("a deadline compares across the counter's wrap")
+deadline_across_wrap()
+    // 0xffff_fffe + 7 wraps to 5: seven ticks ahead, then reached, then passed.
+    assert(!expired(5, 0xffff_fffe), "a deadline past the wrap is still ahead")
+    assert(!expired(5, 0xffff_ffff), "one tick before the wrap")
+    assert(!expired(5, 4), "one tick before the deadline, after the wrap")
+    assert(expired(5, 5), "the deadline, after the wrap")
+    assert(expired(0xffff_ffff, 2), "a deadline before the wrap, seen after it")
+
+@test("core 0's tick advances the time base and another core's does not")
+only_core_0_keeps_time()
+    var time: Atomic[u32] = Atomic(0)
+    var first = Core(0, Atomic(0), false)
+    var second = Core(1, Atomic(0), false)
+    first.tick(&time)
+    second.tick(&time)
+    second.tick(&time)
+    assert_eq(first.own_ticks(), 1)
+    assert_eq(second.own_ticks(), 2)
+    assert_eq(time.load(), 1)
+    assert(first.keeps_time(), "core 0 keeps time")
+    assert(!second.keeps_time(), "core 1 does not")
+
+@test("the time base wraps from the largest u32 to 0")
+time_base_wraps()
+    var time: Atomic[u32] = Atomic(0xffff_ffff)
+    var first = Core(0, Atomic(0xffff_ffff), false)
+    first.tick(&time)
+    assert_eq(time.load(), 0)
+    assert_eq(first.own_ticks(), 0)
+
+@test("with one core, here() is the one Core and never asks the machine")
+here_on_one_core()
+    var r = recorder(1, 5)
+    assert_eq(option_cores, 1)
+    val c = here(&r)
+    assert_eq(c.id, 0)
+    assert(c == here(&r), "the same Core every time")
+
+@test("start announces the core ready and starts its tick at tick_hz")
+start_announces_ready()
+    var r = recorder(1, 0)
+    assert(!ready(0), "not ready before start")
+    start(&r)
+    assert(ready(0), "ready after start")
+    assert(!stopped(0), "not stopped")
+    assert_eq(r.hz, option_tick_hz)
+
+@test("await_tick idles until the core's next tick, which on core 0 moves the time base")
+await_tick_counts()
+    var r = recorder(1, 0)
+    start(&r)
+    assert_eq(await_tick(&r), 1)
+    assert_eq(await_tick(&r), 2)
+    assert_eq(ticks(), 2)
+    assert_eq(here(&r).own_ticks(), 2)
+
+@test("a fault is reported naming the core and its kind, and the core is seen stopped")
+fault_reports_and_stops()
+    var r = recorder(1, 0)
+    start(&r)
+    fault(&r, "BusFault")
+    assert(recorded(&r, "skiff: core 0 fault BusFault\n"), "the fault report")
+    assert(stopped(0), "stopped")
+    assert(!ready(0), "no longer ready")
+    assert(here(&r).stopped, "the Core says so")
+
+@test("the shared tables are sized by the cores option: one core has a state and no inboxes")
+shared_sizes()
+    assert_eq(option_cores, 1)
+    assert_eq(INBOX_CORES, 0)
+    assert_eq(core_state(0), CORE_OFFLINE)
+
+@test("the shared state is within bounds that hold it, and not within bounds that miss any of it")
+shared_placement()
+    val at = usize(time_base())
+    val bytes = sizeof(Shared)
+    assert(shared_within(at, at + bytes), "exactly its own bytes")
+    assert(shared_within(at - 64, at + bytes + 64), "a larger section")
+    assert(!shared_within(at + 1, at + bytes), "its first byte outside")
+    assert(!shared_within(at, at + bytes - 1), "its last byte outside")
+    assert(!shared_within(0, 0), "an empty section")

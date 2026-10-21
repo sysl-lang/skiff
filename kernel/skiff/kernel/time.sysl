@@ -1,0 +1,13 @@
+module skiff.kernel
+
+import sysl.sync.Ordering
+
+// Time: one counter for every core, in `.shared`, advanced by core 0's tick. Every core ticks at the same
+// rate and compares its deadlines with this counter, so a timeout means the same on every core.
+
+// The time base: the ticks core 0 has taken since it started its tick.
+ticks() -> u32 = time_base().load(Ordering.Acquire)
+
+// Whether `deadline` has come at `now`. Both are tick counts that wrap, and a deadline is never more than
+// 2^31 ticks away, so their difference read as signed says which side of `now` the deadline is on.
+expired(deadline: u32, now: u32) -> bool = i32(deadline - now) <= 0

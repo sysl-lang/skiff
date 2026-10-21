@@ -9,5 +9,5 @@ package {
 }
 
 dependencies {
-  kernel { workspace = true }
+  kernel { workspace = true, options = { cores = 2 } }
 }

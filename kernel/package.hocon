@@ -5,3 +5,8 @@ package {
   name    = "kernel"
   version = "0.0.1"
 }
+
+options {
+  cores   { type = usize, default = 1, range = [1, 8], doc = "how many cores run the kernel, each with a Core of its own" }
+  tick_hz { type = u32, default = 100, range = [1, 10000], doc = "how many times a second every core ticks" }
+}

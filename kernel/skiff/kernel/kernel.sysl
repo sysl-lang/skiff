@@ -6,11 +6,17 @@ trait Machine
     // Write `bytes` to this core's console, waiting for room as long as it takes.
     write(*self, bytes: []const u8)
 
-    // How many cores run the kernel: 1 on a single-core machine.
+    // How many cores the machine has: 1 on a single-core machine.
     cores(*self) -> u32
 
     // The number of the core running this call, from 0.
-    core(*self) -> u32
+    core_id(*self) -> u32
+
+    // Start this core's periodic tick at `hz` a second. Each tick calls `kernel.tick` on this core.
+    start_ticks(*self, hz: u32)
+
+    // Sleep until an interrupt has been taken on this core. It may return at once if one is pending.
+    idle(*self)
 
 // Bring the kernel up on `m`: greet on this core's console. On a machine with more than one core the
 // greeting names the core. Answers the status the machine should stop with: 0 for success.
@@ -18,6 +24,6 @@ boot[M: Machine](m: *M) -> i32
     m.write("skiff: hello".bytes)
     if m.cores() > 1
         m.write(" from core ".bytes)
-        write_dec(m, m.core())
+        write_dec(m, m.core_id())
     m.write("\n".bytes)
     0

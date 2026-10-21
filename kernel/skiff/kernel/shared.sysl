@@ -1,0 +1,68 @@
+module skiff.kernel
+
+import sysl.sync.{Atomic, Ordering}
+
+// `.shared`: everything another core can reach, in one structure in one section. The link script places
+// the section between `__shared_start` and `__shared_end`, core 0 zeroes it before it releases the other
+// cores, and in a build of two images both link scripts put it at the same address.
+
+// What one core asks of another through its inbox: a kind and the task it is about.
+struct Message
+    kind: u32
+    task: u32
+
+// How many messages one inbox ring holds.
+const INBOX_SLOTS: usize = 16
+
+// A single-producer, single-consumer ring of messages: the sending core writes `tail` and the slots, the
+// receiving core writes `head`.
+struct Ring
+    head: Atomic[u32]
+    tail: Atomic[u32]
+    slots: [INBOX_SLOTS]Message
+
+// How many cores have inboxes: none on a single core, which has no other core to hear from.
+const INBOX_CORES: usize = inbox_cores(option_cores)
+
+private const inbox_cores(cores: usize) -> usize = if cores > 1 then cores else 0
+
+// The `.shared` structure.
+//   - `time` is the time base, advanced by core 0's tick alone.
+//   - `states` holds each core's state as the others see it: offline, ready or stopped.
+//   - `inboxes[to][from]` is the ring core `from` posts to core `to` through.
+struct Shared
+    time: Atomic[u32]
+    states: [option_cores]Atomic[u32]
+    inboxes: [INBOX_CORES][INBOX_CORES]Ring
+
+private[kernel] const CORE_OFFLINE: u32 = 0
+private[kernel] const CORE_READY: u32 = 1
+private[kernel] const CORE_STOPPED: u32 = 2
+
+// A section's name is the object format's: Mach-O, where the host tests run on a Mac, spells it with a
+// segment.
+#if macos
+@section("__DATA,__shared")
+#else
+@section(".shared")
+#endif
+private var shared: Shared
+
+// Make core `n`'s state `state`, for the other cores to read.
+private[kernel] announce(n: u32, state: u32)
+    shared.states[n].store(state, Ordering.Release)
+
+// Core `n`'s state as the other cores see it.
+private[kernel] core_state(n: u32) -> u32 = shared.states[n].load(Ordering.Acquire)
+
+// The time base's counter.
+private[kernel] time_base() -> *Atomic[u32] = &shared.time
+
+// Whether everything another core can reach lies in [start, end): the bounds the link script gives
+// `.shared`, which the board reads from `__shared_start` and `__shared_end`. The inboxes are named on
+// their own, since they are what every other core writes.
+shared_within(start: usize, end: usize) -> bool
+    within(usize(&shared), sizeof(Shared), start, end) && within(usize(&shared.inboxes), sizeof([INBOX_CORES][INBOX_CORES]Ring), start, end)
+
+// Whether `bytes` bytes at `at` lie in [start, end).
+private within(at: usize, bytes: usize, start: usize, end: usize) -> bool = at >= start && at + bytes <= end
