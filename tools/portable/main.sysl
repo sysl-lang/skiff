@@ -2,6 +2,7 @@
 // kernel that is generic over the port is called from here as well. The kernel is built for two cores,
 // so the paths between cores are built for every CPU family too.
 
+import sysl.sync.{Atomic, Lock}
 import skiff.kernel
 import skiff.kernel.Port
 
@@ -21,8 +22,30 @@ impl Port for Nothing
     start_first(*self, sp: usize) -> never = panic("no task runs here")
     mask(*self) -> u32 = 0
     restore(*self, state: u32) = ()
+    spin_lock(*self, word: *Atomic[u32]) = ()
+    spin_try_lock(*self, word: *Atomic[u32]) -> bool = true
+    spin_unlock(*self, word: *Atomic[u32]) = ()
 
 private var stack: [64]u32 = [0; 64]
+private var units: kernel.Semaphore
+private var guard: kernel.Mutex
+private var word: kernel.KernelLock
+
+// The waits and the locks, over the port. The objects are filled in at run time, as one in `.shared`
+// must be.
+private waits(m: *Nothing) -> bool
+    units = kernel.Semaphore.new("units", 0, 2)
+    guard = kernel.Mutex.new("guard")
+    word = kernel.KernelLock.new("word")
+    var held = word.on(m)
+    held.acquire()
+    held.release()
+    if !held.try_acquire() then return false
+    held.release()
+    if !units.give(m) || !units.try_take(m) || units.take(m, 1) || units.available(m) != 0 then return false
+    if !guard.lock(m, kernel.FOREVER) then return false
+    guard.unlock(m)
+    guard.holder() == kernel.NO_TASK
 
 private body() -> never
     loop
@@ -44,7 +67,7 @@ probe() -> i32
         kernel.sleep(&m, 1)
         kernel.sleep_until(&m, 1)
         kernel.yield_now(&m)
-        if kernel.state(&m, t.unwrap()).is_ok() then return 1
+        if kernel.state(&m, t.unwrap()).is_ok() || !waits(&m) then return 1
         if kernel.switch_context(&m, 0) == 0 || kernel.current(&m) == t.unwrap() then kernel.exit(&m)
     if m.cores() > 2 then kernel.run(&m, stack, &body)
     kernel.boot(&m)

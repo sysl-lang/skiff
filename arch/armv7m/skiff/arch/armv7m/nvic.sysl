@@ -1,0 +1,48 @@
+module skiff.arch.armv7m
+
+// The running core's NVIC: the chip's interrupts, numbered from 0 after the sixteen system exceptions.
+// Each core of a multi-core chip has its own.
+
+private struct Word
+    v: volatile u32
+
+private struct Byte
+    v: volatile u8
+
+private const NVIC_ISER: usize = 0xE000_E100    // set-enable
+private const NVIC_ICER: usize = 0xE000_E180    // clear-enable
+private const NVIC_ISPR: usize = 0xE000_E200    // set-pending
+private const NVIC_ICPR: usize = 0xE000_E280    // clear-pending
+private const NVIC_IPR: usize = 0xE000_E400     // a priority byte per interrupt
+
+// The priority an interrupt that calls the kernel runs at: one `mask` holds off.
+const KERNEL_IRQ_PRIORITY: u8 = 0xc0
+
+// The word of the register array at `base` that holds interrupt `irq`'s bit, and the bit.
+private nvic_word(base: usize, irq: u32) -> *Word = ptr_cast(base + 4 * usize(irq / 32))
+private nvic_bit(irq: u32) -> u32 = 1 << (irq % 32)
+
+// Let interrupt `irq` through, forgetting any request already pending.
+enable_irq(irq: u32)
+    nvic_word(NVIC_ICPR, irq).v = nvic_bit(irq)
+    nvic_word(NVIC_ISER, irq).v = nvic_bit(irq)
+
+// Stop interrupt `irq` from being taken; a request stays pending.
+disable_irq(irq: u32)
+    nvic_word(NVIC_ICER, irq).v = nvic_bit(irq)
+
+// Give interrupt `irq` `priority`, 0 the most urgent. A handler that calls the kernel runs at
+// `KERNEL_IRQ_PRIORITY`, where `mask` holds it off.
+set_irq_priority(irq: u32, priority: u8)
+    val b: *Byte = ptr_cast(NVIC_IPR + usize(irq))
+    b.v = priority
+
+// Raise interrupt `irq` from software, as if its device had asked. Once it is enabled and not masked it
+// is taken before the next instruction that the barriers let through.
+pend_irq(irq: u32)
+    nvic_word(NVIC_ISPR, irq).v = nvic_bit(irq)
+    asm
+        [thumb]
+            "dsb"
+            "isb"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"

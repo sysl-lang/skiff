@@ -3,6 +3,7 @@
 // the time base kept count of them. Then it runs the scenarios' tasks (skiff.board.scenarios), and the
 // last of them stops the machine with the status `boot` answered.
 
+import sysl.sync.Atomic
 import skiff.arch.armv7m
 import skiff.board.scenarios
 import skiff.chip.mps2
@@ -29,11 +30,14 @@ impl Port for Board
     start_first(*self, sp: usize) -> never = armv7m.start_first(sp)
     mask(*self) -> u32 = armv7m.mask()
     restore(*self, state: u32) = armv7m.restore(state)
+    spin_lock(*self, word: *Atomic[u32]) = armv7m.spin_lock(word)
+    spin_try_lock(*self, word: *Atomic[u32]) -> bool = armv7m.spin_try_lock(word)
+    spin_unlock(*self, word: *Atomic[u32]) = armv7m.spin_unlock(word)
 
 // The status `boot` answered, which the last task stops the machine with.
 private var status: i32 = 0
 
-private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet)
+private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise)
 
 // Called by the chip's reset handler once there is a stack and `.bss` and `.shared` are zero.
 @export("skiff_main")
@@ -44,6 +48,9 @@ skiff_main() -> never
     status = kernel.boot(&board)
     if kernel.shared_within(usize(&__shared_start), usize(&__shared_end))
         board.write("skiff: .shared holds the shared state\n".bytes)
+    kernel.shared_bounds(usize(&__shared_start), usize(&__shared_end))
+    armv7m.set_irq_priority(mps2.TIMER0_IRQ, armv7m.KERNEL_IRQ_PRIORITY)
+    armv7m.enable_irq(mps2.TIMER0_IRQ)
     scenarios.create_tasks(&board, 0, &entries)
     kernel.start(&board)
     for _ in 0..<3
@@ -61,15 +68,30 @@ private task_p1() -> never = scenarios.fp_task(&Board(), 0x1000, &entries)
 private task_p2() -> never = scenarios.fp_task(&Board(), 0x2000, &entries)
 private task_h() -> never = scenarios.wake_on_time(&Board())
 private meet() = scenarios.meet(&Board())
+private task_low() -> never = scenarios.low_task(&Board())
+private task_middle() -> never = scenarios.middle_task(&Board())
+private task_high() -> never = scenarios.high_task(&Board())
+private task_timed() -> never = scenarios.timed_task(&Board())
+private task_raiser() -> never = scenarios.raiser_task(&Board(), &entries)
+private task_hammer() -> never = scenarios.hammer_task(&Board())
+
+// Raise timer 0's interrupt from software; the timer itself never runs.
+private raise() = armv7m.pend_irq(mps2.TIMER0_IRQ)
+
+// Timer 0's interrupt: the scenarios' give.
+@export("skiff_timer0")
+board_timer0()
+    scenarios.interrupt(&Board())
 
 private task_idle() -> never
     loop
         armv7m.wait_for_interrupt()
 
-// R: the handle checks, then the end of the run.
+// R: the handle checks, then the waits, then the end of the run.
 private task_r() -> never
     var board = Board()
     scenarios.check_handles(&board, &entries)
+    scenarios.await_waits(&board)
     armv7m.halt(status)
 
 // SysTick: one tick for the kernel.

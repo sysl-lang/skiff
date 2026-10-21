@@ -53,13 +53,15 @@ start[P: Port](p: *P)
     p.start_ticks(option_tick_hz)
 
 // One tick on the running core: count it, wake the sleepers whose deadline it brings, and end the
-// running task's turn. The port's tick interrupt calls it.
+// running task's turn. Then end the waits whose deadline it brings, each under its object's lock, which
+// is taken with no ready set held. The port's tick interrupt calls it.
 tick[P: Port](p: *P)
     val c = here(p)
     val state = p.mask()
     c.tick(time_base())
     if c.sched.started() && c.sched.tick(ticks()) then p.request_switch()
     p.restore(state)
+    if end_expired_waits(p, c) then p.request_switch()
 
 // Idle until the running core takes its next tick, and answer how many it has taken.
 await_tick[P: Port](p: *P) -> u32

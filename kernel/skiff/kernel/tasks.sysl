@@ -64,20 +64,24 @@ enum TaskState
     Free            // no task
     Ready           // in its priority's FIFO; the running task is ready too
     Sleeping        // in the timeout list, or asleep for good
+    Blocked         // waiting on an object (waits.sysl), and in the timeout list if the wait has one
 
 // One slot of a core's table: private to the core, and never pointed at from `.shared`.
 struct Tcb
     sp: usize           // the stack pointer, saved while the task is not running
-    priority: u8
+    priority: u8        // the effective priority: `base`, or higher while it inherits one
     state: TaskState
     generation: u16     // 1 to 4095, changed whenever the slot is freed
     prev: u16           // the neighbours in its priority's FIFO
     next: u16
-    deadline: u32       // the tick a sleep ends on
-    later: u16          // the next sleeper in the timeout list
+    deadline: u32       // the tick a sleep or a wait ends on
+    later: u16          // the next sleeper in the timeout list, or in the list of waits timing out
+    base: u8            // the priority the task was given
+    held: u8            // how many mutexes it holds
+    on: Option[*Waitable]   // what its last wait was on
 
 // An empty slot, in its first generation.
-private[kernel] val FREE_TCB: Tcb = Tcb(0, 0, TaskState.Free, 1, NONE, NONE, 0, NONE)
+private[kernel] val FREE_TCB: Tcb = Tcb(0, 0, TaskState.Free, 1, NONE, NONE, 0, NONE, 0, 0, None)
 
 // One core's table and the choices made over it. It holds no hardware state, so the host tests drive
 // one directly; each core's is in its `Core`.
@@ -88,9 +92,10 @@ struct Scheduler
     tails: [PRIORITIES]u16
     running: u16                // NONE until the core runs its first task
     timeouts: u16               // the first sleeper, in deadline order
+    expiring: u16               // the waits whose deadline has come, for the kernel to end under their objects' locks
 
 // A table with no tasks in it.
-private[kernel] val EMPTY_SCHEDULER: Scheduler = Scheduler([FREE_TCB; option_tasks], 0, [NONE; PRIORITIES], [NONE; PRIORITIES], NONE, NONE)
+private[kernel] val EMPTY_SCHEDULER: Scheduler = Scheduler([FREE_TCB; option_tasks], 0, [NONE; PRIORITIES], [NONE; PRIORITIES], NONE, NONE, NONE)
 
 impl Scheduler
     // Whether the core runs its tasks.
@@ -108,6 +113,8 @@ impl Scheduler
     add_at(*self, i: usize, sp: usize, priority: u8)
         self.tasks[i].sp = sp
         self.tasks[i].priority = priority
+        self.tasks[i].base = priority
+        self.tasks[i].held = 0
         self.tasks[i].state = TaskState.Ready
         self.push(i)
 
@@ -181,14 +188,55 @@ impl Scheduler
         woke || turned
 
     // Wake every sleeper whose deadline has come at `now`, in deadline order. Answers whether one of them
-    // outranks the running task.
+    // outranks the running task. A blocked task whose deadline has come is not woken here: its wait may
+    // be ended by a wake on another core at the same moment, so it moves to the `expiring` list, and the
+    // kernel ends the wait under the object's lock (`end_expired_waits`).
     expire(*self, now: u32) -> bool
         var outranks = false
         while self.timeouts != NONE && expired(self.tasks[usize(self.timeouts)].deadline, now)
             val i = usize(self.timeouts)
             self.timeouts = self.tasks[i].later
-            if self.make_ready(i) then outranks = true
+            if self.tasks[i].state == TaskState.Blocked
+                self.tasks[i].later = self.expiring
+                self.expiring = u16(i)
+            else if self.make_ready(i)
+                outranks = true
         outranks
+
+    // Take the next wait from the `expiring` list, or NONE when it is empty.
+    take_expiring(*self) -> u16
+        val i = self.expiring
+        if i != NONE then self.expiring = self.tasks[usize(i)].later
+        i
+
+    // The running task blocks on `on` until `deadline`, or for as long as it takes with `FOREVER`.
+    block(*self, on: *Waitable, timeout: u32, now: u32)
+        val i = usize(self.running)
+        self.unlink(i)
+        self.tasks[i].state = TaskState.Blocked
+        self.tasks[i].on = Some(on)
+        if timeout == FOREVER then self.tasks[i].later = NONE else self.add_timeout(i, now + timeout)
+
+    // A wait of task `i` has ended: make it ready, out of the timeout list. Answers whether it outranks
+    // the running task.
+    wake(*self, i: usize) -> bool
+        self.remove_timeout(i)
+        self.make_ready(i)
+
+    // Make `priority` task `i`'s effective priority. A ready task moves to the back of its new
+    // priority's FIFO; a blocked one's place among an object's waiters is the kernel's to change.
+    set_effective(*self, i: usize, priority: u8)
+        if self.tasks[i].state == TaskState.Ready
+            self.unlink(i)
+            self.tasks[i].priority = priority
+            self.push(i)
+        else
+            self.tasks[i].priority = priority
+
+    // Whether the highest-priority ready task outranks the running one, so that a switch is due.
+    preempted(*self) -> bool
+        val h = self.highest()
+        h != NONE && self.outranks_running(usize(h))
 
     // Make task `i` ready. Answers whether it outranks the running task.
     make_ready(*self, i: usize) -> bool
@@ -280,10 +328,14 @@ create[P: Port](p: *P, core: u32, stack: []u32, entry: *extern() -> never, prior
     result
 
 // Delete the task `t` names: it never runs again, and its slot is free for another. A task deleting
-// itself is switched away from at once. Only the owner deletes its tasks.
+// itself is switched away from at once. A waiting task's wait is withdrawn first, under its object's
+// lock. Only the owner deletes its tasks.
 delete[P: Port](p: *P, t: Task) -> Result[unit, TaskError]
     owned(p, t)?
     val c = here(p)
+    c.sched.check(t) match
+        Ok(i) -> withdraw(p, c, i)
+        Err(_) -> ()
     val state = p.mask()
     val result = c.sched.delete(t) match
         Ok(running) ->
@@ -371,7 +423,7 @@ switch_context[P: Port](p: *P, sp: usize) -> usize
 
 // The running core's `Core`, from a task: refused before the core runs its tasks, when there is no
 // running task to sleep or yield.
-private running_core[P: Port](p: *P) -> *Core
+private[kernel] running_core[P: Port](p: *P) -> *Core
     val c = here(p)
     if !c.sched.started() then panic("skiff: a task call before the core runs its tasks")
     c

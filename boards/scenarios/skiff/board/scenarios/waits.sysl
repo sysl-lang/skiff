@@ -1,0 +1,170 @@
+module skiff.board.scenarios
+
+import sysl.sync.Atomic
+import skiff.kernel
+import skiff.kernel.{FOREVER, Mutex, Port, Semaphore}
+
+// The waits, each core with objects of its own, from tick 50 of its epoch:
+//
+//   - Tick 50, priority inheritance. Low (priority 1) locks a mutex and works for 5 ticks. High (3)
+//     wants it at tick 52, and Middle (2) starts 20 ticks of work at tick 53. With inheritance Low runs
+//     at High's priority until it unlocks, so High has the mutex before Middle finishes; without it,
+//     Middle keeps Low, and so High, waiting the whole 20 ticks. Once it has unlocked, Low is back at
+//     priority 1, so it runs on only after Middle has finished.
+//   - Tick 78, a timed take of a semaphore nobody gives, which must end after 5 ticks, empty-handed.
+//   - Tick 84, the same task takes a semaphore that timer 0's interrupt gives; at tick 85 the raiser
+//     (priority 2) raises the interrupt from software, and the waiting task (3) must have run by the
+//     time the raiser goes on.
+//   - Tick 90, on a machine of several cores: every core's hammer gives a semaphore in `.shared` twice
+//     and takes it once, for `ROUNDS` rounds, all at once with the others; the count left must be exact,
+//     which it is only if the object's lock keeps the cores out of each other's way. Then core 0 gives
+//     `PASSED` units one at a time through a semaphore of 4 that core 1 takes without waiting.
+
+// How many rounds each core's hammer makes.
+private const ROUNDS: u32 = 100_000
+
+// How many units core 0 passes to core 1.
+private const PASSED: u32 = 1000
+
+private var mutexes: [kernel.CORES]Mutex
+private var never_given: [kernel.CORES]Semaphore
+private var from_irq: [kernel.CORES]Semaphore
+private var middle_done: [kernel.CORES]Atomic[u32]
+private var woke: [kernel.CORES]Atomic[u32]
+private var waits_done: [kernel.CORES]Atomic[u32]
+private var arrived_hammers: Atomic[u32]
+private var done_hammers: Atomic[u32]
+private var refused_takes: Atomic[u32]
+
+// The two objects every core uses: in `.shared`, which start-up zeroes, so core 0 fills them in.
+@section(".shared")
+private var hammered: Semaphore
+@section(".shared")
+private var passed: Semaphore
+
+// Fill in core `core`'s objects, and on core 0 the shared ones. Core 0 calls it for every core before
+// any other core starts.
+fill_objects(core: u32)
+    mutexes[core] = Mutex.new("mutex")
+    never_given[core] = Semaphore.new("never given", 0, 1)
+    from_irq[core] = Semaphore.new("from an interrupt", 0, 1)
+    if core == 0
+        hammered = Semaphore.new("hammered", 0, 0xffff_ffff)
+        passed = Semaphore.new("passed", 0, 4)
+
+// Work for `ticks` ticks of the time base without blocking or yielding.
+private busy(ticks: u32)
+    val start = kernel.ticks()
+    while kernel.ticks() - start < ticks do ()
+
+// Low: lock at tick 50, work 5 ticks, unlock, then say whether it ran on only after Middle finished.
+low_task[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    kernel.sleep_until(p, epochs[me] + 50)
+    val _ = mutexes[me].lock(p, FOREVER)
+    busy(5)
+    mutexes[me].unlock(p)
+    if middle_done[me].load() != 0
+        say(p, "the low task gave up its inherited priority with the mutex\n")
+    else
+        say(p, "the low task kept an inherited priority after unlocking\n")
+    kernel.exit(p)
+
+// Middle: 20 ticks of work from tick 53.
+middle_task[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    kernel.sleep_until(p, epochs[me] + 53)
+    busy(20)
+    middle_done[me].store(1)
+    kernel.exit(p)
+
+// High: lock at tick 52, and say whether Middle had finished by then.
+high_task[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    kernel.sleep_until(p, epochs[me] + 52)
+    val _ = mutexes[me].lock(p, FOREVER)
+    if middle_done[me].load() == 0
+        say(p, "the high task had the mutex before the middle task finished\n")
+    else
+        say(p, "priority inversion: the middle task finished first\n")
+    mutexes[me].unlock(p)
+    kernel.exit(p)
+
+// The timed take at tick 78, then the take an interrupt ends at tick 84.
+timed_task[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    kernel.sleep_until(p, epochs[me] + 78)
+    val start = kernel.ticks()
+    val taken = never_given[me].take(p, 5)
+    val waited = kernel.ticks() - start
+    if !taken && waited >= 5
+        say(p, "a timed take timed out after 5 ticks\n")
+    else
+        say(p, "a timed take ended after ")
+        kernel.write_dec(p, waited)
+        p.write(" ticks\n".bytes)
+    kernel.sleep_until(p, epochs[me] + 84)
+    if from_irq[me].take(p, 20) then woke[me].store(1)
+    kernel.exit(p)
+
+// The raiser, at tick 85: raise timer 0's interrupt through `e.raise`, and say whether the task the
+// interrupt woke ran before the raiser went on.
+raiser_task[P: Port](p: *P, e: *Entries) -> never
+    val me = kernel.here_id(p)
+    kernel.sleep_until(p, epochs[me] + 85)
+    (e.raise)()
+    if woke[me].load() != 0
+        say(p, "an interrupt's give woke a waiting task at once\n")
+    else
+        say(p, "an interrupt's give did not wake the waiting task at once\n")
+    val _ = waits_done[me].add(1)
+    kernel.exit(p)
+
+// Timer 0's interrupt, raised by the raiser: give the semaphore the timed task waits on.
+interrupt[P: Port](p: *P)
+    val _ = from_irq[kernel.here_id(p)].give(p)
+
+// A hammer, at tick 90 on every core of several: give twice, take once, `ROUNDS` times, all cores at
+// once. Then core 0 passes `PASSED` units to core 1, which takes them without waiting.
+hammer_task[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    kernel.sleep_until(p, epochs[me] + 90)
+    val _ = arrived_hammers.add(1)
+    while arrived_hammers.load() < u32(kernel.CORES) do ()
+    for _ in 0..<ROUNDS
+        val _ = hammered.give(p)
+        val _ = hammered.give(p)
+        if !hammered.try_take(p)
+            val _ = refused_takes.add(1)
+    val _ = done_hammers.add(1)
+    if me == 0
+        while done_hammers.load() < u32(kernel.CORES) do ()
+        val left = hammered.available(p)
+        if left == ROUNDS * u32(kernel.CORES) && refused_takes.load() == 0
+            say(p, "two cores' gives and takes left the shared count exact\n")
+        else
+            say(p, "the shared count is ")
+            kernel.write_dec(p, left)
+            p.write(" with ".bytes)
+            kernel.write_dec(p, refused_takes.load())
+            p.write(" takes refused, not ".bytes)
+            kernel.write_dec(p, ROUNDS * u32(kernel.CORES))
+            p.write("\n".bytes)
+        for _ in 0..<PASSED
+            while !passed.give(p) do ()
+    else if me == 1
+        var taken: u32 = 0
+        while taken < PASSED
+            if passed.try_take(p) then taken += 1
+        if passed.available(p) == 0
+            say(p, "took every unit core 0 gave\n")
+        else
+            say(p, "took the units core 0 gave and found more\n")
+    val _ = waits_done[me].add(1)
+    kernel.exit(p)
+
+// Sleep until the running core's waits have all reported.
+await_waits[P: Port](p: *P)
+    val me = kernel.here_id(p)
+    val reports: u32 = if kernel.CORES > 1 then 2 else 1
+    while waits_done[me].load() < reports do kernel.sleep(p, 1)

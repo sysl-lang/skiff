@@ -5,6 +5,7 @@
 // stops it alone. Core 0 sees it stopped, ticks on, checks that the time base counted its ticks and no
 // others, and stops the machine with status 0.
 
+import sysl.sync.Atomic
 import skiff.arch.armv7m
 import skiff.board.scenarios
 import skiff.chip.an521
@@ -40,11 +41,14 @@ impl Port for Board
     start_first(*self, sp: usize) -> never = armv7m.start_first(sp)
     mask(*self) -> u32 = armv7m.mask()
     restore(*self, state: u32) = armv7m.restore(state)
+    spin_lock(*self, word: *Atomic[u32]) = armv7m.spin_lock(word)
+    spin_try_lock(*self, word: *Atomic[u32]) -> bool = armv7m.spin_try_lock(word)
+    spin_unlock(*self, word: *Atomic[u32]) = armv7m.spin_unlock(word)
 
 // The status `boot` answered on core 0, which core 0's last task stops the machine with.
 private var status: i32 = 0
 
-private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet)
+private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise)
 
 @export("skiff_main")
 skiff_main() -> never
@@ -53,10 +57,13 @@ skiff_main() -> never
     armv7m.enable_faults()
     var board = Board()
     val answer = kernel.boot(&board)
+    armv7m.set_irq_priority(an521.TIMER0_IRQ, armv7m.KERNEL_IRQ_PRIORITY)
+    armv7m.enable_irq(an521.TIMER0_IRQ)
     if me == 0
         status = answer
         if kernel.shared_within(usize(&__shared_start), usize(&__shared_end))
             board.write("skiff: .shared holds the shared state\n".bytes)
+        kernel.shared_bounds(usize(&__shared_start), usize(&__shared_end))
         for core in 0u32..<2
             scenarios.create_tasks(&board, core, &entries)
         an521.release_core1(VECTORS)
@@ -76,16 +83,31 @@ private task_p1() -> never = scenarios.fp_task(&Board(), 0x1000, &entries)
 private task_p2() -> never = scenarios.fp_task(&Board(), 0x2000, &entries)
 private task_h() -> never = scenarios.wake_on_time(&Board())
 private meet() = scenarios.meet(&Board())
+private task_low() -> never = scenarios.low_task(&Board())
+private task_middle() -> never = scenarios.middle_task(&Board())
+private task_high() -> never = scenarios.high_task(&Board())
+private task_timed() -> never = scenarios.timed_task(&Board())
+private task_raiser() -> never = scenarios.raiser_task(&Board(), &entries)
+private task_hammer() -> never = scenarios.hammer_task(&Board())
+
+// Raise timer 0's interrupt on the running core from software; the timer itself never runs.
+private raise() = armv7m.pend_irq(an521.TIMER0_IRQ)
+
+// Timer 0's interrupt, on either core: the scenarios' give on that core.
+@export("skiff_timer0")
+board_timer0()
+    scenarios.interrupt(&Board())
 
 private task_idle() -> never
     loop
         armv7m.wait_for_interrupt()
 
-// R: the handle checks, then the end of the run. Core 1 faults; core 0 waits until it sees core 1
-// stopped, ticks on, and stops the machine.
+// R: the handle checks, then the waits, then the end of the run. Core 1 faults; core 0 waits until it
+// sees core 1 stopped, ticks on, and stops the machine.
 private task_r() -> never
     var board = Board()
     scenarios.check_handles(&board, &entries)
+    scenarios.await_waits(&board)
     if an521.core_id() == 1
         val nothing: *Word = ptr_cast(NOWHERE)
         kernel.write_hex(&board, nothing.v)

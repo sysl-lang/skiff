@@ -1,0 +1,173 @@
+module skiff.kernel
+
+import sysl.sync.Lock
+
+// Waiting: the one primitive every object waits through.
+//
+// A task waits on at most one thing at a time, so each task has one `Waiter` record, in `.shared` at
+// `waiters[core][slot]`. An object keeps its waiters in a `WaitQueue`, linked through the records by
+// index, never by pointer: highest priority first, first come first within a priority. Inserting walks
+// the queue; taking the best waiter is its head.
+//
+// A wait, under the object's lock: answer at once if the object can, else fill the record (`Waiting`),
+// enqueue it, block the task on its core (and in its timeout list if the wait has a deadline), release
+// the lock and switch. The task answers from the record's `outcome` when it runs again.
+//
+// A wake, under the object's lock: take the best waiter, set its outcome (`Given` when the object hands
+// itself over, as a semaphore or a mutex does), and make the task ready. Only a waiter still `Waiting`
+// is ever taken, and a timeout also ends a wait only under the lock and only if it is still `Waiting`.
+// So exactly one transition leaves `Waiting`: a timeout after a wake does nothing, and a wake after a
+// timeout finds the waiter gone.
+
+// How a wait ended. `Idle` is 0, which is what `.shared` holds once it is zeroed at start-up.
+enum Outcome: u8
+    Idle = 0        // no wait yet, or one withdrawn when its task was deleted
+    Waiting = 1     // the wait is on
+    Woken = 2       // the object woke the task, handing it nothing
+    Given = 3       // the object handed itself over: a unit of a semaphore, a mutex
+    TimedOut = 4    // the deadline came first
+
+// One task's wait record. `next` links it into an object's queue.
+struct Waiter
+    task: Task          // whose record it is
+    priority: u8        // the task's effective priority when it was queued
+    outcome: Outcome
+    next: u16           // the next waiter's index, or NONE
+    value: u32          // what the wait carries back
+
+// The index of task `slot` of core `core`'s record: `core * option_tasks + slot`. At most 8 cores of
+// 4096 slots, so it fits in a `u16` with NONE left over.
+private[kernel] waiter_index(core: u32, slot: usize) -> u16 = u16(usize(core) * option_tasks + slot)
+
+// An object's waiters, best first. `count` says whether there are any, so a queue of zeros is empty.
+struct WaitQueue
+    head: u16
+    count: u16
+
+impl WaitQueue
+    // The best waiter, or NONE when nobody waits.
+    first(*self) -> u16 = if self.count == 0 then NONE else self.head
+
+    // Queue waiter `w` behind every waiter of its priority or higher.
+    insert(*self, w: u16)
+        val p = waiter(w).priority
+        var before = NONE
+        var at = self.first()
+        while at != NONE && waiter(at).priority >= p
+            before = at
+            at = waiter(at).next
+        waiter(w).next = at
+        if before == NONE then self.head = w else waiter(before).next = w
+        self.count += 1
+
+    // Take waiter `w` out of the queue, answering whether it was in it.
+    remove(*self, w: u16) -> bool
+        var before = NONE
+        var at = self.first()
+        while at != NONE && at != w
+            before = at
+            at = waiter(at).next
+        if at == NONE then return false
+        if before == NONE then self.head = waiter(w).next else waiter(before).next = waiter(w).next
+        self.count -= 1
+        true
+
+// What every object holds to be waited on: its lock and its waiters. A blocked task's `Tcb.on` names
+// it, so that a timeout or a priority change can reach the queue under the lock.
+struct Waitable
+    lock: KernelLock
+    queue: WaitQueue
+
+impl Waitable
+    const new(name: string) -> Waitable = Waitable(KernelLock.new(name), WaitQueue(NONE, 0))
+
+// Whether a task of core `core` is another core's than `me`'s. With one core it never is.
+private[kernel] another_core(core: u32, me: u32) -> bool = option_cores > 1 && core != me
+
+// The running task of core `c` waits on `w`, whose lock the caller holds: fill its record, queue it and
+// block it, for `timeout` ticks or `FOREVER`. The caller then asks for a switch and releases the lock,
+// which lets the switch happen, and reads the outcome with `wait_outcome` once the task runs again.
+private[kernel] enqueue_running(c: *Core, w: *Waitable, timeout: u32)
+    val i = usize(c.sched.running)
+    val r = waiter(waiter_index(c.id, i))
+    r.task = c.sched.handle(c.id, i)
+    r.priority = c.sched.tasks[i].priority
+    r.outcome = Outcome.Waiting
+    r.value = 0
+    w.queue.insert(waiter_index(c.id, i))
+    c.sched.block(w, timeout, ticks())
+
+// How the running task's last wait ended.
+private[kernel] wait_outcome(c: *Core) -> Outcome = waiter(waiter_index(c.id, usize(c.sched.running))).outcome
+
+// Under `w`'s lock, end the wait of its best waiter with `outcome` and make that task ready, asking for
+// a switch if it outranks the running one. Answers the task, or None when nobody waits.
+private[kernel] wake_first[P: Port](p: *P, w: *Waitable, outcome: Outcome) -> Option[Task]
+    val at = w.queue.first()
+    if at == NONE then return None
+    val r = waiter(at)
+    val c = here(p)
+    // A wake for another core's task is a message to that core's inbox, which this kernel does not send.
+    if another_core(r.task.core(), c.id) then panic("skiff: a wake for a task on another core needs a message the kernel does not send")
+    val _ = w.queue.remove(at)
+    r.outcome = outcome
+    if c.sched.wake(r.task.slot()) then p.request_switch()
+    Some(r.task)
+
+// End the waits that `tick` found expired, each under its object's lock: one still `Waiting` leaves the
+// queue as `TimedOut` and its task is made ready; one a wake has already ended is left as it is. Answers
+// whether a task made ready outranks the running one.
+private[kernel] end_expired_waits[P: Port](p: *P, c: *Core) -> bool
+    var outranks = false
+    loop
+        val state = p.mask()
+        val i = c.sched.take_expiring()
+        p.restore(state)
+        if i == NONE then return outranks
+        c.sched.tasks[usize(i)].on match
+            Some(w) -> if time_out(p, c, w, usize(i)) then outranks = true
+            None -> ()
+
+// The timeout of task `i`'s wait on `w`.
+private time_out[P: Port](p: *P, c: *Core, w: *Waitable, i: usize) -> bool
+    val at = waiter_index(c.id, i)
+    var l = w.lock.on(p)
+    l.acquire()
+    var outranks = false
+    if waiter(at).outcome == Outcome.Waiting
+        val _ = w.queue.remove(at)
+        waiter(at).outcome = Outcome.TimedOut
+        outranks = c.sched.wake(i)
+    l.release()
+    outranks
+
+// Withdraw task `i`'s wait, if it is waiting, before the task is deleted: its record leaves the object's
+// queue, so no wake can find it.
+private[kernel] withdraw[P: Port](p: *P, c: *Core, i: usize)
+    if c.sched.tasks[i].state != TaskState.Blocked then return
+    c.sched.tasks[i].on match
+        Some(w) ->
+            val at = waiter_index(c.id, i)
+            var l = w.lock.on(p)
+            l.acquire()
+            if waiter(at).outcome == Outcome.Waiting
+                val _ = w.queue.remove(at)
+                waiter(at).outcome = Outcome.Idle
+            l.release()
+        None -> ()
+
+// Make `priority` the effective priority of task `i` of the running core, re-queueing it among its
+// object's waiters, under that object's lock, if it is waiting. The caller holds no object's lock.
+private[kernel] reprioritize[P: Port](p: *P, c: *Core, i: usize, priority: u8)
+    c.sched.set_effective(i, priority)
+    if c.sched.tasks[i].state != TaskState.Blocked then return
+    c.sched.tasks[i].on match
+        Some(w) ->
+            val at = waiter_index(c.id, i)
+            var l = w.lock.on(p)
+            l.acquire()
+            if waiter(at).outcome == Outcome.Waiting && w.queue.remove(at)
+                waiter(at).priority = priority
+                w.queue.insert(at)
+            l.release()
+        None -> ()

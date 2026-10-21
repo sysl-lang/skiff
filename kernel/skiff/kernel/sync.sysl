@@ -1,0 +1,142 @@
+module skiff.kernel
+
+import sysl.sync.Lock
+
+// Semaphores and mutexes. Each is a plain struct the application declares: in `.shared` if tasks of more
+// than one core use it (and then filled in at run time, since `.shared` is zeroed at start-up), anywhere
+// otherwise. Every wait takes a timeout in ticks: `FOREVER`, or 0 for "only if it can be had now".
+//
+// Both hand themselves over: a give or an unlock with a task waiting goes to the best waiter, so being
+// woken is having it.
+
+// The handle of no task: a free mutex's owner.
+val NO_TASK: Task = Task(0)
+
+// A counting semaphore, from 0 up to `max`; a binary one has `max` 1.
+struct Semaphore
+    w: Waitable
+    count: u32
+    max: u32
+
+impl Semaphore
+    // A semaphore called `name` holding `count` of at most `max`.
+    const new(name: string, count: u32, max: u32) -> Semaphore = Semaphore(Waitable.new(name), count, max)
+
+    // Take one, waiting up to `timeout` ticks for one to be given. Answers whether it was taken. Only a
+    // task may wait; with a timeout of 0 nothing waits.
+    take[P: Port](*self, p: *P, timeout: u32) -> bool
+        var l = self.w.lock.on(p)
+        l.acquire()
+        if self.count > 0
+            self.count -= 1
+            l.release()
+            return true
+        if timeout == 0
+            l.release()
+            return false
+        val c = running_core(p)
+        enqueue_running(c, &self.w, timeout)
+        p.request_switch()
+        l.release()
+        wait_outcome(c) == Outcome.Given
+
+    // Take one if there is one, without waiting. An interrupt handler may call it.
+    try_take[P: Port](*self, p: *P) -> bool = self.take(p, 0)
+
+    // Give one: to the best waiting task if there is one, else to the count. Answers false, giving
+    // nothing, when the count is already at `max`. An interrupt handler may call it.
+    give[P: Port](*self, p: *P) -> bool
+        var l = self.w.lock.on(p)
+        l.acquire()
+        var given = true
+        wake_first(p, &self.w, Outcome.Given) match
+            Some(_) -> ()
+            None -> if self.count < self.max then self.count += 1 else given = false
+        l.release()
+        given
+
+    // How many it holds, as the running core last saw it.
+    available[P: Port](*self, p: *P) -> u32
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val n = self.count
+        l.release()
+        n
+
+// A mutex with priority inheritance, owned by a task handle. While a task waits on it, the owner runs at
+// the waiter's priority at least, so a task of middling priority cannot keep the owner, and with it the
+// waiter, from running. The owner keeps the raised priority until it holds no mutex. Inheritance goes
+// one level: an owner itself waiting on another object moves up that object's queue, but its owner is
+// not raised in turn.
+//
+// A waiter whose owner is another core's task would raise it by a message to that core, which the
+// kernel does not send: such a wait is refused (a panic), and so is a wake across cores.
+struct Mutex
+    w: Waitable
+    owner: Task
+
+impl Mutex
+    const new(name: string) -> Mutex = Mutex(Waitable.new(name), NO_TASK)
+
+    // Lock it, waiting up to `timeout` ticks. Answers whether the running task now holds it. A task may
+    // not lock a mutex it already holds.
+    lock[P: Port](*self, p: *P, timeout: u32) -> bool
+        val c = running_core(p)
+        val i = usize(c.sched.running)
+        val me = c.sched.handle(c.id, i)
+        val outer = p.mask()
+        var l = self.w.lock.on(p)
+        l.acquire()
+        if self.owner == NO_TASK
+            self.owner = me
+            c.sched.tasks[i].held += 1
+            l.release()
+            p.restore(outer)
+            return true
+        if self.owner == me then panic("skiff: a task locked a mutex it already holds")
+        if timeout == 0
+            l.release()
+            p.restore(outer)
+            return false
+        val owner = self.owner
+        if another_core(owner.core(), c.id) then panic("skiff: waiting on a mutex another core's task holds needs a boost the kernel does not send")
+        val mine = c.sched.tasks[i].priority
+        enqueue_running(c, &self.w, timeout)
+        p.request_switch()
+        l.release()
+        // The core stays masked until the owner has inherited, so nothing runs in between.
+        if c.sched.check(owner).is_ok() && mine > c.sched.tasks[owner.slot()].priority
+            reprioritize(p, c, owner.slot(), mine)
+        p.restore(outer)
+        wait_outcome(c) == Outcome.Given
+
+    // Unlock it, handing it to the best waiting task if there is one, which inherits from whoever still
+    // waits. The running task drops any priority it inherited once it holds no mutex. Only the owner may.
+    unlock[P: Port](*self, p: *P)
+        val c = running_core(p)
+        val i = usize(c.sched.running)
+        val outer = p.mask()
+        var l = self.w.lock.on(p)
+        l.acquire()
+        if self.owner != c.sched.handle(c.id, i) then panic("skiff: a task unlocked a mutex it does not hold")
+        c.sched.tasks[i].held -= 1
+        var heir = NONE
+        var inherited = IDLE_PRIORITY
+        wake_first(p, &self.w, Outcome.Given) match
+            Some(t) ->
+                self.owner = t
+                heir = u16(t.slot())
+                c.sched.tasks[t.slot()].held += 1
+                val next = self.w.queue.first()
+                if next != NONE then inherited = waiter(next).priority
+            None -> self.owner = NO_TASK
+        l.release()
+        if heir != NONE && inherited > c.sched.tasks[usize(heir)].priority
+            reprioritize(p, c, usize(heir), inherited)
+        if c.sched.tasks[i].held == 0 && c.sched.tasks[i].priority != c.sched.tasks[i].base
+            c.sched.set_effective(i, c.sched.tasks[i].base)
+        if c.sched.preempted() then p.request_switch()
+        p.restore(outer)
+
+    // The task that holds it, or `NO_TASK`.
+    holder(*self) -> Task = self.owner

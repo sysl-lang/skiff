@@ -33,21 +33,33 @@ skiff: core $1 task B 3"
     echo "skiff: core $1 high priority task ran on the tick that woke it
 skiff: core $1 refuses a stale handle"
 }
+
+# The waits every core runs (boards/scenarios, waits.sysl): a mutex's owner inheriting its waiter's
+# priority and giving it up with the mutex, a timed take that times out, and an interrupt's give waking
+# a waiting task at once.
+waits_expected() {
+    echo "skiff: core $1 the high task had the mutex before the middle task finished
+skiff: core $1 the low task gave up its inherited priority with the mutex
+skiff: core $1 a timed take timed out after 5 ticks
+skiff: core $1 an interrupt's give woke a waiting task at once"
+}
 mps2_expected="skiff: hello
 skiff: .shared holds the shared state
 skiff: core 0 tick 1
 skiff: core 0 tick 2
 skiff: core 0 tick 3
 skiff: core 0 time base agrees
-$(tasks_expected 0 "f32 registers survived the switches")"
+$(tasks_expected 0 "f32 registers survived the switches")
+$(waits_expected 0)"
 
 # The AN521's two cores run one image, each greeting and ticking on the UART of its own number, then
 # running its own tasks at once with the other. Core 0 has no FPU (the SSE-200's CPU0, in QEMU as on
 # the FPGA image), and one image serves both cores, so the image is built with no FPU registers and
 # neither core checks them; core 0 may not create a task on core 1 once
-# it runs. Core 1 then faults on purpose: it reports the fault on its own console and stops. Core 0 sees
-# it stopped, takes more ticks, finds that the time base counted its own ticks and none of core 1's, and
-# stops the machine with status 0.
+# it runs. Both cores then hammer one semaphore in `.shared` at once, and core 0 finds the count exact;
+# core 0 gives units one at a time that core 1 takes without waiting. Core 1 then faults on purpose: it
+# reports the fault on its own console and stops. Core 0 sees it stopped, takes more ticks, finds that
+# the time base counted its own ticks and none of core 1's, and stops the machine with status 0.
 an521_core0_expected="skiff: hello from core 0
 skiff: .shared holds the shared state
 skiff: core 0 tick 1
@@ -55,6 +67,8 @@ skiff: core 0 tick 2
 skiff: core 0 tick 3
 $(tasks_expected 0)
 skiff: core 0 may not create a task on core 1, which runs
+$(waits_expected 0)
+skiff: core 0 two cores' gives and takes left the shared count exact
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
 skiff: core 0 time base agrees"
@@ -63,6 +77,8 @@ skiff: core 1 tick 1
 skiff: core 1 tick 2
 skiff: core 1 tick 3
 $(tasks_expected 1)
+$(waits_expected 1)
+skiff: core 1 took every unit core 0 gave
 skiff: core 1 fault BusFault"
 
 failed=0

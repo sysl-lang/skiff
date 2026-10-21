@@ -1,0 +1,19 @@
+module skiff.chip.mps2
+
+// The MPS2's interrupts, as far as the board uses them: the vector table's chip half, which the link
+// script puts straight after the architecture's sixteen words. Interrupts 0 to 7 stop the machine, as an
+// unhandled system exception does; interrupt 8, timer 0's, goes to the board's `skiff_timer0`. No device
+// past it is ever enabled.
+
+// Timer 0's interrupt. The board raises it from software (the timer itself is never started).
+const TIMER0_IRQ: u32 = 8
+
+asm
+    [thumb]
+        ".section .vectors.irq, \"a\""
+        ".rept 8"
+        ".word skiff_exception"
+        ".endr"
+        ".word skiff_timer0"
+        ".text"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.mps2 is for Armv7-M cores"

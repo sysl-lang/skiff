@@ -1,5 +1,7 @@
 module skiff.kernel
 
+import sysl.sync.Atomic
+
 // The kernel's view of the processor and the machine under it. An arch package, a chip package and a
 // board program together implement it; the kernel itself knows nothing about the hardware beyond what
 // this trait says.
@@ -37,6 +39,17 @@ trait Port
     mask(*self) -> u32
 
     restore(*self, state: u32)
+
+    // Take the chip's lock whose word is `word`, waiting for the other cores as long as it takes; the
+    // kernel's interrupts on this core are already masked. Everything the last holder wrote is visible
+    // once it returns. Only a machine with more than one core is asked.
+    spin_lock(*self, word: *Atomic[u32])
+
+    // Take that lock if no other core holds it, answering whether it did.
+    spin_try_lock(*self, word: *Atomic[u32]) -> bool
+
+    // Let it go, publishing everything written under it to the next holder.
+    spin_unlock(*self, word: *Atomic[u32])
 
 // Bring the kernel up on `p`: greet on this core's console. On a machine with more than one core the
 // greeting names the core. Answers the status the machine should stop with: 0 for success.

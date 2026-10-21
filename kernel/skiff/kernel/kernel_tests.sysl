@@ -47,6 +47,11 @@ impl Port for Recorder
     restore(*self, state: u32)
         self.masked = state
 
+    // One core: the kernel never spins, so these are never asked.
+    spin_lock(*self, word: *Atomic[u32]) = panic("one core never spins")
+    spin_try_lock(*self, word: *Atomic[u32]) -> bool = panic("one core never spins")
+    spin_unlock(*self, word: *Atomic[u32]) = panic("one core never spins")
+
 private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0)
 
 // Whether `r` recorded exactly `want`.

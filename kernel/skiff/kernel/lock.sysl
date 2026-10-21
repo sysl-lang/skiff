@@ -1,0 +1,77 @@
+module skiff.kernel
+
+import sysl.sync.{Atomic, Lock}
+
+// The lock every kernel object holds. Taking it masks the running core's kernel interrupts, which keeps
+// that core's tasks and handlers out; on a machine with more than one core it then spins on the chip's
+// lock word, which keeps the other cores out. The spin is the port's (LDREX/STREX on Armv7-M and
+// Armv8-M, a hardware spinlock where a core has no exclusives), so the kernel names no instruction. With
+// one core the spin is not in the image at all: the mask is the whole lock.
+//
+// A lock is held only for a few instructions: never across a block or a switch, and never two at once.
+// Where a core's ready set is needed under it, the order is the object's lock, then the ready set, which
+// is guarded by the mask alone.
+
+// The value of `KernelLock.user` once a second core has taken the lock.
+private const SHARED_USE: u32 = 0xffff_ffff
+
+struct KernelLock
+    name: string            // what a misplaced object is reported as
+    word: Atomic[u32]       // the chip lock's word: 0 when free
+    saved: u32              // what the holder's mask answered, which the release restores
+    user: u32               // the core that first took the lock, plus one; SHARED_USE once another has
+
+impl KernelLock
+    // A free lock for the object called `name`.
+    const new(name: string) -> KernelLock = KernelLock(name, Atomic(0), 0, 0)
+
+    // The lock as the running core takes it, through its port `p`.
+    on[P: Port](*self, p: *P) -> Locking[P] = Locking(self, p)
+
+// A `KernelLock` taken through a port: what implements `sysl.sync.Lock`. The mask and the spin are the
+// port's, and `Lock`'s members take no port, so the pair is what is locked.
+struct Locking[P: Port]
+    lock: *KernelLock
+    port: *P
+
+impl[P: Port] Lock for Locking[P]
+    acquire(*self)
+        val state = self.port.mask()
+        if option_cores > 1
+            self.port.spin_lock(&self.lock.word)
+            self.placed()
+        self.lock.saved = state
+
+    try_acquire(*self) -> bool
+        val state = self.port.mask()
+        if option_cores > 1
+            if !self.port.spin_try_lock(&self.lock.word)
+                self.port.restore(state)
+                return false
+            self.placed()
+        self.lock.saved = state
+        true
+
+    release(*self)
+        val state = self.lock.saved
+        if option_cores > 1 then self.port.spin_unlock(&self.lock.word)
+        self.port.restore(state)
+
+impl[P: Port] Locking[P]
+    // The placement check, made with the spin held: the first time a second core takes the lock, the
+    // object must lie in `.shared`, or the kernel stops, naming it. Each core keeps its private memory
+    // to itself (on a core with a data cache it may be cached), so an object two cores use outside
+    // `.shared` is a coherence bug waiting to happen.
+    private placed(*self)
+        val me = here_id(self.port) + 1
+        val l = self.lock
+        if l.user == me || l.user == SHARED_USE then return
+        if l.user == 0
+            l.user = me
+            return
+        if !in_shared(usize(l), sizeof(KernelLock))
+            self.port.write("skiff: ".bytes)
+            self.port.write(l.name.bytes)
+            self.port.write(" is used by two cores and lies outside .shared\n".bytes)
+            panic("skiff: an object two cores use lies outside .shared")
+        l.user = SHARED_USE
