@@ -34,6 +34,8 @@ Status: sent to `sysl` for 0.3.7.
 images share one target, so nothing can choose between the scripts. `--features m4` still links with the
 target's one script.
 
-Status: sent to `sysl` for 0.3.7. The shape is a `targets` entry with `when = <feature>` whose keys
-override the plain entry's while the feature is on. An OS is one program, never one workspace member per
-image.
+Status: accepted for 0.3.7. The spelling is a `features` block inside the target, provisional until
+0.4.0's manifest syntax pass:
+`thumb-freestanding { linker_script = "one.ld", features { m4 { linker_script = "m4.ld" } } }`. An enabled
+feature's entry overrides the target's keys; two enabled features setting one key are refused; an
+undeclared feature is refused. An OS is one program, never one workspace member per image.
