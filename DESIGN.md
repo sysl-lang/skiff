@@ -40,6 +40,8 @@ Core (private, one per core)          .shared
   same. `Port` is `write`, `cores`, `core_id`, `start_ticks`, `idle`, `new_context`, `request_switch`,
   `start_first`, `mask` and `restore`; the arch package supplies the last five. The idle task's body
   is the board's (`kernel.run(p, idle_stack, idle)`), since a task entry takes no port.
+- **One image is built for the weakest core it runs on**: the AN521's core 0 has no FP registers, so its
+  image is built for `thumb-freestanding-soft`, and no core of it saves or uses them.
 - Each core's start-up fills its own `Core`; core 0 zeroes `.bss` and `.shared` before releasing the
   others. A core announces itself ready in `.shared`; a message to a core not yet ready is a panic.
 
