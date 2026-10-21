@@ -18,3 +18,21 @@ the library for every consumer: features are names, and `#if` reads only the tar
 
 Status: accepted; 0.3.7 ships valued `options` (declared in the library's manifest with a type and a
 default, set in the consumer's dependency entry, read as `const option_<name>`; the root's value wins).
+
+## FINDINGS 3 — an unknown key inside a `targets` block is ignored silently
+
+`targets { thumb-freestanding { linker_scrpt = "m4.ld" } }` builds with no warning, and the image is laid
+out by the linker's defaults. A top-level unknown key is reported, as the packages reference says every
+unknown key is.
+
+Status: sent to `sysl` for 0.3.7.
+
+## FINDINGS 4 — a link script cannot differ by feature
+
+`linker_script` is keyed only by target. The two-image build is one board program built once per image
+(`--features split,m7`, `--features split,m4`), and each image needs its own layout; on the AN521 both
+images share one target, so nothing can choose between the scripts. `--features m4` still links with the
+target's one script.
+
+Status: sent to `sysl` for 0.3.7; the shape (a target entry with `when = <feature>`, or a features
+block inside the target) is the user's call.
