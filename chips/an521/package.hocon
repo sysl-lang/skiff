@@ -1,0 +1,11 @@
+// Arm's MPS2 AN521 as QEMU models it: an SSE-200 subsystem with two Cortex-M33 cores. Both run in the
+// Secure state from reset, so every peripheral here is reached through its Secure alias (0x5xxx_xxxx).
+
+package {
+  name    = "an521"
+  version = "0.0.1"
+}
+
+dependencies {
+  armv7m { workspace = true }
+}

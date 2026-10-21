@@ -1,0 +1,25 @@
+// skiff on QEMU's MPS2 AN500 (Cortex-M7) and AN386 (Cortex-M4). The two share a memory map, so one
+// program serves both, built once per core: for the M7's double-precision FPU (fpv5-d16) and for the
+// M4's single-precision one (fpv4-sp-d16).
+
+package {
+  name    = "qemu-mps2"
+  version = "0.0.1"
+}
+
+dependencies {
+  kernel { workspace = true }
+  armv7m { workspace = true }
+  mps2 { workspace = true }
+}
+
+targets {
+  thumbv7em-freestanding-dp {
+    linker_script = "link.ld"
+    entry         = "_start"
+  }
+  thumbv7em-freestanding {
+    linker_script = "link.ld"
+    entry         = "_start"
+  }
+}

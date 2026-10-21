@@ -1,0 +1,8 @@
+// skiff's workspace. A dependency only ever points down this list (ROADMAP.md, "Layers"):
+//
+//   kernel          the portable kernel: no architecture, chip or board in it
+//   arch/<family>   one CPU family each: start-up, vectors, exceptions, the MPU, the FPU context
+//   chips/<chip>    one chip each: memory map, clocks, interrupt numbers, peripheral drivers
+//   boards/<board>  one program per board and core: ties the three together; link script, entry
+//   tools/portable  the gate's proof that the kernel builds for every CPU family
+workspace = ["kernel", "arch/*", "chips/*", "boards/*", "tools/*"]

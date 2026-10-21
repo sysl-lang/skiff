@@ -1,0 +1,13 @@
+// The gate's proof that the kernel is portable: a program that instantiates every generic part of the
+// kernel over a machine that does nothing, built as an archive for each CPU family. A library build
+// alone proves too little, since it never checks the body of a generic function nothing has
+// instantiated.
+
+package {
+  name    = "portable"
+  version = "0.0.1"
+}
+
+dependencies {
+  kernel { workspace = true }
+}

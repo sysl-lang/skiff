@@ -1,0 +1,40 @@
+module skiff.chip.an521
+
+// The AN521's CMSDK UARTs, at 0x5020_0000 onward in the Secure alias (QEMU's `info mtree -f`). Each core
+// has a console of its own, so that the two never interleave: core 0 writes UART0 and core 1 UART1.
+
+private struct Uart
+    data: volatile u32          // 0x00 a write sends a byte
+    state: volatile u32         // 0x04 bit 0: transmit buffer full
+    ctrl: volatile u32          // 0x08 bit 0: transmit enable
+    intstatus: volatile u32     // 0x0c
+    bauddiv: volatile u32       // 0x10
+
+@assert(offsetof(Uart, bauddiv) == 0x10, "BAUDDIV is at 0x10")
+
+private const UART_BASE: usize = 0x5020_0000
+const UART_STRIDE: usize = 0x1000
+private const STATE_TX_FULL: u32 = 1 << 0
+private const CTRL_TX_ENABLE: u32 = 1 << 0
+
+// Where UART `n`'s registers start; they take `UART_STRIDE` bytes.
+uart_base(n: u32) -> usize = UART_BASE + UART_STRIDE * usize(n)
+
+private uart(n: u32) -> *Uart = ptr_cast(uart_base(n))
+
+// Switch UART `n`'s transmitter on. QEMU's model ignores the divisor's value but needs one written.
+console_init(n: u32)
+    val u = uart(n)
+    u.bauddiv = 16
+    u.ctrl = CTRL_TX_ENABLE
+
+// Send one byte on UART `n`, waiting while its transmit buffer is full.
+put_byte(n: u32, b: u8)
+    val u = uart(n)
+    while (u.state & STATE_TX_FULL) != 0 do ()
+    u.data = u32(b)
+
+// Send every byte of `bytes` on UART `n`.
+write(n: u32, bytes: []const u8)
+    for b in bytes
+        put_byte(n, b)

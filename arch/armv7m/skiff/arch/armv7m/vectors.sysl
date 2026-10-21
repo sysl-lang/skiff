@@ -1,0 +1,65 @@
+module skiff.arch.armv7m
+
+// The vector table's system half, and the exception entry that stops the machine.
+//
+// The table's first sixteen words are the architecture's: the initial stack pointer, the reset handler,
+// then the system exceptions. The chip's interrupts, when it has any, follow in `.vectors.irq`, which
+// belongs to the chip package; the board's link script puts that section straight after this one.
+// Every system exception goes to `skiff_exception`, so a fault stops the machine with `FAULT_STATUS`
+// where, with no handler, it would escalate to a HardFault and lock the core up somewhere meaningless.
+//
+// `.word _start`, not `_start + 1`: the linker already sets the Thumb bit on a Thumb function symbol.
+// The section is opened in the assembly with its `"a"` flag: the assembler takes a section's flags from
+// its name, `.vectors` gets none, and an unallocated table has `.text` linked over it at address zero.
+asm
+    [thumb]
+        ".section .vectors, \"a\""
+        ".word _stack_top"
+        ".word _start"
+        ".word skiff_exception"     // NMI
+        ".word skiff_exception"     // HardFault
+        ".word skiff_exception"     // MemManage
+        ".word skiff_exception"     // BusFault
+        ".word skiff_exception"     // UsageFault
+        ".word 0"
+        ".word 0"
+        ".word 0"
+        ".word 0"
+        ".word skiff_exception"     // SVCall
+        ".word skiff_exception"     // DebugMonitor
+        ".word 0"
+        ".word skiff_exception"     // PendSV
+        ".word skiff_exception"     // SysTick
+        ".text"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+
+// The status a fault stops the machine with. Nothing else uses it, so a run that ends in it is known to
+// have faulted rather than finished.
+const FAULT_STATUS: i32 = 99
+
+// Every system exception lands here: stop the machine with `FAULT_STATUS`.
+@export("skiff_exception")
+unhandled_exception() -> never
+    halt(FAULT_STATUS)
+
+// Stop the machine with `code`, through Arm semihosting: a debugger, or QEMU with semihosting on, ends
+// the run with that status. SYS_EXIT_EXTENDED (0x20) carries the code. Plain SYS_EXIT (0x18) on AArch32
+// always reports zero. ADP_Stopped_ApplicationExit (0x20026) says the program ran to completion.
+halt(code: i32) -> never
+    var block: [2]u32 = [0x20026, u32(code)]
+    val op: u32 = 0x20
+    val at = usize(&block)
+    asm
+        [thumb]
+            "bkpt 0xab"
+            in op : "r0"
+            in at : "r1"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+    loop
+        ()
+
+// Sleep until an interrupt is pending. It returns at once if one already is.
+wait_for_interrupt()
+    asm
+        [thumb] "wfi"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"

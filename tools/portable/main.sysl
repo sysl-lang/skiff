@@ -1,0 +1,20 @@
+// The kernel instantiated over a machine with no hardware behind it (see package.hocon). Each piece of
+// the kernel that is generic over the machine is called from here as well.
+
+import skiff.kernel
+import skiff.kernel.Machine
+
+struct Nothing
+end Nothing
+
+impl Machine for Nothing
+    write(*self, bytes: []const u8) = ()
+    cores(*self) -> u32 = 1
+    core(*self) -> u32 = 0
+
+@export("main")
+probe() -> i32
+    var m = Nothing()
+    kernel.write_dec(&m, 1)
+    kernel.write_hex(&m, 1)
+    kernel.boot(&m)

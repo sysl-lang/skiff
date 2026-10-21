@@ -1,0 +1,37 @@
+module skiff.chip.mps2
+
+// Reset for the MPS2's one core. It runs with no stack set up, before any sysl code, so it is assembly:
+// a function might save a register on the stack before its first instruction.
+//   - It sets the stack pointer itself. QEMU enters at the ELF's entry point and does not load SP from
+//     the vector table.
+//   - It grants the FPU (CPACR CP10/CP11 full access) before anything can use it. A hard-float build may
+//     use VFP registers anywhere, and a Cortex-M denies them until this write. On a core with no FPU the
+//     bits ignore writes.
+//   - It zeroes `.bss`, which on a bare machine nobody else does. `.data` needs no copy: the image is
+//     loaded into RAM where it runs.
+//   - It calls `skiff_main`, which the board program exports.
+asm
+    [thumb]
+        ".syntax unified"
+        ".text"
+        ".thumb_func"
+        ".globl _start"
+        "_start:"
+        "ldr sp, =_stack_top"
+        "ldr r0, =0xE000ED88"
+        "ldr r1, [r0]"
+        "orr r1, r1, #(0xF << 20)"
+        "str r1, [r0]"
+        "dsb"
+        "isb"
+        "ldr r0, =__bss_start"
+        "ldr r1, =__bss_end"
+        "movs r2, #0"
+        "1: cmp r0, r1"
+        "beq 2f"
+        "str r2, [r0], #4"
+        "b 1b"
+        "2: bl skiff_main"
+        "3: b 3b"
+        ".ltorg"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.mps2 is for Armv7-M cores"

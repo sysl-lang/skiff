@@ -1,0 +1,24 @@
+module skiff.chip.an521
+
+// The SSE-200's system control block (Secure only, at 0x5002_1000), which holds core 1 in reset.
+//
+// At reset core 0 runs and core 1 waits: CPUWAIT's bit 1 is set. Core 1 starts once the bit is cleared,
+// reading its stack pointer and reset handler from the vector table at INITSVTOR1. So core 0 points
+// INITSVTOR1 at core 1's image first.
+
+private struct Word
+    v: volatile u32
+
+private const INITSVTOR1: usize = 0x5002_1114
+private const CPUWAIT: usize = 0x5002_1118
+private const CPUWAIT_CORE1: u32 = 1 << 1
+
+// The clock both cores and SysTick run on: QEMU's AN521 SYSCLK.
+const CLOCK_HZ: u32 = 20_000_000
+
+// Start core 1 at the image whose vector table is at `vectors`.
+release_core1(vectors: usize)
+    val svtor: *Word = ptr_cast(INITSVTOR1)
+    svtor.v = u32(vectors)
+    val wait: *Word = ptr_cast(CPUWAIT)
+    wait.v = wait.v & ~CPUWAIT_CORE1

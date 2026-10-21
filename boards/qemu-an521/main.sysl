@@ -1,0 +1,60 @@
+// skiff on QEMU's MPS2 AN521: one image, run by both Cortex-M33 cores. Both enter `_start`
+// (skiff.chip.an521) and then `skiff_main`, and tell themselves apart by core number. Core 0 releases
+// core 1 and, once core 1 has greeted and said so, stops the machine with status 0.
+
+import skiff.arch.armv7m
+import skiff.chip.an521
+import skiff.kernel
+import skiff.kernel.Machine
+import sysl.sync.{Atomic, Ordering}
+
+// Where core 0 sees that core 1 has finished: 1 once it has. It is in `.bss`, which core 0 clears before
+// it releases core 1.
+private var core1_done: Atomic[u32] = Atomic(0)
+
+// The address of the vector table, at the start of the image, which core 1 is told to start from.
+private const VECTORS: usize = 0x1000_0000
+
+// The machine as the kernel sees it: two cores, each with the UART of its own number as its console.
+struct Board
+end Board
+
+impl Machine for Board
+    write(*self, bytes: []const u8) = an521.write(an521.core_id(), bytes)
+    cores(*self) -> u32 = 2
+    core(*self) -> u32 = an521.core_id()
+
+@export("skiff_main")
+skiff_main() -> never
+    val me = an521.core_id()
+    if me == 0 then an521.release_core1(VECTORS)
+    an521.console_init(me)
+    var board = Board()
+    val status = kernel.boot(&board)
+    if me == 1
+        core1_done.store(1, Ordering.Release)
+        loop
+            armv7m.wait_for_interrupt()
+    while core1_done.load(Ordering.Acquire) == 0 do ()
+    armv7m.halt(status)
+
+@export("putchar")
+putchar(c: int) -> int
+    an521.put_byte(an521.core_id(), u8(c & 0xff))
+    c
+
+@export("memcpy")
+board_memcpy(dst: *u8, src: *u8, n: usize) -> *u8
+    for i in 0..<n
+        dst[i] = src[i]
+    dst
+
+@export("memset")
+board_memset(dst: *u8, byte: int, n: usize) -> *u8
+    for i in 0..<n
+        dst[i] = u8(byte & 0xff)
+    dst
+
+@export("exit")
+board_exit(code: int) -> never
+    armv7m.halt(i32(code))

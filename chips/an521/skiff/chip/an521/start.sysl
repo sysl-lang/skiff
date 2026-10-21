@@ -1,0 +1,54 @@
+module skiff.chip.an521
+
+// Reset for both of the AN521's cores: one image, one `_start`. Like the MPS2's, it runs with no stack
+// set up, so it is assembly. Each core reads its number from the SSE-200's CPU_IDENTITY (0x5001_F000)
+// and
+//   - takes the top of its own stack, `_stack_top0` or `_stack_top1` from the link script;
+//   - grants itself the FPU (CPACR CP10/CP11 full access; the register is per core);
+//   - core 0 alone zeroes `.bss`, since core 1 is held in reset until core 0 releases it
+//     (`release_core1`, sysctl.sysl) and may not touch what core 0 is clearing. `.data` needs no copy:
+//     the image is loaded into RAM where it runs;
+//   - calls `skiff_main`, which the board program exports and both cores run.
+asm
+    [thumb]
+        ".syntax unified"
+        ".text"
+        ".thumb_func"
+        ".globl _start"
+        "_start:"
+        "ldr r4, =0x5001F000"
+        "ldr r4, [r4]"
+        "ands r4, r4, #1"
+        "bne 4f"
+        "ldr sp, =_stack_top0"
+        "b 5f"
+        "4: ldr sp, =_stack_top1"
+        "5: ldr r0, =0xE000ED88"
+        "ldr r1, [r0]"
+        "orr r1, r1, #(0xF << 20)"
+        "str r1, [r0]"
+        "dsb"
+        "isb"
+        "cmp r4, #0"
+        "bne 2f"
+        "ldr r0, =__bss_start"
+        "ldr r1, =__bss_end"
+        "movs r2, #0"
+        "1: cmp r0, r1"
+        "beq 2f"
+        "str r2, [r0], #4"
+        "b 1b"
+        "2: bl skiff_main"
+        "3: b 3b"
+        ".ltorg"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.an521 is for Armv8-M cores"
+
+private struct Word
+    v: volatile u32
+
+private const CPUID: usize = 0x5001_F000
+
+// The number of the core running this: 0 or 1.
+core_id() -> u32
+    val id: *Word = ptr_cast(CPUID)
+    id.v & 1

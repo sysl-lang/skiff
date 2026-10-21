@@ -1,0 +1,59 @@
+module skiff.kernel
+@tests
+
+// The kernel on the host, over a machine that records what it is asked to write. Every boot test on a
+// board checks the same banner through a real console.
+
+private struct Recorder
+    bytes: [256]u8
+    used: usize
+    count: u32
+    me: u32
+
+impl Machine for Recorder
+    write(*self, bytes: []const u8)
+        for b in bytes
+            self.bytes[self.used] = b
+            self.used += 1
+
+    cores(*self) -> u32 = self.count
+
+    core(*self) -> u32 = self.me
+
+private recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me)
+
+// Whether `r` recorded exactly `want`.
+private recorded(r: *Recorder, want: string) -> bool
+    val w = want.bytes
+    if r.used != w.len then return false
+    for i in 0..<w.len
+        if r.bytes[i] != w[i] then return false
+    true
+
+@test("a single-core boot prints the plain banner and answers 0")
+boot_single_core()
+    var r = recorder(1, 0)
+    assert_eq(boot(&r), 0)
+    assert(recorded(&r, "skiff: hello\n"), "the banner")
+
+@test("a multi-core boot names the core it runs on")
+boot_names_the_core()
+    var r = recorder(2, 1)
+    assert_eq(boot(&r), 0)
+    assert(recorded(&r, "skiff: hello from core 1\n"), "the banner with the core")
+
+@test("write_dec writes zero, one digit, and the largest u32")
+dec_digits()
+    var r = recorder(1, 0)
+    write_dec(&r, 0)
+    write_dec(&r, 7)
+    write_dec(&r, 4294967295)
+    assert(recorded(&r, "074294967295"), "decimal digits")
+
+@test("write_hex writes eight digits whatever the value")
+hex_digits()
+    var r = recorder(1, 0)
+    write_hex(&r, 0)
+    write_hex(&r, 0x0000_8200)
+    write_hex(&r, 0xdead_beef)
+    assert(recorded(&r, "0x000000000x000082000xdeadbeef"), "hexadecimal digits")
