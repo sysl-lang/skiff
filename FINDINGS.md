@@ -105,3 +105,32 @@ question for sysl.
 
 Status: fixed in sysl 0.3.9: an enum with an explicit field-less `= 0` variant zeroes to it. `Shared` takes
 its zero value.
+
+## FINDINGS 8 — a generic type's static member, reached through its module, is an undefined name
+
+```sysl
+module pk.m
+
+struct Q[T, const N: usize]
+    slots: [N]T
+
+impl[T, const N: usize] Q[T, N]
+    const new() -> Q[T, N]
+        var s: [N]T
+        Q(s)
+```
+
+```sysl
+import pk.m
+
+private var b: m.Q[u32, 2] = m.Q.new()
+```
+
+is refused with "undefined name 'm'" at the `m` of `m.Q.new()` (sysl 0.3.11), at module level and in a
+function body alike. The type in the annotation resolves, and so do `m.Q[u32, 2].new()`, `Q.new()` after
+`import pk.m.Q`, and `m.S.new()` for a plain struct `S`: only a generic type named through its module, with
+its arguments left to the expected type, fails, and the diagnostic names the module rather than what went
+wrong. skiff's `tools/portable` hit it with `kernel.Queue.new("mail")`. Importing `Queue` by name is the
+ordinary spelling and is what skiff uses, so nothing here is contorted.
+
+Status: open; reported to sysl.

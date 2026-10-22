@@ -35,7 +35,7 @@ impl Semaphore
             l.release()
             return false
         val c = running_core(p)
-        enqueue_running(c, &self.w, timeout)
+        enqueue_running(c, &self.w, timeout, 0, 0)
         p.request_switch()
         l.release()
         wait_outcome(c) == Outcome.Given
@@ -101,7 +101,7 @@ impl Mutex
         val owner = self.owner
         if another_core(owner.core(), c.id) then panic("skiff: waiting on a mutex another core's task holds needs a boost the kernel does not send")
         val mine = c.sched.tasks[i].priority
-        enqueue_running(c, &self.w, timeout)
+        enqueue_running(c, &self.w, timeout, 0, 0)
         p.request_switch()
         l.release()
         // The core stays masked until the owner has inherited, so nothing runs in between.

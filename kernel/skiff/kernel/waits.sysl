@@ -33,7 +33,8 @@ struct Waiter
     priority: u8        // the task's effective priority when it was queued
     outcome: Outcome
     next: u16           // the next waiter's index, or NONE
-    value: u32          // what the wait carries back
+    mode: u8            // what kind of wait it is, as its object reads it: a queue's side, a flags wait's terms
+    value: u32          // what the wait asks for, and then what it carries back
 
 // The index of task `slot` of core `core`'s record: `core * option_tasks + slot`. At most 8 cores of
 // 4096 slots, so it fits in a `u16` with NONE left over.
@@ -47,6 +48,13 @@ struct WaitQueue
 impl WaitQueue
     // The best waiter, or NONE when nobody waits.
     first(*self) -> u16 = if self.count == 0 then NONE else self.head
+
+    // The best waiter whose mode is `mode`, or NONE. An object whose waiters are all of one mode finds
+    // it at the head.
+    first_of(*self, mode: u8) -> u16
+        var at = self.first()
+        while at != NONE && waiter(at).mode != mode do at = waiter(at).next
+        at
 
     // Queue waiter `w` behind every waiter of its priority or higher.
     insert(*self, w: u16)
@@ -84,27 +92,36 @@ impl Waitable
 // Whether a task of core `core` is another core's than `me`'s. With one core it never is.
 private[kernel] another_core(core: u32, me: u32) -> bool = option_cores > 1 && core != me
 
-// The running task of core `c` waits on `w`, whose lock the caller holds: fill its record, queue it and
-// block it, for `timeout` ticks or `FOREVER`. The caller then asks for a switch and releases the lock,
-// which lets the switch happen, and reads the outcome with `wait_outcome` once the task runs again.
-private[kernel] enqueue_running(c: *Core, w: *Waitable, timeout: u32)
+// The running task of core `c` waits on `w`, whose lock the caller holds: fill its record with the
+// wait's `mode` and `value`, queue it and block it, for `timeout` ticks or `FOREVER`. The caller then
+// asks for a switch and releases the lock, which lets the switch happen, and reads the outcome with
+// `wait_outcome` once the task runs again.
+private[kernel] enqueue_running(c: *Core, w: *Waitable, timeout: u32, mode: u8, value: u32)
     val i = usize(c.sched.running)
     val r = waiter(waiter_index(c.id, i))
     r.task = c.sched.handle(c.id, i)
     r.priority = c.sched.tasks[i].priority
     r.outcome = Outcome.Waiting
-    r.value = 0
+    r.mode = mode
+    r.value = value
     w.queue.insert(waiter_index(c.id, i))
     c.sched.block(w, timeout, ticks())
 
 // How the running task's last wait ended.
 private[kernel] wait_outcome(c: *Core) -> Outcome = waiter(waiter_index(c.id, usize(c.sched.running))).outcome
 
+// What the running task's last wait carried back.
+private[kernel] wait_value(c: *Core) -> u32 = waiter(waiter_index(c.id, usize(c.sched.running))).value
+
 // Under `w`'s lock, end the wait of its best waiter with `outcome` and make that task ready, asking for
 // a switch if it outranks the running one. Answers the task, or None when nobody waits.
 private[kernel] wake_first[P: Port](p: *P, w: *Waitable, outcome: Outcome) -> Option[Task]
     val at = w.queue.first()
-    if at == NONE then return None
+    if at == NONE then None else Some(wake_at(p, w, at, outcome))
+
+// Under `w`'s lock, end the wait of waiter `at`, which is in `w`'s queue, with `outcome`, and make its
+// task ready, asking for a switch if it outranks the running one. Answers the task.
+private[kernel] wake_at[P: Port](p: *P, w: *Waitable, at: u16, outcome: Outcome) -> Task
     val r = waiter(at)
     val c = here(p)
     // A wake for another core's task is a message to that core's inbox, which this kernel does not send.
@@ -112,7 +129,7 @@ private[kernel] wake_first[P: Port](p: *P, w: *Waitable, outcome: Outcome) -> Op
     val _ = w.queue.remove(at)
     r.outcome = outcome
     if c.sched.wake(r.task.slot()) then p.request_switch()
-    Some(r.task)
+    r.task
 
 // End the waits that `tick` found expired, each under its object's lock: one still `Waiting` leaves the
 // queue as `TimedOut` and its task is made ready; one a wake has already ended is left as it is. Answers

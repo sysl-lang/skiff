@@ -1,0 +1,112 @@
+module skiff.kernel
+
+import sysl.sync.Lock
+
+// Task notifications: a 32-bit value and a pending mark that every task has, sent to by handle and
+// waited for by the task alone. They need no object of the application's, so they are the lightest way
+// to wake a task: as event bits, as a counting semaphore, or as a mailbox of one word.
+//
+// Each task's notification is a `Note` in `.shared`, at `notes[core][slot]`, so any core may send to
+// any task. A note names the task it is for by handle, and a send whose handle does not match is
+// refused as stale: the note is renewed when a task is created in its slot and cleared when the task is
+// deleted. A send never waits, so an interrupt handler may send as a task does.
+
+// How a send changes the value of the note it sends to.
+enum Action: u8
+    SetBits         // or the value sent into it
+    Increment       // add one, whatever the value sent: a give
+    Overwrite       // replace it with the value sent, pending or not
+    NoOverwrite     // replace it with the value sent, unless a notification is already pending
+
+// One task's notification. A note of zeros, which is what start-up leaves in `.shared`, is for no task.
+struct Note
+    w: Waitable
+    task: Task          // the task it is for, or `NO_TASK` while its slot is free
+    value: u32
+    pending: bool       // a notification has come since the task last took one
+
+// Make the note of slot `slot` of core `core` the note of `task`, with no value and nothing pending:
+// `NO_TASK` when the slot is freed. Taken under the note's lock, with no other lock held.
+private[kernel] renew_note[P: Port](p: *P, core: u32, slot: usize, task: Task)
+    val n = note_of(core, slot)
+    var l = n.w.lock.on(p)
+    l.acquire()
+    n.task = task
+    n.value = 0
+    n.pending = false
+    l.release()
+
+// Send to the task `t` names, changing its value by `action` with `value`, and end its wait for a
+// notification if it waits. Answers false for `NoOverwrite` while a notification is pending, changing
+// nothing and waking nobody, and true otherwise; a handle that names no task is refused as stale.
+notify[P: Port](p: *P, t: Task, value: u32, action: Action) -> Result[bool, TaskError]
+    if usize(t.core()) >= option_cores || t.slot() >= option_tasks then return Err(TaskError.Stale)
+    val n = note_of(t.core(), t.slot())
+    var l = n.w.lock.on(p)
+    l.acquire()
+    if n.task != t || t == NO_TASK
+        l.release()
+        return Err(TaskError.Stale)
+    if action == Action.NoOverwrite && n.pending
+        l.release()
+        return Ok(false)
+    n.value = action match
+        Action.SetBits -> n.value | value
+        Action.Increment -> n.value + 1
+        Action.Overwrite -> value
+        Action.NoOverwrite -> value
+    n.pending = true
+    val _ = wake_first(p, &n.w, Outcome.Woken)
+    l.release()
+    Ok(true)
+
+// Give the task `t` names one, counting its value up as a semaphore's: `notify` with `Increment`.
+notify_give[P: Port](p: *P, t: Task) -> Result[bool, TaskError] = notify(p, t, 0, Action.Increment)
+
+// Wait up to `timeout` ticks for a notification to the running task. If none is pending, the bits of
+// `clear_on_entry` are cleared from its value first. Answers the value the wait ended on, then clears
+// the bits of `clear_on_exit` from it and the pending mark; answers None, leaving the value as it was,
+// if the timeout came first. With a timeout of 0 nothing waits.
+notify_wait[P: Port](p: *P, clear_on_entry: u32, clear_on_exit: u32, timeout: u32) -> Option[u32]
+    val c = running_core(p)
+    val n = note_of(c.id, usize(c.sched.running))
+    var l = n.w.lock.on(p)
+    l.acquire()
+    if !n.pending
+        n.value &= ~clear_on_entry
+        if !wait_for_note(p, c, n, &l, timeout) then return None
+    val got = n.value
+    n.value &= ~clear_on_exit
+    n.pending = false
+    l.release()
+    Some(got)
+
+// Take from the running task's value as from a counting semaphore, waiting up to `timeout` ticks while
+// it is 0. Answers the value as it was, then takes one from it, or with `clear` all of it; answers 0 if
+// the timeout came first. Either way no notification is pending afterwards. With a timeout of 0 nothing
+// waits.
+notify_take[P: Port](p: *P, clear: bool, timeout: u32) -> u32
+    val c = running_core(p)
+    val n = note_of(c.id, usize(c.sched.running))
+    var l = n.w.lock.on(p)
+    l.acquire()
+    if n.value == 0 && !wait_for_note(p, c, n, &l, timeout) then return 0
+    val got = n.value
+    n.value = if clear || got == 0 then 0 else got - 1
+    n.pending = false
+    l.release()
+    got
+
+// The running task of `c` waits up to `timeout` ticks on its own note `n`, whose lock `l` holds. Answers
+// true, with the lock held again, if a notification ended the wait; false, with the lock released, if
+// the timeout came first or the timeout was 0.
+private wait_for_note[P: Port](p: *P, c: *Core, n: *Note, l: *Locking[P], timeout: u32) -> bool
+    if timeout == 0
+        l.release()
+        return false
+    enqueue_running(c, &n.w, timeout, 0, 0)
+    p.request_switch()
+    l.release()
+    if wait_outcome(c) != Outcome.Woken then return false
+    l.acquire()
+    true

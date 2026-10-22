@@ -14,11 +14,13 @@ import skiff.kernel.{FOREVER, Mutex, Port, Semaphore}
 //   - Tick 78, a timed take of a semaphore nobody gives, which must end after 5 ticks, empty-handed.
 //   - Tick 84, the same task takes a semaphore that timer 0's interrupt gives; at tick 85 the raiser
 //     (priority 2) raises the interrupt from software, and the waiting task (3) must have run by the
-//     time the raiser goes on.
-//   - Tick 90, on a machine of several cores: every core's hammer gives a semaphore in `.shared` twice
-//     and takes it once, for `ROUNDS` rounds, all at once with the others; the count left must be exact,
-//     which it is only if the object's lock keeps the cores out of each other's way. Then core 0 gives
-//     `PASSED` units one at a time through a semaphore of 4 that core 1 takes without waiting.
+//     time the raiser goes on. The interrupt also sends a message, which messages.sysl looks for.
+//   - Tick 140, on a machine of several cores, once the messages (messages.sysl) are done: every core's
+//     hammer gives a semaphore in `.shared` twice and takes it once, for `ROUNDS` rounds, all at once
+//     with the others; the count left must be exact, which it is only if the object's lock keeps the
+//     cores out of each other's way. Then core 0 gives `PASSED` units one at a time through a semaphore
+//     of 4 that core 1 takes without waiting, and the two cores pass messages, notifications and event
+//     flags the same way (messages.sysl).
 
 // How many rounds each core's hammer makes.
 private const ROUNDS: u32 = 100_000
@@ -32,7 +34,7 @@ private var never_given = [Semaphore.new("never given", 0, 1); kernel.CORES]
 private var from_irq = [Semaphore.new("from an interrupt", 0, 1); kernel.CORES]
 private var middle_done: [kernel.CORES]Atomic[u32]
 private var woke: [kernel.CORES]Atomic[u32]
-private var waits_done: [kernel.CORES]Atomic[u32]
+private[scenarios] var waits_done: [kernel.CORES]Atomic[u32]
 private var arrived_hammers: Atomic[u32]
 private var done_hammers: Atomic[u32]
 private var refused_takes: Atomic[u32]
@@ -47,6 +49,7 @@ private var passed: Semaphore
 fill_shared_objects()
     hammered = Semaphore.new("hammered", 0, 0xffff_ffff)
     passed = Semaphore.new("passed", 0, 4)
+    fill_shared_messages()
 
 // Work for `ticks` ticks of the time base without blocking or yielding.
 private busy(ticks: u32)
@@ -116,15 +119,18 @@ raiser_task[P: Port](p: *P, e: *Entries) -> never
     val _ = waits_done[me].add(1)
     kernel.exit(p)
 
-// Timer 0's interrupt, raised by the raiser: give the semaphore the timed task waits on.
+// Timer 0's interrupt, raised by the raiser: give the semaphore the timed task waits on, and send the
+// tick it was raised on to the core's queue for messages from an interrupt.
 interrupt[P: Port](p: *P)
-    val _ = from_irq[kernel.here_id(p)].give(p)
+    val me = kernel.here_id(p)
+    val _ = from_irq[me].give(p)
+    val _ = from_interrupt[me].try_send(p, kernel.ticks() - epochs[me])
 
 // A hammer, at tick 90 on every core of several: give twice, take once, `ROUNDS` times, all cores at
 // once. Then core 0 passes `PASSED` units to core 1, which takes them without waiting.
 hammer_task[P: Port](p: *P) -> never
     val me = kernel.here_id(p)
-    kernel.sleep_until(p, epochs[me] + 90)
+    kernel.sleep_until(p, epochs[me] + 140)
     val _ = arrived_hammers.add(1)
     while arrived_hammers.load() < u32(kernel.CORES) do ()
     for _ in 0..<ROUNDS
@@ -156,11 +162,13 @@ hammer_task[P: Port](p: *P) -> never
             say(p, "took every unit core 0 gave\n")
         else
             say(p, "took the units core 0 gave and found more\n")
+    across_cores(p, me)
     val _ = waits_done[me].add(1)
     kernel.exit(p)
 
-// Sleep until the running core's waits have all reported.
+// Sleep until the running core's waits and messages have all reported: the raiser, the receiver, and on
+// a machine of several cores the hammer.
 await_waits[P: Port](p: *P)
     val me = kernel.here_id(p)
-    val reports: u32 = if kernel.CORES > 1 then 2 else 1
+    val reports: u32 = if kernel.CORES > 1 then 3 else 2
     while waits_done[me].load() < reports do kernel.sleep(p, 1)

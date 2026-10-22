@@ -43,6 +43,19 @@ skiff: core $1 the low task gave up its inherited priority with the mutex
 skiff: core $1 a timed take timed out after 5 ticks
 skiff: core $1 an interrupt's give woke a waiting task at once"
 }
+
+# The messages every core runs (boards/scenarios, messages.sysl): a message an interrupt sent, a queue
+# passing five messages in order while it fills and empties, a timed receive, a wait for all of two event
+# flags woken only by the last, a timed flags wait, and a notification kept from before the wait and one
+# that wakes it.
+messages_expected() {
+    echo "skiff: core $1 a message an interrupt sent was waiting
+skiff: core $1 a queue carried 5 messages in order through a full queue and an empty one
+skiff: core $1 a timed receive timed out after 3 ticks
+skiff: core $1 event flags woke a wait for all only once all its bits were set
+skiff: core $1 a flags wait timed out after 4 ticks
+skiff: core $1 a notification sent before the wait was kept, and one sent during it woke the task"
+}
 mps2_expected="skiff: hello
 skiff: .shared holds the shared state
 skiff: core 0 tick 1
@@ -50,14 +63,17 @@ skiff: core 0 tick 2
 skiff: core 0 tick 3
 skiff: core 0 time base agrees
 $(tasks_expected 0 "f32 registers survived the switches")
-$(waits_expected 0)"
+$(waits_expected 0)
+$(messages_expected 0)"
 
 # The AN521's two cores run one image, each greeting and ticking on the UART of its own number, then
 # running its own tasks at once with the other. Core 0 has no FPU (the SSE-200's CPU0, in QEMU as on
 # the FPGA image), and one image serves both cores, so the image is built with no FPU registers and
 # neither core checks them; core 0 may not create a task on core 1 once
 # it runs. Both cores then hammer one semaphore in `.shared` at once, and core 0 finds the count exact;
-# core 0 gives units one at a time that core 1 takes without waiting. Core 1 then faults on purpose: it
+# core 0 gives units one at a time that core 1 takes without waiting, then sends it numbered messages
+# and notifications that it takes without waiting, and the two pass an event flag back and forth, each
+# polling for the other's. Core 1 then faults on purpose: it
 # reports the fault on its own console and stops. Core 0 sees it stopped, takes more ticks, finds that
 # the time base counted its own ticks and none of core 1's, and stops the machine with status 0.
 an521_core0_expected="skiff: hello from core 0
@@ -68,7 +84,9 @@ skiff: core 0 tick 3
 $(tasks_expected 0)
 skiff: core 0 may not create a task on core 1, which runs
 $(waits_expected 0)
+$(messages_expected 0)
 skiff: core 0 two cores' gives and takes left the shared count exact
+skiff: core 0 two cores passed event flags back and forth 1000 times
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
 skiff: core 0 time base agrees"
@@ -78,7 +96,10 @@ skiff: core 1 tick 2
 skiff: core 1 tick 3
 $(tasks_expected 1)
 $(waits_expected 1)
+$(messages_expected 1)
 skiff: core 1 took every unit core 0 gave
+skiff: core 1 received every message core 0 sent, in order
+skiff: core 1 took every notification core 0 gave
 skiff: core 1 fault BusFault"
 
 failed=0

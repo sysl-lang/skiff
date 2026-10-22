@@ -321,6 +321,8 @@ create[P: Port](p: *P, core: u32, stack: []u32, entry: *extern() -> never, prior
     val result = c.sched.free_slot() match
         Some(i) ->
             c.sched.add_at(i, p.new_context(stack, entry), priority)
+            // Its note is the new task's before the task can run, and before anyone has the handle.
+            renew_note(p, core, i, c.sched.handle(core, i))
             if core == me && c.sched.outranks_running(i) then p.request_switch()
             Ok(c.sched.handle(core, i))
         None -> Err(TaskError.Full)
@@ -329,12 +331,16 @@ create[P: Port](p: *P, core: u32, stack: []u32, entry: *extern() -> never, prior
 
 // Delete the task `t` names: it never runs again, and its slot is free for another. A task deleting
 // itself is switched away from at once. A waiting task's wait is withdrawn first, under its object's
-// lock. Only the owner deletes its tasks.
+// lock, and its notification is cleared, refusing any send to the handle. Only the owner deletes its
+// tasks.
 delete[P: Port](p: *P, t: Task) -> Result[unit, TaskError]
     owned(p, t)?
     val c = here(p)
     c.sched.check(t) match
-        Ok(i) -> withdraw(p, c, i)
+        Ok(i) ->
+            withdraw(p, c, i)
+            // Cleared before the task goes, since a task deleting itself never comes back to it.
+            if c.sched.tasks[i].priority != IDLE_PRIORITY then renew_note(p, t.core(), i, NO_TASK)
         Err(_) -> ()
     val state = p.mask()
     val result = c.sched.delete(t) match

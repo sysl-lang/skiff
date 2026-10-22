@@ -37,7 +37,7 @@ impl Port for Board
 // The status `boot` answered, which the last task stops the machine with.
 private var status: i32 = 0
 
-private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise)
+private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender)
 
 // Called by the chip's reset handler once there is a stack and `.bss` and `.shared` are zero.
 @export("skiff_main")
@@ -74,6 +74,8 @@ private task_high() -> never = scenarios.high_task(&Board())
 private task_timed() -> never = scenarios.timed_task(&Board())
 private task_raiser() -> never = scenarios.raiser_task(&Board(), &entries)
 private task_hammer() -> never = scenarios.hammer_task(&Board())
+private task_receiver() -> never = scenarios.receiver_task(&Board())
+private task_sender() -> never = scenarios.sender_task(&Board())
 
 // Raise timer 0's interrupt from software; the timer itself never runs.
 private raise() = armv7m.pend_irq(mps2.TIMER0_IRQ)

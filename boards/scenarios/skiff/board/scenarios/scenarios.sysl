@@ -19,14 +19,16 @@ import skiff.kernel.{Port, Task, TaskError, TaskState}
 //     never yields: B, asking H's state as it spins, must never find H ready.
 //   - R, at priority 4, at tick 45: A's handle, kept since A was created, is refused now that A has
 //     exited, and still refused once a new task has A's slot. Core 0 of several may not create a task
-//     on core 1, which runs. Then it waits for the waits (waits.sysl), and the board ends the run.
+//     on core 1, which runs. Then it waits for the waits (waits.sysl) and the messages (messages.sysl),
+//     and the board ends the run.
 
 // How many words each task's stack holds: 2 KiB, enough for a kernel call at -O0.
 const STACK_WORDS: usize = 512
 
-// How many stacks each core has: A, B, P1, P2, H, R, the six of the waits and the idle task.
-private const STACKS: usize = 13
-private const IDLE_STACK: usize = 12
+// How many stacks each core has: A, B, P1, P2, H, R, the six of the waits, the two of the messages
+// and the idle task.
+private const STACKS: usize = 15
+private const IDLE_STACK: usize = 14
 
 // The entries a board gives the tasks. Each calls the scenario of its name over the board's port; `meet`
 // returns, and is what the FPU probe calls with its registers filled; `raise` raises timer 0's interrupt
@@ -48,6 +50,8 @@ struct Entries
     raiser: *extern() -> never
     hammer: *extern() -> never
     raise: *extern() -> unit
+    receiver: *extern() -> never
+    sender: *extern() -> never
 
 private var stacks: [kernel.CORES][STACKS][STACK_WORDS]u32
 private[scenarios] var epochs: [kernel.CORES]u32
@@ -76,7 +80,9 @@ create_tasks[P: Port](p: *P, core: u32, e: *Entries)
     val _ = created(kernel.create(p, core, stacks[core][9], e.timed, 3))
     val _ = created(kernel.create(p, core, stacks[core][10], e.raiser, 2))
     if kernel.CORES > 1
-        val _ = created(kernel.create(p, core, stacks[core][11], e.hammer, 2))
+        hammers[core] = created(kernel.create(p, core, stacks[core][11], e.hammer, 2))
+    receivers[core] = created(kernel.create(p, core, stacks[core][12], e.receiver, 4))
+    val _ = created(kernel.create(p, core, stacks[core][13], e.sender, 3))
 
 private created(result: Result[Task, TaskError]) -> Task = result match
     Ok(t) -> t

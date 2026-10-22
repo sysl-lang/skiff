@@ -1,0 +1,130 @@
+module skiff.kernel
+
+import sysl.sync.Lock
+
+// Message queues: `N` messages of type `T`, first in first out, copied in by a send and out by a
+// receive. The storage is the queue's own, so a queue in `.shared` carries messages between cores with
+// no pointer in them. Like a semaphore, a queue is a plain struct the application declares, filled in
+// at run time if it is in `.shared` and laid into the image as constant data otherwise. `T` needs a zero
+// value, which the empty slots hold, and `N` is at least 1.
+//
+// A queue hands itself over as a semaphore does. A send with a receiver waiting puts the message in and
+// keeps it for that receiver, which takes it when it runs; a receive with a sender waiting takes its
+// message out and keeps the free slot for that sender, which fills it when it runs. So a woken receiver
+// always has a message and a woken sender always has room, and what is kept for them is out of reach of
+// every other send and receive. Messages leave in the order they came: a receiver kept a message takes
+// the oldest when it runs.
+//
+// Senders and receivers wait in the one queue of waiters, each marked with its side. Both sides wait at
+// once only for the moment between a kept slot or message and its taker running.
+
+// The side a waiter of a queue is on: its record's mode.
+private const RECEIVING: u8 = 0
+private const SENDING: u8 = 1
+
+struct Queue[T, const N: usize]
+    w: Waitable
+    slots: [N]T
+    head: u32           // the oldest message's slot
+    count: u32          // the messages in the slots, those kept for woken receivers among them
+    kept_messages: u32  // messages kept for receivers already woken
+    kept_slots: u32     // free slots kept for senders already woken
+
+impl[T, const N: usize] Queue[T, N]
+    // An empty queue called `name`.
+    const new(name: string) -> Queue[T, N]
+        var slots: [N]T
+        Queue(Waitable.new(name), slots, 0, 0, 0, 0)
+
+    // Send `m`, waiting up to `timeout` ticks for room. Answers whether it was sent. Only a task may
+    // wait; with a timeout of 0 nothing waits.
+    send[P: Port](*self, p: *P, m: T, timeout: u32) -> bool
+        var l = self.w.lock.on(p)
+        l.acquire()
+        if self.count + self.kept_slots < u32(N)
+            self.put(p, m)
+            l.release()
+            return true
+        if timeout == 0
+            l.release()
+            return false
+        val c = running_core(p)
+        enqueue_running(c, &self.w, timeout, SENDING, 0)
+        p.request_switch()
+        l.release()
+        if wait_outcome(c) != Outcome.Given then return false
+        self.fill_kept(p, m)
+        true
+
+    // Send `m` if there is room, without waiting. An interrupt handler may call it.
+    try_send[P: Port](*self, p: *P, m: T) -> bool = self.send(p, m, 0)
+
+    // Receive the oldest message, waiting up to `timeout` ticks for one. Answers None if none came. Only
+    // a task may wait; with a timeout of 0 nothing waits.
+    receive[P: Port](*self, p: *P, timeout: u32) -> Option[T]
+        var l = self.w.lock.on(p)
+        l.acquire()
+        if self.count > self.kept_messages
+            val m = self.take_oldest(p)
+            l.release()
+            return Some(m)
+        if timeout == 0
+            l.release()
+            return None
+        val c = running_core(p)
+        enqueue_running(c, &self.w, timeout, RECEIVING, 0)
+        p.request_switch()
+        l.release()
+        if wait_outcome(c) != Outcome.Given then return None
+        Some(self.take_kept(p))
+
+    // Receive the oldest message if there is one, without waiting. An interrupt handler may call it.
+    try_receive[P: Port](*self, p: *P) -> Option[T] = self.receive(p, 0)
+
+    // How many messages it holds that a receive may take now.
+    waiting[P: Port](*self, p: *P) -> u32
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val n = self.count - self.kept_messages
+        l.release()
+        n
+
+    // How many messages it holds at most.
+    capacity(*self) -> u32 = u32(N)
+
+    // What a woken sender does when it runs: fill the slot kept for it with `m`.
+    private[kernel] fill_kept[P: Port](*self, p: *P, m: T)
+        var l = self.w.lock.on(p)
+        l.acquire()
+        self.kept_slots -= 1
+        self.put(p, m)
+        l.release()
+
+    // What a woken receiver does when it runs: take the message kept for it.
+    private[kernel] take_kept[P: Port](*self, p: *P) -> T
+        var l = self.w.lock.on(p)
+        l.acquire()
+        self.kept_messages -= 1
+        val m = self.take_oldest(p)
+        l.release()
+        m
+
+    // Under the lock: put `m` behind the newest message, and keep it for the best waiting receiver.
+    private put[P: Port](*self, p: *P, m: T)
+        self.slots[usize((self.head + self.count) % u32(N))] = m
+        self.count += 1
+        val r = self.w.queue.first_of(RECEIVING)
+        if r != NONE
+            self.kept_messages += 1
+            val _ = wake_at(p, &self.w, r, Outcome.Given)
+
+    // Under the lock: take the oldest message out, and keep its slot for the best waiting sender.
+    private take_oldest[P: Port](*self, p: *P) -> T
+        val m = self.slots[usize(self.head)]
+        self.head = (self.head + 1) % u32(N)
+        self.count -= 1
+        val s = self.w.queue.first_of(SENDING)
+        if s != NONE
+            self.kept_slots += 1
+            val _ = wake_at(p, &self.w, s, Outcome.Given)
+        m

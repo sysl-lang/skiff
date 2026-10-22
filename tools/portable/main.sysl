@@ -4,7 +4,7 @@
 
 import sysl.sync.{Atomic, Lock}
 import skiff.kernel
-import skiff.kernel.Port
+import skiff.kernel.{Port, Queue}
 
 struct Nothing
 end Nothing
@@ -32,6 +32,13 @@ private var stack: [64]u32 = [0; 64]
 private var units = kernel.Semaphore.new("units", 0, 2)
 private var guard = kernel.Mutex.new("guard")
 private var word = kernel.KernelLock.new("word")
+private var mail: Queue[u32, 2] = Queue.new("mail")
+private var events = kernel.Flags.new("events", 0)
+
+// A message wider than a word, so a queue copies a struct in and out.
+struct Reading
+    channel: u8
+    value: u64
 
 // The waits and the locks, over the port.
 private waits(m: *Nothing) -> bool
@@ -43,7 +50,18 @@ private waits(m: *Nothing) -> bool
     if !units.give(m) || !units.try_take(m) || units.take(m, 1) || units.available(m) != 0 then return false
     if !guard.lock(m, kernel.FOREVER) then return false
     guard.unlock(m)
-    guard.holder() == kernel.NO_TASK
+    guard.holder() == kernel.NO_TASK && messages(m)
+
+// The queues, the flags and the notifications, over the port.
+private messages(m: *Nothing) -> bool
+    var readings: Queue[Reading, 3] = Queue.new("readings")
+    if !readings.send(m, Reading(1, 2), kernel.FOREVER) || readings.receive(m, 1).is_none() then return false
+    if !mail.try_send(m, 1) || mail.try_receive(m) != Some(1) || mail.waiting(m) != 0 then return false
+    if events.set(m, 0b11) != 0b11 || events.clear(m, 0b1) != 0b11 || events.get(m) != 0b10 then return false
+    if events.wait(m, 0b10, true, true, 5) != Some(0b10) then return false
+    val me = kernel.current(m)
+    if kernel.notify(m, me, 1, kernel.Action.SetBits).is_err() || kernel.notify_give(m, me).is_err() then return false
+    kernel.notify_wait(m, 0, 0, 3) == Some(2) && kernel.notify_take(m, true, 3) == 2
 
 private body() -> never
     loop

@@ -1,0 +1,166 @@
+module skiff.board.scenarios
+
+import sysl.sync.Atomic
+import skiff.kernel
+import skiff.kernel.{Action, FOREVER, Flags, Port, Queue, Task}
+
+// The messages, each core with objects of its own, between the receiver (priority 4) and the sender
+// (priority 3), from tick 100 of the core's epoch:
+//
+//   - Tick 100, the receiver finds the message timer 0's interrupt sent at tick 85 (waits.sysl) waiting
+//     in a queue. Then it receives from an empty queue of 2, and the sender's first send at tick 101
+//     hands it the message. The receiver sleeps 2 ticks, in which the sender fills the queue and blocks
+//     on its fourth send; each receive then makes room for the sender, and the receiver must get 1 to 5
+//     in order. Then a timed receive on the empty queue must end after 3 ticks, empty-handed.
+//   - Tick 110, the receiver waits for all of two event flags, clearing them as it wakes. The sender sets
+//     one, then a flag it did not ask for, then the other: the receiver must wake only on the last set,
+//     answered all three bits, and leave the third set. Then a timed wait for a flag nobody sets must
+//     end after 4 ticks.
+//   - Tick 120, the sender notifies the receiver before it waits, and at tick 124 while it waits: the
+//     first must be answered at once, the second must wake it.
+//
+// On a machine of several cores the hammers (waits.sysl) go on to pass messages, notifications and
+// event flags from core 0 to core 1 through objects in `.shared`, with neither core waiting: core 0
+// sends `CARRIED` numbered messages through a queue of 4 that core 1 receives in order, gives core 1's
+// hammer `CARRIED` notifications that it takes, and the two pass a flag back and forth `CARRIED` times.
+
+// How many messages, notifications and flag rounds pass between the cores.
+private const CARRIED: u32 = 1000
+
+// Event flags the scenarios use.
+private const LEFT: u32 = 0b001
+private const RIGHT: u32 = 0b010
+private const OTHER: u32 = 0b100
+private const NEVER_SET: u32 = 0b1000
+private const PING: u32 = 0b01
+private const PONG: u32 = 0b10
+
+// Each core's own objects, laid into the image as constant data.
+private[scenarios] var from_interrupt: [kernel.CORES]Queue[u32, 1] = [Queue.new("from an interrupt"); kernel.CORES]
+private var mail: [kernel.CORES]Queue[u32, 2] = [Queue.new("mail"); kernel.CORES]
+private var events = [Flags.new("events", 0); kernel.CORES]
+private[scenarios] var receivers: [kernel.CORES]Task
+private[scenarios] var hammers: [kernel.CORES]Task
+private var found_full: [kernel.CORES]Atomic[u32]
+private var sets_made: [kernel.CORES]Atomic[u32]
+
+// The objects the cores pass things through: in `.shared`, so filled in by core 0.
+@section(".shared")
+private var carried: Queue[u32, 4]
+@section(".shared")
+private var signals: Flags
+
+// Fill in the shared objects of the messages. Core 0 calls it before any other core starts.
+fill_shared_messages()
+    carried = Queue.new("carried")
+    signals = Flags.new("signals", 0)
+
+// The receiver: the three scenarios' waiting side.
+receiver_task[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    kernel.sleep_until(p, epochs[me] + 100)
+    val raised = from_interrupt[me].try_receive(p)
+    if raised.is_some() && raised.unwrap() >= 85
+        say(p, "a message an interrupt sent was waiting\n")
+    else
+        say(p, "no message from the interrupt\n")
+    var in_order = true
+    for want in 1u32..5
+        if mail[me].receive(p, FOREVER) != Some(want) then in_order = false
+        if want == 1 then kernel.sleep(p, 2)
+    if in_order && found_full[me].load() != 0
+        say(p, "a queue carried 5 messages in order through a full queue and an empty one\n")
+    else
+        say(p, "a queue lost its order, or was never full\n")
+    val start = kernel.ticks()
+    val got = mail[me].receive(p, 3)
+    report_timeout(p, got.is_none(), kernel.ticks() - start, 3, "a timed receive")
+
+    kernel.sleep_until(p, epochs[me] + 110)
+    val bits = events[me].wait(p, LEFT | RIGHT, true, true, 20)
+    if bits == Some(LEFT | RIGHT | OTHER) && sets_made[me].load() == 2 && events[me].get(p) == OTHER
+        say(p, "event flags woke a wait for all only once all its bits were set\n")
+    else
+        say(p, "event flags ended a wait for all before all its bits were set\n")
+    val since = kernel.ticks()
+    val none = events[me].wait(p, NEVER_SET, false, false, 4)
+    report_timeout(p, none.is_none(), kernel.ticks() - since, 4, "a flags wait")
+
+    kernel.sleep_until(p, epochs[me] + 122)
+    val early = kernel.notify_wait(p, 0, 0xffff_ffff, FOREVER)
+    val during = kernel.notify_wait(p, 0, 0xffff_ffff, FOREVER)
+    if early == Some(42) && during == Some(5)
+        say(p, "a notification sent before the wait was kept, and one sent during it woke the task\n")
+    else
+        say(p, "a notification was lost\n")
+    val _ = waits_done[me].add(1)
+    kernel.exit(p)
+
+// The sender: the three scenarios' other side.
+sender_task[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    kernel.sleep_until(p, epochs[me] + 101)
+    for m in 1u32..5
+        if mail[me].waiting(p) == mail[me].capacity() then found_full[me].store(1)
+        val _ = mail[me].send(p, m, FOREVER)
+    kernel.sleep_until(p, epochs[me] + 111)
+    val _ = events[me].set(p, LEFT)
+    val _ = events[me].set(p, OTHER)
+    sets_made[me].store(2)
+    val _ = events[me].set(p, RIGHT)
+    kernel.sleep_until(p, epochs[me] + 120)
+    val _ = kernel.notify(p, receivers[me], 42, Action.Overwrite)
+    kernel.sleep_until(p, epochs[me] + 124)
+    val _ = kernel.notify(p, receivers[me], 5, Action.SetBits)
+    kernel.exit(p)
+
+// Say whether a timed wait of `timeout` ticks that waited `waited` ended empty-handed and on time.
+private report_timeout[P: Port](p: *P, empty: bool, waited: u32, timeout: u32, what: string)
+    say(p, what)
+    if empty && waited >= timeout
+        p.write(" timed out after ".bytes)
+    else
+        p.write(" ended after ".bytes)
+    kernel.write_dec(p, if empty && waited >= timeout then timeout else waited)
+    p.write(" ticks\n".bytes)
+
+// The hammers' messages between the cores, after the semaphore's: core 0 sends, gives and sets, core 1
+// receives, takes and answers, neither waiting on the other's objects.
+across_cores[P: Port](p: *P, me: u32)
+    if me == 0
+        for m in 0..<CARRIED
+            while !carried.try_send(p, m) do ()
+        for _ in 0..<CARRIED
+            val _ = kernel.notify_give(p, hammers[1])
+        // Each answer must find the ping cleared: core 1 clears it as its wait ends, before it answers.
+        var crossed: u32 = 0
+        for _ in 0..<CARRIED
+            val _ = signals.set(p, PING)
+            var answer = signals.wait(p, PONG, false, true, 0)
+            while answer.is_none() do answer = signals.wait(p, PONG, false, true, 0)
+            if answer.unwrap() & PING != 0 then crossed += 1
+        if crossed == 0
+            say(p, "two cores passed event flags back and forth 1000 times\n")
+        else
+            say(p, "two cores passing event flags found a ping not cleared ")
+            kernel.write_dec(p, crossed)
+            p.write(" times\n".bytes)
+    else if me == 1
+        var next: u32 = 0
+        var in_order = true
+        while next < CARRIED
+            carried.try_receive(p) match
+                Some(m) ->
+                    if m != next then in_order = false
+                    next += 1
+                None -> ()
+        if in_order && carried.waiting(p) == 0
+            say(p, "received every message core 0 sent, in order\n")
+        else
+            say(p, "received core 0's messages out of order\n")
+        var taken: u32 = 0
+        while taken < CARRIED do taken += kernel.notify_take(p, true, 0)
+        if taken == CARRIED then say(p, "took every notification core 0 gave\n") else say(p, "took more notifications than core 0 gave\n")
+        for _ in 0..<CARRIED
+            while signals.wait(p, PING, false, true, 0).is_none() do ()
+            val _ = signals.set(p, PONG)

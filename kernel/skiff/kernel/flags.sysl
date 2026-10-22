@@ -1,0 +1,89 @@
+module skiff.kernel
+
+import sysl.sync.Lock
+
+// Event flags: 32 bits that tasks and interrupt handlers set and clear, and that a task waits on until
+// any of the bits it names are set, or all of them. A waiter may ask for the bits it waited on to be
+// cleared as its wait ends. A plain struct like the other objects: in `.shared` if more than one core
+// uses it, and filled in at run time there.
+//
+// A set ends the wait of every waiter it satisfies, in the queue's order, and each is answered the bits
+// as the set left them; the bits the woken waiters asked to clear are cleared once all of them have been
+// seen, so two waiters for one bit are both woken by one set.
+
+// The terms of a flags wait, kept in its record's mode.
+private const WAIT_ALL: u8 = 1       // every bit named, not any one of them
+private const CLEAR_ON_EXIT: u8 = 2  // the bits named are cleared as the wait ends
+
+struct Flags
+    w: Waitable
+    bits: u32
+
+impl Flags
+    // Flags called `name`, starting as `bits`.
+    const new(name: string, bits: u32) -> Flags = Flags(Waitable.new(name), bits)
+
+    // Set `bits`, ending every wait that is now satisfied. Answers the bits as they are afterwards. An
+    // interrupt handler may call it.
+    set[P: Port](*self, p: *P, bits: u32) -> u32
+        var l = self.w.lock.on(p)
+        l.acquire()
+        self.bits |= bits
+        var cleared: u32 = 0
+        var at = self.w.queue.first()
+        while at != NONE
+            val r = waiter(at)
+            val next = r.next
+            if satisfied(self.bits, r.value, r.mode)
+                if r.mode & CLEAR_ON_EXIT != 0 then cleared |= r.value
+                r.value = self.bits
+                val _ = wake_at(p, &self.w, at, Outcome.Woken)
+            at = next
+        self.bits &= ~cleared
+        val now = self.bits
+        l.release()
+        now
+
+    // Clear `bits`. Answers the bits as they were before. An interrupt handler may call it.
+    clear[P: Port](*self, p: *P, bits: u32) -> u32
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val was = self.bits
+        self.bits &= ~bits
+        l.release()
+        was
+
+    // The bits as they are.
+    get[P: Port](*self, p: *P) -> u32
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val now = self.bits
+        l.release()
+        now
+
+    // Wait up to `timeout` ticks until any of `wanted` is set, or with `all` every one of them. Answers
+    // the bits as they were when the wait was satisfied, and clears `wanted` from them if `clear`; answers
+    // None, clearing nothing, if the timeout came first. A wait for no bits at all answers None at once.
+    // Only a task may wait; with a timeout of 0 nothing waits.
+    wait[P: Port](*self, p: *P, wanted: u32, all: bool, clear: bool, timeout: u32) -> Option[u32]
+        if wanted == 0 then return None
+        val mode = (if all then WAIT_ALL else 0) | (if clear then CLEAR_ON_EXIT else 0)
+        var l = self.w.lock.on(p)
+        l.acquire()
+        if satisfied(self.bits, wanted, mode)
+            val got = self.bits
+            if clear then self.bits &= ~wanted
+            l.release()
+            return Some(got)
+        if timeout == 0
+            l.release()
+            return None
+        val c = running_core(p)
+        enqueue_running(c, &self.w, timeout, mode, wanted)
+        p.request_switch()
+        l.release()
+        if wait_outcome(c) == Outcome.Woken then Some(wait_value(c)) else None
+
+// Whether `bits` satisfy a wait for `wanted` on the terms `mode`.
+private satisfied(bits: u32, wanted: u32, mode: u8) -> bool
+    if mode & WAIT_ALL != 0 then bits & wanted == wanted else bits & wanted != 0

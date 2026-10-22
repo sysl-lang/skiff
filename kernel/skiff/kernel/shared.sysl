@@ -30,6 +30,7 @@ const INBOX_CORES: usize = if option_cores > 1 then option_cores else 0
 //   - `inboxes[to][from]` is the ring core `from` posts to core `to` through.
 //   - `waiters[core][slot]` is the wait record of that task (waits.sysl): a task waits on one thing at
 //     a time, so one record each is all there is.
+//   - `notes[core][slot]` is the notification of that task (notify.sysl), which any core may send to.
 //   - `start` and `end` are `.shared`'s bounds, as the board found them in its link script, for the
 //     check that an object two cores use lies inside them.
 struct Shared
@@ -37,6 +38,7 @@ struct Shared
     states: [option_cores]Atomic[u32]
     inboxes: [INBOX_CORES][INBOX_CORES]Ring
     waiters: [option_cores][option_tasks]Waiter
+    notes: [option_cores][option_tasks]Note
     start: usize
     end: usize
 
@@ -70,7 +72,7 @@ private[kernel] time_base() -> *Atomic[u32] = &shared.time
 // `.shared`, which the board reads from `__shared_start` and `__shared_end`. The inboxes and the wait
 // records are named on their own, since they are what the other cores write.
 shared_within(start: usize, end: usize) -> bool
-    within(usize(&shared), sizeof(Shared), start, end) && within(usize(&shared.inboxes), sizeof([INBOX_CORES][INBOX_CORES]Ring), start, end) && within(usize(&shared.waiters), sizeof([option_cores][option_tasks]Waiter), start, end)
+    within(usize(&shared), sizeof(Shared), start, end) && within(usize(&shared.inboxes), sizeof([INBOX_CORES][INBOX_CORES]Ring), start, end) && within(usize(&shared.waiters), sizeof([option_cores][option_tasks]Waiter), start, end) && within(usize(&shared.notes), sizeof([option_cores][option_tasks]Note), start, end)
 
 // Tell the kernel `.shared`'s bounds, [start, end), from the link script's `__shared_start` and
 // `__shared_end`. Core 0 calls it before it releases the other cores. Until it does, no object counts as
@@ -84,6 +86,9 @@ private[kernel] in_shared(at: usize, bytes: usize) -> bool = within(at, bytes, s
 
 // The wait record at `index`: `core * option_tasks + slot`.
 private[kernel] waiter(index: u16) -> *Waiter = &shared.waiters[usize(index) / option_tasks][usize(index) % option_tasks]
+
+// The notification of task `slot` of core `core`.
+private[kernel] note_of(core: u32, slot: usize) -> *Note = &shared.notes[core][slot]
 
 // Whether `bytes` bytes at `at` lie in [start, end).
 private within(at: usize, bytes: usize, start: usize, end: usize) -> bool = at >= start && at + bytes <= end
