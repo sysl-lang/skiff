@@ -22,9 +22,7 @@ struct Ring
     slots: [INBOX_SLOTS]Message
 
 // How many cores have inboxes: none on a single core, which has no other core to hear from.
-const INBOX_CORES: usize = inbox_cores(option_cores)
-
-private const inbox_cores(cores: usize) -> usize = if cores > 1 then cores else 0
+const INBOX_CORES: usize = if option_cores > 1 then option_cores else 0
 
 // The `.shared` structure.
 //   - `time` is the time base, advanced by core 0's tick alone.

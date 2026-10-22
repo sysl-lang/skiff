@@ -44,10 +44,10 @@ undeclared feature is refused. An OS is one program, never one workspace member 
 
 `const A = if N > 1 then N else 0` is refused ("the value of 'A' is not a constant expression"), and so is
 the same `if` in an array length or an `@assert`. The same `if` as the body of a `const` function folds. The
-inbox array is sized `option_cores` when there is more than one core and 0 otherwise, so today it goes
-through the helper `inbox_cores` in `kernel/skiff/kernel/shared.sysl`, which is inlined once `if` folds.
+inbox array is sized `option_cores` when there is more than one core and 0 otherwise.
 
-Status: sent to `sysl` (found on 0.3.7).
+Status: fixed in sysl 0.3.8 (`if`, `elif` and `match` over constants are constant); `INBOX_CORES` is the
+`if` itself.
 
 ## FINDINGS 6 — a `const` member of a plain struct is never constant data on a freestanding target
 
@@ -80,7 +80,7 @@ is the behaviour `S.new` should have. skiff does not depend on it: a kernel obje
 `Mutex.new`) is filled in at run time, which an object in `.shared` needs anyway since start-up zeroes the
 section. The workaround would have been free functions (`semaphore(name, count, max)`) in place of `new`.
 
-Status: open (found on 0.3.7), not sent: this agent does not message other sessions.
+Status: open (found on 0.3.7); sent to `sysl` as a bug.
 
 ## FINDINGS 7 — a simple enum with a variant at 0 has no zero value
 
@@ -103,4 +103,4 @@ so its declaration now carries an initializer that is all zeros, spelled out
 zero the section already holds. Whether an enum with a variant at 0 should zero to it is a design
 question for sysl.
 
-Status: open (found on 0.3.7), not sent.
+Status: open (found on 0.3.7); sent to `sysl` as a design question.
