@@ -12,10 +12,21 @@ trait Doorbell
     // it before it reads any inbox: a message posted while the drain runs then rings once more.
     clear(*self)
 
+// The running core's data cache, as far as a buffer handed between owners needs it: a buffer is cleaned
+// before it is given and invalidated after it is taken (DESIGN "Channels and the buffer pool"). Every
+// buffer starts on a cache line and fills whole lines, so neither touches bytes outside it. A core with
+// no data cache does nothing for either.
+trait Cache
+    // Write the core's dirty lines over `bytes` back to memory, so another owner reads what was written.
+    clean(*self, bytes: []const u8)
+
+    // Drop the core's lines over `bytes`, so the next read of them comes from memory.
+    invalidate(*self, bytes: []u8)
+
 // The kernel's view of the processor and the machine under it. An arch package, a chip package and a
 // board program together implement it; the kernel itself knows nothing about the hardware beyond what
 // this trait says.
-trait Port: Doorbell
+trait Port: Doorbell + Cache
     // Write `bytes` to this core's console, waiting for room as long as it takes.
     write(*self, bytes: []const u8)
 

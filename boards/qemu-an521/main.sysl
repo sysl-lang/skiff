@@ -10,7 +10,7 @@ import skiff.arch.armv7m
 import skiff.board.scenarios
 import skiff.chip.an521
 import skiff.kernel
-import skiff.kernel.{Doorbell, Port}
+import skiff.kernel.{Cache, Doorbell, Port}
 
 // The bounds of `.shared`, from the link script.
 extern __shared_start: u8
@@ -49,6 +49,11 @@ impl Port for Board
 impl Doorbell for Board
     ring(*self, core: u32) = an521.ring_doorbell(core)
     clear(*self) = an521.clear_doorbell()
+
+// The M33s have no data cache, so a buffer handed over needs nothing done.
+impl Cache for Board
+    clean(*self, bytes: []const u8) = ()
+    invalidate(*self, bytes: []u8) = ()
 
 // The status `boot` answered on core 0, which core 0's last task stops the machine with.
 private var status: i32 = 0

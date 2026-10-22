@@ -46,15 +46,16 @@ skiff: core $1 an interrupt's give woke a waiting task at once"
 
 # The messages every core runs (boards/scenarios, messages.sysl): a message an interrupt sent, a queue
 # passing five messages in order while it fills and empties, a timed receive, a wait for all of two event
-# flags woken only by the last, a timed flags wait, and a notification kept from before the wait and one
-# that wakes it.
+# flags woken only by the last, a timed flags wait, a notification kept from before the wait and one
+# that wakes it, and a buffer handed to another task and back, in place, eight times.
 messages_expected() {
     echo "skiff: core $1 a message an interrupt sent was waiting
 skiff: core $1 a queue carried 5 messages in order through a full queue and an empty one
 skiff: core $1 a timed receive timed out after 3 ticks
 skiff: core $1 event flags woke a wait for all only once all its bits were set
 skiff: core $1 a flags wait timed out after 4 ticks
-skiff: core $1 a notification sent before the wait was kept, and one sent during it woke the task"
+skiff: core $1 a notification sent before the wait was kept, and one sent during it woke the task
+skiff: core $1 a buffer went to another task and back 8 times in place, and every buffer is back in the pool"
 }
 mps2_expected="skiff: hello
 skiff: .shared holds the shared state
@@ -75,7 +76,9 @@ $(messages_expected 0)"
 # and notifications that it takes without waiting, and the two pass an event flag back and forth, each
 # polling for the other's. Then core 1 waits, blocking, on a semaphore, a mutex, a queue, event flags and
 # its notification, each given by core 0 through core 1's inbox and doorbell; the two pass a unit back and
-# forth through two semaphores, each waiting for the other; and a task on core 0 waits on a mutex a task
+# forth through two semaphores, each waiting for the other; core 0 fills buffers that core 1 receives,
+# finds in place and as written, and gives back to the pool, from which core 0 takes every one again;
+# and a task on core 0 waits on a mutex a task
 # of core 1 holds while a task of middling priority works on core 1, and must have it within a bound
 # through the boost core 1's inbox carries, which the owner gives up with the mutex. Core 1 then faults
 # on purpose: it
@@ -93,6 +96,7 @@ $(messages_expected 0)
 skiff: core 0 two cores' gives and takes left the shared count exact
 skiff: core 0 two cores passed event flags back and forth 1000 times
 skiff: core 0 two cores woke each other through semaphores 1000 times
+skiff: core 0 had every buffer it sent core 1 back in the pool
 skiff: core 0 the high task had the mutex a task on core 1 held within 10 ticks
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
@@ -112,6 +116,7 @@ skiff: core 1 locked a mutex core 0 unlocked while it waited
 skiff: core 1 received a message core 0 sent while it waited
 skiff: core 1 woke on an event flag core 0 set while it waited
 skiff: core 1 woke on a notification core 0 sent while it waited
+skiff: core 1 received 100 buffers core 0 filled, in place and every byte as written
 skiff: core 1 the low task gave up the priority core 0's task lent it with the mutex
 skiff: core 1 fault BusFault"
 

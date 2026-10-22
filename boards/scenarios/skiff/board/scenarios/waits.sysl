@@ -52,6 +52,7 @@ fill_shared_objects()
     passed = Semaphore.new("passed", 0, 4)
     fill_shared_messages()
     fill_shared_crossing()
+    fill_shared_buffers()
 
 // Work for `ticks` ticks of the time base without blocking or yielding.
 private[scenarios] busy(ticks: u32)
@@ -169,9 +170,9 @@ hammer_task[P: Port](p: *P) -> never
     val _ = waits_done[me].add(1)
     kernel.exit(p)
 
-// Sleep until the running core's waits and messages have all reported: the raiser, the receiver, and on
-// a machine of several cores the hammer and the inversion across cores (crossing.sysl).
+// Sleep until the running core's waits and messages have all reported: the raiser, the receiver, the
+// sender, and on a machine of several cores the hammer and the inversion across cores (crossing.sysl).
 await_waits[P: Port](p: *P)
     val me = kernel.here_id(p)
-    val reports: u32 = if kernel.CORES > 1 then 4 else 2
+    val reports: u32 = if kernel.CORES > 1 then 5 else 3
     while waits_done[me].load() < reports do kernel.sleep(p, 1)

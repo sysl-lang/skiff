@@ -18,6 +18,7 @@ import skiff.kernel.{Action, FOREVER, Flags, Port, Queue, Task}
 //     end after 4 ticks.
 //   - Tick 120, the sender notifies the receiver before it waits, and at tick 124 while it waits: the
 //     first must be answered at once, the second must wake it.
+//   - Tick 130, a buffer goes back and forth between them (buffers.sysl).
 //
 // On a machine of several cores the hammers (waits.sysl) go on to pass messages, notifications and
 // event flags from core 0 to core 1 through objects in `.shared`, with neither core waiting: core 0
@@ -93,6 +94,7 @@ receiver_task[P: Port](p: *P) -> never
         say(p, "a notification sent before the wait was kept, and one sent during it woke the task\n")
     else
         say(p, "a notification was lost\n")
+    buffers_receiver(p, me)
     val _ = waits_done[me].add(1)
     kernel.exit(p)
 
@@ -112,6 +114,8 @@ sender_task[P: Port](p: *P) -> never
     val _ = kernel.notify(p, receivers[me], 42, Action.Overwrite)
     kernel.sleep_until(p, epochs[me] + 124)
     val _ = kernel.notify(p, receivers[me], 5, Action.SetBits)
+    buffers_sender(p, me)
+    val _ = waits_done[me].add(1)
     kernel.exit(p)
 
 // Say whether a timed wait of `timeout` ticks that waited `waited` ended empty-handed and on time.

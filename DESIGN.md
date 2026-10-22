@@ -8,8 +8,8 @@ change is checked against it. Where the code and this file disagree, one of them
 
 - **Core**: one processor running a scheduler. `option_cores` of them, numbered from 0.
 - **Owner**: the core a task belongs to. A task never runs anywhere else.
-- **Object**: a kernel object a task can wait on: semaphore, mutex, queue, flags, stream, timer service.
-  A task's notification value is an object too.
+- **Object**: a kernel object a task can wait on: semaphore, mutex, queue, flags, buffer pool, channel,
+  stream, timer service. A task's notification value is an object too.
 - **`.shared`**: the section holding everything another core can reach. Everything else a core keeps is
   **private**: read and written only by that core, so on a core with a data cache it may be cached.
 
@@ -40,7 +40,8 @@ Core (private, one per core)          .shared
   same. `Port` is `write`, `cores`, `core_id`, `start_ticks`, `idle`, `new_context`, `request_switch`,
   `start_first`, `mask`, `restore`, `spin_lock`, `spin_try_lock` and `spin_unlock`; the arch package
   supplies the last eight. `Port` extends **`Doorbell`** (`ring(core)`), which the chip supplies: MHU0
-  on the AN521. The idle task's body is the board's (`kernel.run(p, idle_stack, idle)`), since a task
+  on the AN521; and **`Cache`** (`clean`, `invalidate`), the running core's data cache, which does
+  nothing on a core without one (see "Channels and the buffer pool"). The idle task's body is the board's (`kernel.run(p, idle_stack, idle)`), since a task
   entry takes no port.
 - **One image is built for the weakest core it runs on**: the AN521's core 0 has no FP registers, so its
   image is built for `thumb-freestanding-soft`, and no core of it saves or uses them.
@@ -237,6 +238,83 @@ wake can find it.
   counts the mutex in `Tcb.held`, raises the task to `priority` if that is higher, and makes it ready.
   The unlocking core never touches the new owner's `Tcb`.
 
+## Channels and the buffer pool
+
+Bulk data (an audio block, a frame, a packet) moves between tasks, on one core or across cores, by
+handing over a buffer, never by copying it. A **pool** holds the buffers; a **channel** carries them.
+
+### What a buffer is, and who owns it
+
+- **A pool, `Pool[N, SIZE]`, is `N` buffers of `SIZE` bytes in the pool's own storage**, so a pool in
+  `.shared` holds its buffers there. The application sizes it with the type's const arguments, as it
+  sizes a `Queue[T, N]`; nothing about one pool is a kernel option. `N` is 1 to 4096.
+- **Each buffer starts on a cache line and fills whole lines**, so cleaning or invalidating one buffer
+  never touches another's bytes, or the pool's own records. The line is `option_cache_line` (default 32,
+  the M7's): the one size here that is kernel-wide, since it is the machine's, not a pool's.
+- **A buffer is named by a `Buffer` handle**: the pool's id (8 bits), the buffer's index (12) and a
+  generation (12), packed in a `u32` as a task's handle is. The application gives each pool an id, 1 to
+  255, in `Pool.new(name, id)`; pools whose handles can meet need ids of their own, and then each refuses
+  the other's handles. A generation is never 0, so the handle 0 (`NO_BUFFER`) names
+  nothing. **A channel carries handles, never pointers**, by the rule everything follows; the bytes are
+  reached through the pool, `pool.bytes(p, b)`, which checks the handle first.
+- **Holding the current handle is owning the buffer.** At every moment a buffer belongs to exactly one
+  of: the pool (free), one holder (a task or an interrupt handler, which has its current handle), or
+  one channel (in flight, its handle in the channel's slots).
+- **Every hand-over issues a new generation**: a take from the pool, a give back to it, a send. So the
+  handle a holder gave away no longer matches, and every later use of it (`bytes`, a give back, another
+  send) is refused with `Err(Stale)`: a use after giving, a buffer given twice, a handle kept after its
+  buffer went back to the pool. A handle of another pool fails the id, and one whose index is past `N`
+  fails the index; both are refused the same way. A receive issues nothing: the handle in the channel
+  was issued by the send for whoever receives it, and nobody else has it. The generation wraps after
+  4095 hand-overs, as a task's does.
+- **A give back takes the buffer from its holder in three steps**: under the pool's lock it checks the
+  handle and issues the new generation, so that from then on nobody holds the buffer; with no lock held
+  it cleans the buffer; under the lock again it puts the buffer in the pool, or keeps it for the best
+  waiting taker. Only one object's lock is held at a time, and a second give of the same handle, racing
+  the first, finds it already stale.
+- **A send** issues the new generation the same way, cleans the buffer, and sends the handle through
+  the channel's queue. If the queue refuses it (full, and the timeout passed), the send puts the old
+  generation back, which nobody has seen the new one of, and answers `Err(Full)`: the buffer is still
+  the sender's, under the handle it had.
+- **A receive is told the pool its buffers come from**, as a send is: a send checks the handle against
+  it, so a channel only ever holds handles of the pools its senders named. A receive given another pool
+  than the one the handle names is the application's mistake, and stops the kernel naming the channel.
+
+### Caches: clean before giving, invalidate after taking
+
+- **`Cache` is part of `Port`** (`clean(bytes)`, `invalidate(bytes)`), since a data cache is the running
+  core's. Cleaning writes the core's dirty lines over the bytes back to memory; invalidating drops its
+  lines over them, so the next read comes from memory. On a core with no data cache (every QEMU machine
+  here, the M33s, an M0+, an M4) both do nothing, and the board's port says so.
+- **Every give cleans, before the buffer can be seen**: a send before the handle goes into the channel,
+  a give back before the buffer is in the pool. **Every take invalidates, after the buffer is the
+  taker's**: a receive once the handle has left the channel, a take once the buffer has left the pool,
+  and a woken receiver or taker when it runs. So a receiver reads the bytes the sender wrote, and lines
+  a core kept from an earlier turn of the same buffer are never read, or written back over a newer
+  owner's data.
+- Where the pool lies decides whether the operations do anything: in `.shared` mapped uncached (the M7
+  of a one-image build) they are no-ops by the board's choice; where the buffers are cached, they are
+  what keeps them coherent. Making the whole region non-cacheable suits control data, not audio.
+
+### Empty pool, full channel
+
+- The forms are the queue's. `take(p, timeout)` and `try_take(p)` answer `Option[Buffer]`: `None` when
+  the pool stayed empty. `send(p, pool, b, timeout)` and `try_send(p, pool, b)` answer
+  `Result[unit, BufferError]`: `Err(Full)` when the channel stayed full, `Err(Stale)` when the handle was
+  not its holder's. `receive(p, pool, timeout)` and `try_receive(p, pool)` answer `Option[Buffer]`. A
+  timeout of 0 never waits, so an interrupt handler may use the try forms; `FOREVER` waits for ever.
+  `give(p, b)` never waits: there is always room in the pool for its own buffer.
+- **A pool waits as a semaphore does**, through its `Waitable`: a give back with a taker waiting keeps
+  the buffer for it (`Given`), out of every other take's reach, and the taker takes it when it runs. A
+  free buffer is one the pool holds that is not kept for a woken taker.
+- **A channel is a `Queue[Buffer, N]`** and hands over as a queue does. Its capacity is its const
+  argument `N`, and it holds handles only, so a channel of eight buffers of 4 KiB is eight words.
+- A timeout races a give or a send as every wait does, and the outcome decides: a taker or receiver
+  woken `Given` has its buffer kept for it; one whose timeout ended the wait first leaves the buffer to
+  the pool or the channel.
+- **Placement**: a pool or a channel two cores use lives in `.shared`, and its lock's first use from a
+  second core checks it ("Placement, checked"). A pool's buffers are inside the pool.
+
 ## Time
 
 - **One time base**: `ticks()` is a single counter in `.shared`, advanced by core 0's tick. Every core
@@ -277,5 +355,9 @@ The single-core boots stay in the gate so that stays true.
   priority, so an `option_priorities` would save at most 120 bytes a core.
 - **A suspended task's wait.** skiff-old let it carry on (unlike FreeRTOS, which drops it); this design
   keeps that, since the outcome rule makes it safe.
+- **A pool's records and its buffers in one structure.** A pool's lock, generations and free stack are
+  control data that must not be cached where two cores use them; its buffers may be. With `.shared`
+  uncached they share it; a board that caches the buffers will need the pool's storage in a region of
+  its own. Settled with the H747I (milestone 9).
 - **The H7's time base** in a two-image build: core 0's tick counter in `.shared` works; a shared
   hardware timer may be better.

@@ -1,0 +1,54 @@
+module skiff.kernel
+
+// Channels: buffers handed from one owner to another, first in first out, without a copy (DESIGN
+// "Channels and the buffer pool"). A channel of `N` carries up to `N` buffer handles, never their bytes
+// and never a pointer, so a channel in `.shared` carries buffers between cores. Each call names the pool
+// the buffers belong to: a send checks the handle against it, issues the next generation (the sender's
+// handle no longer matches) and cleans the buffer before the handle goes in; a receive invalidates the
+// buffer once the handle is out. A channel waits and hands over as the queue under it does.
+struct Channel[const N: usize]
+    q: Queue[Buffer, N]
+
+impl[const N: usize] Channel[N]
+    // An empty channel called `name`.
+    const new(name: string) -> Channel[N] = Channel(Queue.new(name))
+
+    // Send buffer `b` of `pool`, waiting up to `timeout` ticks for room. Once it is sent the buffer is
+    // the receiver's, and `b` is refused everywhere. Refused with `Stale`, sending nothing, unless `b`
+    // is the buffer's current handle; with `Full` when no room came, and then the buffer is still the
+    // sender's under `b`. Only a task may wait; with a timeout of 0 nothing waits.
+    send[P: Port, const B: usize, const S: usize](*self, p: *P, pool: *Pool[B, S], b: Buffer, timeout: u32) -> Result[unit, BufferError]
+        val given = pool.reissue(p, b)?
+        p.clean(pool.storage(given))
+        if self.q.send(p, given, timeout) then return Ok(())
+        pool.restore(p, given, b)
+        Err(BufferError.Full)
+
+    // Send buffer `b` of `pool` if there is room, without waiting. An interrupt handler may call it.
+    try_send[P: Port, const B: usize, const S: usize](*self, p: *P, pool: *Pool[B, S], b: Buffer) -> Result[unit, BufferError] = self.send(p, pool, b, 0)
+
+    // Receive the oldest buffer, of `pool`, waiting up to `timeout` ticks for one. Answers None if none
+    // came; the buffer received is the caller's. Only a task may wait; with a timeout of 0 nothing waits.
+    receive[P: Port, const B: usize, const S: usize](*self, p: *P, pool: *Pool[B, S], timeout: u32) -> Option[Buffer]
+        val b = self.q.receive(p, timeout)?
+        Some(self.taken(p, pool, b))
+
+    // Receive the oldest buffer of `pool` if there is one, without waiting. An interrupt handler may call it.
+    try_receive[P: Port, const B: usize, const S: usize](*self, p: *P, pool: *Pool[B, S]) -> Option[Buffer] = self.receive(p, pool, 0)
+
+    // How many buffers it holds that a receive may take now.
+    waiting[P: Port](*self, p: *P) -> u32 = self.q.waiting(p)
+
+    // How many buffers it holds at most.
+    capacity(*self) -> u32 = u32(N)
+
+    // What a receiver does once handle `b` is out of the channel: the buffer is its own, so drop the
+    // core's stale lines over it. A handle of another pool than the one named is the caller's mistake.
+    private[kernel] taken[P: Port, const B: usize, const S: usize](*self, p: *P, pool: *Pool[B, S], b: Buffer) -> Buffer
+        if b.pool() != pool.id
+            p.write("skiff: channel ".bytes)
+            p.write(self.q.w.lock.name.bytes)
+            p.write(" received with another pool than its buffers'\n".bytes)
+            panic("skiff: a channel received with another pool than its buffers'")
+        p.invalidate(pool.storage(b))
+        b

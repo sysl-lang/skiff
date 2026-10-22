@@ -1,0 +1,126 @@
+module skiff.board.scenarios
+
+import skiff.kernel
+import skiff.kernel.{Buffer, Channel, FOREVER, Pool, Port}
+
+// Buffers handed over, never copied, each core with a pool and two channels of its own, between the
+// receiver (priority 4) and the sender (priority 3), from tick 130 of the core's epoch:
+//
+//   - The sender takes a buffer, fills it and sends it out; the receiver, waiting, checks every byte,
+//     adds 1 to each and sends it back; the sender, waiting, finds its bytes at the address it filled
+//     them, changed, and gives the buffer back to the pool. `ROUND_TRIPS` times, and then the pool holds
+//     every buffer again and the handle the sender last gave away is refused.
+//
+// On a machine of several cores the hammers go on, after their waits across cores (crossing.sysl), to
+// pass `STREAMED` buffers from core 0 to core 1 through a pool and a channel in `.shared`: core 0 takes
+// each, waiting while the pool is empty, fills it and sends it; core 1 receives each, waiting while the
+// channel is empty, checks that every byte is as core 0 wrote it and that it lies where core 0 filled
+// it, and gives it back to the pool. At the end core 0 takes every buffer of the pool, so every one has
+// come back.
+
+// How many times a buffer goes out and back on each core.
+private const ROUND_TRIPS: u32 = 8
+
+// How many buffers core 0 passes to core 1.
+private const STREAMED: u32 = 100
+
+// How many buffers the pool between the cores holds.
+private const STREAM_BUFFERS: usize = 4
+
+// Each core's own pool and channels, laid into the image as constant data. The cores' pools never
+// meet, so they share an id.
+private var blocks: [kernel.CORES]Pool[2, 64] = [Pool.new("blocks", 1); kernel.CORES]
+private var outward: [kernel.CORES]Channel[1] = [Channel.new("outward"); kernel.CORES]
+private var homeward: [kernel.CORES]Channel[1] = [Channel.new("homeward"); kernel.CORES]
+
+// The pool and the channel the cores pass buffers through: in `.shared`, so filled in by core 0.
+@section(".shared")
+private var stream: Pool[STREAM_BUFFERS, 256]
+@section(".shared")
+private var streamed: Channel[2]
+// Where core 0 filled each buffer it sent, by its number.
+@section(".shared")
+private var origins: [STREAMED]usize
+
+// Fill in the shared objects of the buffers. Core 0 calls it before any other core starts.
+fill_shared_buffers()
+    stream = Pool.new("stream", 2)
+    streamed = Channel.new("streamed")
+
+// The receiver's side of the round trips: check each buffer, change it, and send it back.
+private[scenarios] buffers_receiver[P: Port](p: *P, me: u32)
+    kernel.sleep_until(p, epochs[me] + 130)
+    for round in 0..<ROUND_TRIPS
+        val b = outward[me].receive(p, &blocks[me], FOREVER).unwrap()
+        val bytes = blocks[me].bytes(p, b).unwrap()
+        // A byte not as the sender wrote it comes back 0, which the sender never expects.
+        for i in 0..<bytes.len
+            bytes[i] = if bytes[i] == u8(round + u32(i)) then bytes[i] + 1 else 0
+        val _ = homeward[me].send(p, &blocks[me], b, FOREVER)
+
+// The sender's side: take, fill and send a buffer, then take it back, and say whether every one came
+// back unchanged in place.
+private[scenarios] buffers_sender[P: Port](p: *P, me: u32)
+    kernel.sleep_until(p, epochs[me] + 130)
+    var in_place = true
+    for round in 0..<ROUND_TRIPS
+        val b = blocks[me].take(p, FOREVER).unwrap()
+        val bytes = blocks[me].bytes(p, b).unwrap()
+        for i in 0..<bytes.len
+            bytes[i] = u8(round + u32(i))
+        val _ = outward[me].send(p, &blocks[me], b, FOREVER)
+        if blocks[me].bytes(p, b).is_ok() then in_place = false
+        val back = homeward[me].receive(p, &blocks[me], FOREVER).unwrap()
+        val seen = blocks[me].bytes(p, back).unwrap()
+        if usize(&seen[0]) != usize(&bytes[0]) then in_place = false
+        for i in 0..<seen.len
+            if seen[i] != u8(round + u32(i) + 1) then in_place = false
+        if blocks[me].give(p, back).is_err() || blocks[me].give(p, back).is_ok() then in_place = false
+    if in_place && blocks[me].available(p) == blocks[me].capacity()
+        say(p, "a buffer went to another task and back 8 times in place, and every buffer is back in the pool\n")
+    else
+        say(p, "a buffer handed to another task was copied, changed or lost\n")
+
+// The hammers' buffers between the cores, after their waits across cores: core 0 fills and sends, core
+// 1 receives, checks and gives back.
+private[scenarios] buffers_across[P: Port](p: *P, me: u32)
+    if me == 0
+        for n in 0..<STREAMED
+            val b = stream.take(p, FOREVER).unwrap()
+            val bytes = stream.bytes(p, b).unwrap()
+            for i in 0..<bytes.len
+                bytes[i] = streamed_byte(n, i)
+            origins[n] = usize(&bytes[0])
+            val _ = streamed.send(p, &stream, b, FOREVER)
+        var back: [STREAM_BUFFERS]Buffer
+        for i in 0..<back.len
+            back[i] = stream.take(p, FOREVER).unwrap()
+        for b in back
+            val _ = stream.give(p, b)
+        if stream.available(p) == stream.capacity()
+            say(p, "had every buffer it sent core 1 back in the pool\n")
+        else
+            say(p, "lost a buffer it sent core 1\n")
+    else if me == 1
+        var exact: u32 = 0
+        var in_place: u32 = 0
+        for n in 0..<STREAMED
+            val b = streamed.receive(p, &stream, FOREVER).unwrap()
+            val bytes = stream.bytes(p, b).unwrap()
+            var same = true
+            for i in 0..<bytes.len
+                if bytes[i] != streamed_byte(n, i) then same = false
+            if same then exact += 1
+            if usize(&bytes[0]) == origins[n] then in_place += 1
+            val _ = stream.give(p, b)
+        if exact == STREAMED && in_place == STREAMED
+            say(p, "received 100 buffers core 0 filled, in place and every byte as written\n")
+        else
+            say(p, "received buffers core 0 filled: ")
+            kernel.write_dec(p, exact)
+            p.write(" as written, ".bytes)
+            kernel.write_dec(p, in_place)
+            p.write(" in place, of 100\n".bytes)
+
+// Byte `i` of buffer number `n`.
+private streamed_byte(n: u32, i: usize) -> u8 = u8((n + u32(i)) & 0xff)

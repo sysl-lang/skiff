@@ -8,7 +8,7 @@ import skiff.arch.armv7m
 import skiff.board.scenarios
 import skiff.chip.mps2
 import skiff.kernel
-import skiff.kernel.{Doorbell, Port}
+import skiff.kernel.{Cache, Doorbell, Port}
 
 // The bounds of `.shared`, from the link script.
 extern __shared_start: u8
@@ -38,6 +38,11 @@ impl Port for Board
 impl Doorbell for Board
     ring(*self, core: u32) = panic("skiff: one core rings no doorbell")
     clear(*self) = panic("skiff: one core rings no doorbell")
+
+// QEMU models no data cache on either machine's core, so a buffer handed over needs nothing done.
+impl Cache for Board
+    clean(*self, bytes: []const u8) = ()
+    invalidate(*self, bytes: []u8) = ()
 
 // The status `boot` answered, which the last task stops the machine with.
 private var status: i32 = 0

@@ -10,4 +10,5 @@ options {
   cores   { type = usize, default = 1, range = [1, 8], doc = "how many cores run the kernel, each with a Core of its own" }
   tick_hz { type = u32, default = 100, range = [1, 10000], doc = "how many times a second every core ticks" }
   tasks   { type = usize, default = 16, range = [2, 4096], doc = "how many tasks each core's table holds, its idle task among them; a handle's slot has 12 bits" }
+  cache_line { type = usize, default = 32, range = [4, 256], doc = "the data cache's line in bytes, a power of two: every pool buffer starts on one and fills whole lines" }
 }

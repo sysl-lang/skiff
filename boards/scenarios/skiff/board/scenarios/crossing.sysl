@@ -11,7 +11,8 @@ import skiff.kernel.{FOREVER, Flags, Mutex, Port, Queue, Semaphore}
 //     waits on each kind of object, a semaphore, a mutex core 0 holds, a queue, event flags and its own
 //     notification, and core 0 gives it each 2 ticks after core 1 said it was about to wait, so each
 //     wait must have blocked for a tick at least and been ended by core 0. Then the two pass a unit back
-//     and forth `ROUNDS_ACROSS` times through two semaphores, each waiting for the other's give.
+//     and forth `ROUNDS_ACROSS` times through two semaphores, each waiting for the other's give, and
+//     core 0 streams buffers to core 1 (buffers.sysl).
 //   - Then priority inversion across cores. The owner (priority 1, core 1) locks a mutex and has
 //     `OWNER_WORK` ticks of work to do with it. The worker (2, core 1) starts `WORKER_WORK` ticks of work
 //     as soon as it sees the mutex held, and the waiter (3, core 0) wants the mutex as soon as it sees it
@@ -73,6 +74,7 @@ waits_across[P: Port](p: *P, me: u32)
         give_across(p)
     else if me == 1
         take_across(p)
+    buffers_across(p, me)
     val _ = crossed.add(1)
 
 // Core 0's side: lock `turns`, then end each of core 1's waits 2 ticks after it says it is about to wait.

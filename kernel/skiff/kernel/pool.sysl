@@ -1,0 +1,197 @@
+module skiff.kernel
+
+import sysl.sync.Lock
+
+// Buffer pools: bulk data handed between owners, never copied (DESIGN "Channels and the buffer pool").
+// A pool is `N` buffers of `SIZE` bytes in its own storage; a holder names a buffer by a `Buffer` handle,
+// and the bytes are reached through the pool, which checks the handle. Holding the current handle is
+// owning the buffer: every hand-over (a take, a give back, a send through a channel) issues a new
+// generation, so the handle given away no longer matches and every later use of it is refused.
+//
+// Like a semaphore, a pool is a plain struct the application declares, filled in at run time if it is
+// in `.shared` and laid into the image as constant data otherwise. A take with the pool empty waits as
+// a semaphore's does: a give back with a taker waiting keeps the buffer for it.
+
+// The fields of a buffer's handle: the index has 12 bits and the generation 12.
+private const INDEXES: usize = 4096
+private const BUFFER_GENERATIONS: u32 = 0xfff
+
+// A buffer's handle: its pool's id (8 bits), its index in the pool (12) and the generation it was issued
+// in (12), packed in a `u32`. A generation is never 0, so the handle 0 names no buffer.
+struct Buffer derives Eq
+    bits: u32
+
+impl Buffer
+    // The id of the pool the buffer belongs to.
+    pool(self) -> u8 = u8(self.bits >> 24)
+
+    // The buffer's index in its pool.
+    index(self) -> usize = usize((self.bits >> 12) & 0xfff)
+
+    // The generation the handle was issued in.
+    generation(self) -> u16 = u16(self.bits & BUFFER_GENERATIONS)
+
+// The handle of no buffer: what an empty channel slot holds.
+val NO_BUFFER: Buffer = Buffer(0)
+
+// The handle for buffer `index` of pool `pool` in generation `generation`.
+private[kernel] buffer_handle(pool: u8, index: usize, generation: u16) -> Buffer = Buffer((u32(pool) << 24) | (u32(index) << 12) | u32(generation))
+
+// Why an operation on a buffer was refused.
+enum BufferError
+    Stale           // the handle is not the buffer's current one: another pool's, given away, or given back
+    Full            // the channel had no room within the timeout; the buffer is still the sender's
+
+// One buffer's bytes, starting on a cache line and filling whole lines.
+@align(option_cache_line)
+struct Block[const SIZE: usize]
+    bytes: [SIZE]u8
+
+// A pool of `N` buffers of `SIZE` bytes.
+//   - `generations[i]` is the generation of buffer `i`'s current handle: 0 until it is first taken.
+//   - `held[i]` says whether buffer `i` is out of the pool.
+//   - `returned` is a stack of the buffers given back, the most recent at `stacked - 1`; the buffers
+//     from `fresh` up have never left the pool. So a zeroed pool is full, and taking costs no search.
+//   - `kept` counts the free buffers kept for takers already woken.
+struct Pool[const N: usize, const SIZE: usize]
+    w: Waitable
+    id: u8
+    blocks: [N]Block[SIZE]
+    generations: [N]u16
+    held: [N]bool
+    returned: [N]u16
+    stacked: u32
+    fresh: u32
+    kept: u32
+
+impl[const N: usize, const SIZE: usize] Pool[N, SIZE]
+    // A full pool called `name`, whose handles carry `id`, 1 to 255. Pools whose handles can meet need
+    // ids of their own, and then each refuses the other's handles.
+    const new(name: string, id: u8) -> Pool[N, SIZE]
+        if N == 0 || N > INDEXES then panic("a pool holds 1 to 4096 buffers")
+        var blocks: [N]Block[SIZE]
+        Pool(Waitable.new(name), id, blocks, [0; N], [false; N], [0; N], 0, 0, 0)
+
+    // Take a buffer, waiting up to `timeout` ticks for one to be given back. Answers None if none came.
+    // Its contents are whatever its last owner left. Only a task may wait; with a timeout of 0 nothing
+    // waits, and an interrupt handler may call it.
+    take[P: Port](*self, p: *P, timeout: u32) -> Option[Buffer]
+        var l = self.w.lock.on(p)
+        l.acquire()
+        if self.free() > self.kept
+            val b = self.hand_out()
+            l.release()
+            return Some(self.taken(p, b))
+        if timeout == 0
+            l.release()
+            return None
+        val c = running_core(p)
+        enqueue_running(c, &self.w, timeout, 0, 0)
+        p.request_switch()
+        l.release()
+        if wait_outcome(c) != Outcome.Given then return None
+        Some(self.take_kept(p))
+
+    // Take a buffer if one is free, without waiting.
+    try_take[P: Port](*self, p: *P) -> Option[Buffer] = self.take(p, 0)
+
+    // Give buffer `b` back: to the best waiting taker if there is one, else to the pool. Refused, giving
+    // nothing, unless `b` is the buffer's current handle. Never waits, so an interrupt handler may call it.
+    give[P: Port](*self, p: *P, b: Buffer) -> Result[unit, BufferError]
+        val gone = self.reissue(p, b)?
+        p.clean(self.storage(gone))
+        var l = self.w.lock.on(p)
+        l.acquire()
+        self.held[gone.index()] = false
+        self.returned[usize(self.stacked)] = u16(gone.index())
+        self.stacked += 1
+        if wake_first(p, &self.w, Outcome.Given).is_some() then self.kept += 1
+        l.release()
+        Ok(())
+
+    // The bytes of buffer `b`, refused unless `b` is the buffer's current handle.
+    bytes[P: Port](*self, p: *P, b: Buffer) -> Result[[]u8, BufferError]
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val now = self.current(b)
+        l.release()
+        if now then Ok(self.storage(b)) else Err(BufferError.Stale)
+
+    // How many buffers a take may have now.
+    available[P: Port](*self, p: *P) -> u32
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val n = self.free() - self.kept
+        l.release()
+        n
+
+    // How many buffers it holds in all.
+    capacity(*self) -> u32 = u32(N)
+
+    // How many bytes each buffer holds.
+    size(*self) -> usize = SIZE
+
+    // The id its handles carry.
+    pool_id(*self) -> u8 = self.id
+
+    // What a woken taker does when it runs: take the buffer kept for it.
+    private[kernel] take_kept[P: Port](*self, p: *P) -> Buffer
+        var l = self.w.lock.on(p)
+        l.acquire()
+        self.kept -= 1
+        val b = self.hand_out()
+        l.release()
+        self.taken(p, b)
+
+    // Take buffer `b` from its holder: under the lock, check that `b` is its current handle and issue
+    // the next generation, which nobody holds yet. Answers the new handle.
+    private[kernel] reissue[P: Port](*self, p: *P, b: Buffer) -> Result[Buffer, BufferError]
+        var l = self.w.lock.on(p)
+        l.acquire()
+        if !self.current(b)
+            l.release()
+            return Err(BufferError.Stale)
+        val g = next_buffer_generation(b.generation())
+        self.generations[b.index()] = g
+        l.release()
+        Ok(buffer_handle(self.id, b.index(), g))
+
+    // Give buffer `issued` back to the holder of `was`, which `reissue` took it from and nobody has
+    // seen `issued` since: its generation is `was`'s again.
+    private[kernel] restore[P: Port](*self, p: *P, issued: Buffer, was: Buffer)
+        var l = self.w.lock.on(p)
+        l.acquire()
+        if self.current(issued) then self.generations[was.index()] = was.generation()
+        l.release()
+
+    // The bytes of the buffer `b` names, which the caller owns or is handing over; `b` is this pool's.
+    private[kernel] storage(*self, b: Buffer) -> []u8 = self.blocks[b.index()].bytes[..]
+
+    // What a taker does once a buffer is its own: drop the core's stale lines over it.
+    private taken[P: Port](*self, p: *P, b: Buffer) -> Buffer
+        p.invalidate(self.storage(b))
+        b
+
+    // Under the lock: whether `b` is the current handle of a buffer out of this pool.
+    private current(*self, b: Buffer) -> bool
+        val i = b.index()
+        b.pool() == self.id && i < N && self.held[i] && self.generations[i] == b.generation()
+
+    // Under the lock: how many buffers the pool holds, those kept for woken takers among them.
+    private free(*self) -> u32 = self.stacked + u32(N) - self.fresh
+
+    // Under the lock: take a free buffer out, the most recently given back first, and issue its handle.
+    private hand_out(*self) -> Buffer
+        val i = if self.stacked > 0
+            self.stacked -= 1
+            usize(self.returned[usize(self.stacked)])
+        else
+            self.fresh += 1
+            usize(self.fresh - 1)
+        self.held[i] = true
+        val g = next_buffer_generation(self.generations[i])
+        self.generations[i] = g
+        buffer_handle(self.id, i, g)
+
+// The generation after `g`, wrapping past 4095 to 1: never 0.
+private next_buffer_generation(g: u16) -> u16 = if u32(g) == BUFFER_GENERATIONS then 1 else g + 1

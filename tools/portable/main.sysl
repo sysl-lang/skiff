@@ -4,7 +4,7 @@
 
 import sysl.sync.{Atomic, Lock}
 import skiff.kernel
-import skiff.kernel.{Doorbell, Port, Queue}
+import skiff.kernel.{Cache, Channel, Doorbell, Pool, Port, Queue}
 
 struct Nothing
 end Nothing
@@ -30,6 +30,10 @@ impl Doorbell for Nothing
     ring(*self, core: u32) = ()
     clear(*self) = ()
 
+impl Cache for Nothing
+    clean(*self, bytes: []const u8) = ()
+    invalidate(*self, bytes: []u8) = ()
+
 private var stack: [64]u32 = [0; 64]
 // Objects one core keeps are constant data: an export reaches them, and a freestanding artifact has no
 // entry to fill them in, so this build fails if `new` stops folding.
@@ -38,6 +42,8 @@ private var guard = kernel.Mutex.new("guard")
 private var word = kernel.KernelLock.new("word")
 private var mail: Queue[u32, 2] = Queue.new("mail")
 private var events = kernel.Flags.new("events", 0)
+private var blocks: Pool[2, 48] = Pool.new("blocks", 1)
+private var carried: Channel[2] = Channel.new("carried")
 
 // A message wider than a word, so a queue copies a struct in and out.
 struct Reading
@@ -65,7 +71,18 @@ private messages(m: *Nothing) -> bool
     if events.wait(m, 0b10, true, true, 5) != Some(0b10) then return false
     val me = kernel.current(m)
     if kernel.notify(m, me, 1, kernel.Action.SetBits).is_err() || kernel.notify_give(m, me).is_err() then return false
-    kernel.notify_wait(m, 0, 0, 3) == Some(2) && kernel.notify_take(m, true, 3) == 2
+    kernel.notify_wait(m, 0, 0, 3) == Some(2) && kernel.notify_take(m, true, 3) == 2 && buffers(m)
+
+// The pool and the channel, over the port.
+private buffers(m: *Nothing) -> bool
+    val b = blocks.take(m, kernel.FOREVER)
+    if b.is_none() || blocks.try_take(m).is_none() || blocks.available(m) != 0 then return false
+    if blocks.bytes(m, b.unwrap()).is_err() || blocks.capacity() != 2 || blocks.size() != 48 then return false
+    if carried.send(m, &blocks, b.unwrap(), 1).is_err() || carried.try_send(m, &blocks, b.unwrap()).is_ok() then return false
+    if carried.waiting(m) != 1 || carried.capacity() != 2 then return false
+    val r = carried.receive(m, &blocks, 1)
+    if r.is_none() || carried.try_receive(m, &blocks).is_some() then return false
+    blocks.give(m, r.unwrap()).is_ok()
 
 private body() -> never
     loop

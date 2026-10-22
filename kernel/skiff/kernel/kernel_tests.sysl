@@ -14,6 +14,32 @@ private[kernel] struct Recorder
     hz: u32
     switches: u32       // how many switches the kernel has asked for
     masked: u32         // how deep the kernel's masking is nested
+    cleans: u32         // how many cleans the kernel asked for
+    invalidates: u32    // how many invalidates
+    cleaned: []const u8         // the bytes of the last clean
+    invalidated: []const u8     // the bytes of the last invalidate
+    pool: *Pool[2, 32]          // a pool to look at on each clean and invalidate (null: none)
+    channel: *Channel[1]        // a channel to look at likewise (null: none)
+    free_then: u32      // what `pool` had available at the last clean or invalidate
+    waiting_then: u32   // what `channel` held at the last clean or invalidate
+
+// A data cache that records what it is asked and, at that step, how full the watched pool and channel
+// are: what tells whether a buffer was cleaned before it could be seen and invalidated after it was taken.
+impl Cache for Recorder
+    clean(*self, bytes: []const u8)
+        self.cleans += 1
+        self.cleaned = bytes
+        self.look()
+
+    invalidate(*self, bytes: []u8)
+        self.invalidates += 1
+        self.invalidated = bytes
+        self.look()
+
+impl Recorder
+    private look(*self)
+        if self.pool != null then self.free_then = self.pool.available(self)
+        if self.channel != null then self.waiting_then = self.channel.waiting(self)
 
 // The recorder's tick is taken by hand: `idle` takes one, as a real core's sleep ends at its tick. A new
 // task's context is only its stack's address, which is what the kernel keeps as its stack pointer.
@@ -57,7 +83,7 @@ impl Doorbell for Recorder
     ring(*self, core: u32) = panic("one core never rings")
     clear(*self) = panic("one core never rings")
 
-private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0)
+private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, [], [], null, null, 0, 0)
 
 // Whether `r` recorded exactly `want`.
 private recorded(r: *Recorder, want: string) -> bool
