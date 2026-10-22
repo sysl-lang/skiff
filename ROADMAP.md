@@ -130,5 +130,6 @@ defect that must make it fail.
 | 9 | The H747I-DISCO (needs the board): clocks and power, HSEM, one image on both cores with shared state uncached on the M7, then the two-image build with the cache trait | milestone 4's scenarios on the board in both builds, caches on |
 | 10 | Supervision and power: a watchdog per core, faults forwarded, one console, tickless idle, coordinated stop | a hung core is noticed; both cores enter Stop and wake |
 
-skiff needs sysl 0.3.8 or later: milestone 1 on uses `options` and an `if` as a constant, and 8 uses the
+skiff needs sysl 0.3.9 or later: milestone 1 on uses `options` and an `if` as a constant, 3 a `const new`
+as data and an enum's zero, and 8 uses the
 explicit type-argument fix and a link script per feature.

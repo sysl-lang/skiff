@@ -68,7 +68,8 @@ create_tasks[P: Port](p: *P, core: u32, e: *Entries)
 #endif
     high[core] = created(kernel.create(p, core, stacks[core][4], e.h, 3))
     val _ = created(kernel.create(p, core, stacks[core][5], e.r, 4))
-    fill_objects(core)
+    if core == 0
+        fill_shared_objects()
     val _ = created(kernel.create(p, core, stacks[core][6], e.low, 1))
     val _ = created(kernel.create(p, core, stacks[core][7], e.middle, 2))
     val _ = created(kernel.create(p, core, stacks[core][8], e.high, 3))

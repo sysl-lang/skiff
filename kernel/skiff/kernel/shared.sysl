@@ -44,11 +44,9 @@ private[kernel] const CORE_OFFLINE: u32 = 0
 private[kernel] const CORE_READY: u32 = 1
 private[kernel] const CORE_STOPPED: u32 = 2
 
-// The structure's value is all zeros, which is what start-up writes over the section (a board's link
-// script leaves `.shared` out of the image), so the value written here and the one a core finds agree.
-private val NO_WAITER: Waiter = Waiter(Task(0), 0, Outcome.Idle, 0, 0)
-private val EMPTY_RING: Ring = Ring(Atomic(0), Atomic(0), [Message(0, 0); INBOX_SLOTS])
-
+// The structure starts as zeros, which is what start-up writes over the section (a board's link script
+// leaves `.shared` out of the image): no time, every core offline, empty rings and `Idle` wait records.
+//
 // A section's name is the object format's: Mach-O, where the host tests run on a Mac, spells it with a
 // segment.
 #if macos
@@ -56,7 +54,7 @@ private val EMPTY_RING: Ring = Ring(Atomic(0), Atomic(0), [Message(0, 0); INBOX_
 #else
 @section(".shared")
 #endif
-private var shared: Shared = Shared(Atomic(0), [Atomic(0); option_cores], [[EMPTY_RING; INBOX_CORES]; INBOX_CORES], [[NO_WAITER; option_tasks]; option_cores], 0, 0)
+private var shared: Shared
 
 // Make core `n`'s state `state`, for the other cores to read.
 private[kernel] announce(n: u32, state: u32)

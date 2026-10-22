@@ -212,8 +212,9 @@ wake can find it.
   `kernel.shared_bounds` (core 0, before it releases the others) and panics naming the object
   (`Semaphore.new(name, …)`, `Mutex.new(name)`). With one core there is no check.
 - **An object in `.shared` is filled in at run time**, before another core starts: start-up zeroes the
-  section rather than loading it. The kernel's own `.shared` structure is declared with an initializer
-  that is all zeros, to agree with that.
+  section rather than loading it. The kernel's own `.shared` structure takes its zero value, which is
+  what start-up writes (an `Outcome` zeroes to `Idle`). An object only one core uses is constant data:
+  `Semaphore.new` and `Mutex.new` are `const`.
 - On a core with a data cache (the M7), the board maps `.shared` uncached.
 - A `Queue[T, N]`'s items cross cores by value. A `T` that holds a pointer into one core's private memory
   is the application's mistake, and in a two-image build an impossible one to make work.

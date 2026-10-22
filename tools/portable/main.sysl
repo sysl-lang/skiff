@@ -27,16 +27,14 @@ impl Port for Nothing
     spin_unlock(*self, word: *Atomic[u32]) = ()
 
 private var stack: [64]u32 = [0; 64]
-private var units: kernel.Semaphore
-private var guard: kernel.Mutex
-private var word: kernel.KernelLock
+// Objects one core keeps are constant data: an export reaches them, and a freestanding artifact has no
+// entry to fill them in, so this build fails if `new` stops folding.
+private var units = kernel.Semaphore.new("units", 0, 2)
+private var guard = kernel.Mutex.new("guard")
+private var word = kernel.KernelLock.new("word")
 
-// The waits and the locks, over the port. The objects are filled in at run time, as one in `.shared`
-// must be.
+// The waits and the locks, over the port.
 private waits(m: *Nothing) -> bool
-    units = kernel.Semaphore.new("units", 0, 2)
-    guard = kernel.Mutex.new("guard")
-    word = kernel.KernelLock.new("word")
     var held = word.on(m)
     held.acquire()
     held.release()

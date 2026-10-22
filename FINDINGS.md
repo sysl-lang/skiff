@@ -80,7 +80,7 @@ is the behaviour `S.new` should have. skiff does not depend on it: a kernel obje
 `Mutex.new`) is filled in at run time, which an object in `.shared` needs anyway since start-up zeroes the
 section. The workaround would have been free functions (`semaphore(name, count, max)`) in place of `new`.
 
-Status: open (found on 0.3.7); sent to `sysl` as a bug.
+Status: fixed in sysl 0.3.9. The scenarios' per-core objects are now constant data.
 
 ## FINDINGS 7 — a simple enum with a variant at 0 has no zero value
 
@@ -103,4 +103,5 @@ so its declaration now carries an initializer that is all zeros, spelled out
 zero the section already holds. Whether an enum with a variant at 0 should zero to it is a design
 question for sysl.
 
-Status: open (found on 0.3.7); sent to `sysl` as a design question.
+Status: fixed in sysl 0.3.9: an enum with an explicit field-less `= 0` variant zeroes to it. `Shared` takes
+its zero value.

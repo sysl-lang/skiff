@@ -26,9 +26,10 @@ private const ROUNDS: u32 = 100_000
 // How many units core 0 passes to core 1.
 private const PASSED: u32 = 1000
 
-private var mutexes: [kernel.CORES]Mutex
-private var never_given: [kernel.CORES]Semaphore
-private var from_irq: [kernel.CORES]Semaphore
+// Each core's own objects, laid into the image as constant data.
+private var mutexes = [Mutex.new("mutex"); kernel.CORES]
+private var never_given = [Semaphore.new("never given", 0, 1); kernel.CORES]
+private var from_irq = [Semaphore.new("from an interrupt", 0, 1); kernel.CORES]
 private var middle_done: [kernel.CORES]Atomic[u32]
 private var woke: [kernel.CORES]Atomic[u32]
 private var waits_done: [kernel.CORES]Atomic[u32]
@@ -42,15 +43,10 @@ private var hammered: Semaphore
 @section(".shared")
 private var passed: Semaphore
 
-// Fill in core `core`'s objects, and on core 0 the shared ones. Core 0 calls it for every core before
-// any other core starts.
-fill_objects(core: u32)
-    mutexes[core] = Mutex.new("mutex")
-    never_given[core] = Semaphore.new("never given", 0, 1)
-    from_irq[core] = Semaphore.new("from an interrupt", 0, 1)
-    if core == 0
-        hammered = Semaphore.new("hammered", 0, 0xffff_ffff)
-        passed = Semaphore.new("passed", 0, 4)
+// Fill in the shared objects. Core 0 calls it before any other core starts.
+fill_shared_objects()
+    hammered = Semaphore.new("hammered", 0, 0xffff_ffff)
+    passed = Semaphore.new("passed", 0, 4)
 
 // Work for `ticks` ticks of the time base without blocking or yielding.
 private busy(ticks: u32)
