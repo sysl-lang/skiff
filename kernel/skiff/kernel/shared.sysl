@@ -46,13 +46,13 @@ private[kernel] const CORE_OFFLINE: u32 = 0
 private[kernel] const CORE_READY: u32 = 1
 private[kernel] const CORE_STOPPED: u32 = 2
 
-// A section's name is the object format's: Mach-O, where the host tests run on a Mac, spells it with a
-// segment.
-// Its value is all zeros, which is what start-up writes over the section (a board's link script leaves
-// `.shared` out of the image), so the value written here and the one a core finds agree.
+// The structure's value is all zeros, which is what start-up writes over the section (a board's link
+// script leaves `.shared` out of the image), so the value written here and the one a core finds agree.
 private val NO_WAITER: Waiter = Waiter(Task(0), 0, Outcome.Idle, 0, 0)
 private val EMPTY_RING: Ring = Ring(Atomic(0), Atomic(0), [Message(0, 0); INBOX_SLOTS])
 
+// A section's name is the object format's: Mach-O, where the host tests run on a Mac, spells it with a
+// segment.
 #if macos
 @section("__DATA,__shared")
 #else
@@ -71,10 +71,10 @@ private[kernel] core_state(n: u32) -> u32 = shared.states[n].load(Ordering.Acqui
 private[kernel] time_base() -> *Atomic[u32] = &shared.time
 
 // Whether everything another core can reach lies in [start, end): the bounds the link script gives
-// `.shared`, which the board reads from `__shared_start` and `__shared_end`. The inboxes are named on
-// their own, since they are what every other core writes.
+// `.shared`, which the board reads from `__shared_start` and `__shared_end`. The inboxes and the wait
+// records are named on their own, since they are what the other cores write.
 shared_within(start: usize, end: usize) -> bool
-    within(usize(&shared), sizeof(Shared), start, end) && within(usize(&shared.inboxes), sizeof([INBOX_CORES][INBOX_CORES]Ring), start, end)
+    within(usize(&shared), sizeof(Shared), start, end) && within(usize(&shared.inboxes), sizeof([INBOX_CORES][INBOX_CORES]Ring), start, end) && within(usize(&shared.waiters), sizeof([option_cores][option_tasks]Waiter), start, end)
 
 // Tell the kernel `.shared`'s bounds, [start, end), from the link script's `__shared_start` and
 // `__shared_end`. Core 0 calls it before it releases the other cores. Until it does, no object counts as
