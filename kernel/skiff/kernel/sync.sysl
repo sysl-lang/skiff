@@ -69,8 +69,10 @@ impl Semaphore
 // one level: an owner itself waiting on another object moves up that object's queue, but its owner is
 // not raised in turn.
 //
-// A waiter whose owner is another core's task would raise it by a message to that core, which the
-// kernel does not send: such a wait is refused (a panic), and so is a wake across cores.
+// An owner on another core than its waiter is raised by a `Boost` message to its core's inbox, which
+// that core applies only while the task still holds the mutex; a waiter on another core than the
+// unlocking owner is handed the mutex by a `Hand` message, which counts it held there and makes the new
+// owner ready (inbox.sysl).
 struct Mutex
     w: Waitable
     owner: Task
@@ -99,13 +101,15 @@ impl Mutex
             p.restore(outer)
             return false
         val owner = self.owner
-        if another_core(owner.core(), c.id) then panic("skiff: waiting on a mutex another core's task holds needs a boost the kernel does not send")
         val mine = c.sched.tasks[i].priority
         enqueue_running(c, &self.w, timeout, 0, 0)
         p.request_switch()
         l.release()
-        // The core stays masked until the owner has inherited, so nothing runs in between.
-        if c.sched.check(owner).is_ok() && mine > c.sched.tasks[owner.slot()].priority
+        // The core stays masked until the owner has inherited, or been asked to, so nothing runs in
+        // between. An owner of another core is asked whatever its priority, which only its core knows.
+        if another_core(owner.core(), c.id)
+            post(p, MessageKind.Boost, owner, mine, self)
+        else if c.sched.check(owner).is_ok() && mine > c.sched.tasks[owner.slot()].priority
             reprioritize(p, c, owner.slot(), mine)
         p.restore(outer)
         wait_outcome(c) == Outcome.Given
@@ -122,14 +126,17 @@ impl Mutex
         c.sched.tasks[i].held -= 1
         var heir = NONE
         var inherited = IDLE_PRIORITY
-        wake_first(p, &self.w, Outcome.Given) match
-            Some(t) ->
-                self.owner = t
+        val at = self.w.queue.first()
+        if at == NONE
+            self.owner = NO_TASK
+        else
+            // The best of those left waiting is the one behind the heir.
+            if self.w.queue.count > 1 then inherited = waiter(waiter(at).next).priority
+            val t = end_wait(p, &self.w, at, Outcome.Given, MessageKind.Hand, inherited)
+            self.owner = t
+            if !another_core(t.core(), c.id)
                 heir = u16(t.slot())
                 c.sched.tasks[t.slot()].held += 1
-                val next = self.w.queue.first()
-                if next != NONE then inherited = waiter(next).priority
-            None -> self.owner = NO_TASK
         l.release()
         if heir != NONE && inherited > c.sched.tasks[usize(heir)].priority
             reprioritize(p, c, usize(heir), inherited)
@@ -140,3 +147,11 @@ impl Mutex
 
     // The task that holds it, or `NO_TASK`.
     holder(*self) -> Task = self.owner
+
+    // Whether task `t` holds it, read under its lock: what a `Boost` checks before it raises `t`.
+    private[kernel] owned_by[P: Port](*self, p: *P, t: Task) -> bool
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val owns = self.owner == t
+        l.release()
+        owns

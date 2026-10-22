@@ -73,7 +73,12 @@ $(messages_expected 0)"
 # it runs. Both cores then hammer one semaphore in `.shared` at once, and core 0 finds the count exact;
 # core 0 gives units one at a time that core 1 takes without waiting, then sends it numbered messages
 # and notifications that it takes without waiting, and the two pass an event flag back and forth, each
-# polling for the other's. Core 1 then faults on purpose: it
+# polling for the other's. Then core 1 waits, blocking, on a semaphore, a mutex, a queue, event flags and
+# its notification, each given by core 0 through core 1's inbox and doorbell; the two pass a unit back and
+# forth through two semaphores, each waiting for the other; and a task on core 0 waits on a mutex a task
+# of core 1 holds while a task of middling priority works on core 1, and must have it within a bound
+# through the boost core 1's inbox carries, which the owner gives up with the mutex. Core 1 then faults
+# on purpose: it
 # reports the fault on its own console and stops. Core 0 sees it stopped, takes more ticks, finds that
 # the time base counted its own ticks and none of core 1's, and stops the machine with status 0.
 an521_core0_expected="skiff: hello from core 0
@@ -87,6 +92,8 @@ $(waits_expected 0)
 $(messages_expected 0)
 skiff: core 0 two cores' gives and takes left the shared count exact
 skiff: core 0 two cores passed event flags back and forth 1000 times
+skiff: core 0 two cores woke each other through semaphores 1000 times
+skiff: core 0 the high task had the mutex a task on core 1 held within 10 ticks
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
 skiff: core 0 time base agrees"
@@ -100,6 +107,12 @@ $(messages_expected 1)
 skiff: core 1 took every unit core 0 gave
 skiff: core 1 received every message core 0 sent, in order
 skiff: core 1 took every notification core 0 gave
+skiff: core 1 took a semaphore core 0 gave while it waited
+skiff: core 1 locked a mutex core 0 unlocked while it waited
+skiff: core 1 received a message core 0 sent while it waited
+skiff: core 1 woke on an event flag core 0 set while it waited
+skiff: core 1 woke on a notification core 0 sent while it waited
+skiff: core 1 the low task gave up the priority core 0's task lent it with the mutex
 skiff: core 1 fault BusFault"
 
 failed=0

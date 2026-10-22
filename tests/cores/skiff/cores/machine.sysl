@@ -1,0 +1,82 @@
+module skiff.cores
+
+import sysl.sync.{Atomic, Ordering}
+import skiff.kernel
+import skiff.kernel.{Doorbell, Port, Task}
+
+// A machine of `kernel.CORES` cores on the host, played one core at a time: `me` says which core is
+// running, and a test changes it to act as another. Its doorbell rings nothing; it counts the rings each
+// core was sent, and a test answers one by calling `kernel.answer_doorbell` as that core. No task ever
+// runs: a call that blocks returns at once with its task blocked and a switch asked for, and the test
+// then makes the scheduler choose (`switch_now`), as the switch would.
+struct Machine
+    me: u32
+    rung: [kernel.CORES]u32        // how many times each core's doorbell was rung
+    switches: [kernel.CORES]u32    // how many switches each core asked for
+    masked: u32                     // how deep the running core's masking is nested
+
+// A tick is taken by hand. A new task's context is only its stack's address. The chip's lock is a word
+// that is never contended, since one core acts at a time: finding it taken is a lock left held.
+impl Port for Machine
+    write(*self, bytes: []const u8) = ()
+    cores(*self) -> u32 = u32(kernel.CORES)
+    core_id(*self) -> u32 = self.me
+    start_ticks(*self, hz: u32) = ()
+    idle(*self) = kernel.tick(self)
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize = usize(&stack[0])
+
+    request_switch(*self)
+        self.switches[self.me] += 1
+
+    start_first(*self, sp: usize) -> never = panic("the host runs no task")
+
+    mask(*self) -> u32
+        self.masked += 1
+        self.masked - 1
+
+    restore(*self, state: u32)
+        self.masked = state
+
+    spin_lock(*self, word: *Atomic[u32])
+        if word.swap(1, Ordering.Acquire) != 0 then panic("a kernel lock was left held")
+
+    spin_try_lock(*self, word: *Atomic[u32]) -> bool = word.swap(1, Ordering.Acquire) == 0
+    spin_unlock(*self, word: *Atomic[u32]) = word.store(0, Ordering.Release)
+
+impl Doorbell for Machine
+    ring(*self, core: u32)
+        self.rung[core] += 1
+
+// A machine with every core offline, core 0 acting. The objects a test declares are its own locals, and
+// every one of them may be used by two cores, so the whole address space counts as `.shared`.
+machine() -> Machine
+    kernel.shared_bounds(0, 0xffff_ffff_ffff_ffff)
+    Machine(0, [0; kernel.CORES], [0; kernel.CORES], 0)
+
+// Act as core `core` from now on.
+on(m: *Machine, core: u32)
+    m.me = core
+
+// Start every core and let each that has tasks choose its first. Tasks are created before, while the
+// cores are offline, which is when one core may create them on another.
+begin(m: *Machine)
+    for core in 0u32..<u32(kernel.CORES)
+        on(m, core)
+        kernel.start(m)
+        if kernel.here(m).sched.ready != 0
+            val _ = kernel.here(m).sched.first()
+    on(m, 0)
+
+// The switch the running core asked for: its scheduler's choice runs.
+switch_now(m: *Machine)
+    val _ = kernel.switch_context(m, 0)
+
+// A task's body: no task runs on the host.
+private body() -> never
+    loop
+        ()
+
+private var stacks: [12][64]u32
+
+// A task at `priority` on core `core`, on stack `n`.
+task_on(m: *Machine, core: u32, n: usize, priority: u8) -> Task = kernel.create(m, core, stacks[n], &body, priority).unwrap()

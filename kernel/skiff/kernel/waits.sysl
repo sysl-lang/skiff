@@ -14,7 +14,8 @@ import sysl.sync.Lock
 // the lock and switch. The task answers from the record's `outcome` when it runs again.
 //
 // A wake, under the object's lock: take the best waiter, set its outcome (`Given` when the object hands
-// itself over, as a semaphore or a mutex does), and make the task ready. Only a waiter still `Waiting`
+// itself over, as a semaphore or a mutex does), and make the task ready: on the waker's own core at once,
+// on another by a message to that core's inbox (inbox.sysl). Only a waiter still `Waiting`
 // is ever taken, and a timeout also ends a wait only under the lock and only if it is still `Waiting`.
 // So exactly one transition leaves `Waiting`: a timeout after a wake does nothing, and a wake after a
 // timeout finds the waiter gone.
@@ -121,14 +122,19 @@ private[kernel] wake_first[P: Port](p: *P, w: *Waitable, outcome: Outcome) -> Op
 
 // Under `w`'s lock, end the wait of waiter `at`, which is in `w`'s queue, with `outcome`, and make its
 // task ready, asking for a switch if it outranks the running one. Answers the task.
-private[kernel] wake_at[P: Port](p: *P, w: *Waitable, at: u16, outcome: Outcome) -> Task
+private[kernel] wake_at[P: Port](p: *P, w: *Waitable, at: u16, outcome: Outcome) -> Task = end_wait(p, w, at, outcome, MessageKind.Wake, IDLE_PRIORITY)
+
+// `wake_at`, where a task of another core is told by a message of `kind` at `priority` to its core's
+// inbox, which makes it ready there: the waker's core never touches another core's scheduler.
+private[kernel] end_wait[P: Port](p: *P, w: *Waitable, at: u16, outcome: Outcome, kind: MessageKind, priority: u8) -> Task
     val r = waiter(at)
     val c = here(p)
-    // A wake for another core's task is a message to that core's inbox, which this kernel does not send.
-    if another_core(r.task.core(), c.id) then panic("skiff: a wake for a task on another core needs a message the kernel does not send")
     val _ = w.queue.remove(at)
     r.outcome = outcome
-    if c.sched.wake(r.task.slot()) then p.request_switch()
+    if another_core(r.task.core(), c.id)
+        post(p, kind, r.task, priority, null)
+    else if c.sched.wake(r.task.slot())
+        p.request_switch()
     r.task
 
 // End the waits that `tick` found expired, each under its object's lock: one still `Waiting` leaves the

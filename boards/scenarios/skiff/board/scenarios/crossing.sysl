@@ -1,0 +1,188 @@
+module skiff.board.scenarios
+
+import sysl.sync.Atomic
+import skiff.kernel
+import skiff.kernel.{FOREVER, Flags, Mutex, Port, Queue, Semaphore}
+
+// Waits across cores, on a machine of several. Every wake here is a message to the waiter's core's inbox
+// and a ring of its doorbell, and every boost of a mutex's owner on the other core is one too.
+//
+//   - The hammers, once they have passed things back and forth without waiting (messages.sysl): core 1
+//     waits on each kind of object, a semaphore, a mutex core 0 holds, a queue, event flags and its own
+//     notification, and core 0 gives it each 2 ticks after core 1 said it was about to wait, so each
+//     wait must have blocked for a tick at least and been ended by core 0. Then the two pass a unit back
+//     and forth `ROUNDS_ACROSS` times through two semaphores, each waiting for the other's give.
+//   - Then priority inversion across cores. The owner (priority 1, core 1) locks a mutex and has
+//     `OWNER_WORK` ticks of work to do with it. The worker (2, core 1) starts `WORKER_WORK` ticks of work
+//     as soon as it sees the mutex held, and the waiter (3, core 0) wants the mutex as soon as it sees it
+//     held. The waiter's boost reaches the owner through core 1's inbox, so the owner runs at 3 ahead of
+//     the worker and the waiter has the mutex within `BOUND` ticks; without the boost the worker keeps
+//     the owner, and so the waiter, waiting for the whole of its work. Once it has unlocked, the owner is
+//     back at 1, so it runs on only after the worker has finished.
+
+// How many times the cores pass a unit back and forth, each waiting for the other.
+private const ROUNDS_ACROSS: u32 = 1000
+
+// The inversion's ticks: the owner's work with the mutex, the worker's, and how long the waiter may wait.
+private const OWNER_WORK: u32 = 3
+private const WORKER_WORK: u32 = 30
+private const BOUND: u32 = 10
+
+// The flag core 1 waits for.
+private const WANTED: u32 = 0b100
+
+// The objects of the waits across cores: in `.shared`, so filled in by core 0.
+@section(".shared")
+private var handed: Semaphore
+@section(".shared")
+private var turns: Mutex
+@section(".shared")
+private var posted: Queue[u32, 2]
+@section(".shared")
+private var raised: Flags
+@section(".shared")
+private var ping: Semaphore
+@section(".shared")
+private var pong: Semaphore
+@section(".shared")
+private var contended: Mutex
+
+// How far core 1 has got: the number of the wait it is about to make.
+private var stage: Atomic[u32]
+// Whether core 0 holds `turns`, which it locks before core 1 starts waiting.
+private var turns_held: Atomic[u32]
+// How many hammers have finished their waits across cores.
+private var crossed: Atomic[u32]
+// Whether the owner holds `contended`, and whether the worker has finished.
+private var contended_held: Atomic[u32]
+private var worker_done: Atomic[u32]
+
+// Fill in the shared objects of the waits across cores. Core 0 calls it before any other core starts.
+fill_shared_crossing()
+    handed = Semaphore.new("handed", 0, 1)
+    turns = Mutex.new("turns")
+    posted = Queue.new("posted")
+    raised = Flags.new("raised", 0)
+    ping = Semaphore.new("ping", 0, 1)
+    pong = Semaphore.new("pong", 0, 1)
+    contended = Mutex.new("contended")
+
+// The hammers' waits across cores: core 1 waits, core 0 gives.
+waits_across[P: Port](p: *P, me: u32)
+    if me == 0
+        give_across(p)
+    else if me == 1
+        take_across(p)
+    val _ = crossed.add(1)
+
+// Core 0's side: lock `turns`, then end each of core 1's waits 2 ticks after it says it is about to wait.
+private give_across[P: Port](p: *P)
+    val _ = turns.lock(p, FOREVER)
+    turns_held.store(1)
+    await_stage(p, 1)
+    val _ = handed.give(p)
+    await_stage(p, 2)
+    turns.unlock(p)
+    await_stage(p, 3)
+    val _ = posted.send(p, 7, FOREVER)
+    await_stage(p, 4)
+    val _ = raised.set(p, WANTED)
+    await_stage(p, 5)
+    val _ = kernel.notify_give(p, hammers[1])
+    var answered: u32 = 0
+    for _ in 0..<ROUNDS_ACROSS
+        val _ = ping.give(p)
+        if pong.take(p, FOREVER) then answered += 1
+    if answered == ROUNDS_ACROSS
+        say(p, "two cores woke each other through semaphores 1000 times\n")
+    else
+        say(p, "two cores woke each other through semaphores only ")
+        kernel.write_dec(p, answered)
+        p.write(" times\n".bytes)
+
+// Wait until core 1 is about to make wait `n`, then 2 ticks more, by which it has blocked.
+private await_stage[P: Port](p: *P, n: u32)
+    while stage.load() < n do kernel.sleep(p, 1)
+    kernel.sleep(p, 2)
+
+// Core 1's side: each wait, and whether core 0 ended it after it had blocked.
+private take_across[P: Port](p: *P)
+    while turns_held.load() == 0 do kernel.sleep(p, 1)
+    var start = begin_wait(1)
+    report_wait(p, handed.take(p, FOREVER), start, "took a semaphore core 0 gave")
+    start = begin_wait(2)
+    val locked = turns.lock(p, FOREVER) && turns.holder() == kernel.current(p)
+    report_wait(p, locked, start, "locked a mutex core 0 unlocked")
+    turns.unlock(p)
+    start = begin_wait(3)
+    report_wait(p, posted.receive(p, FOREVER) == Some(7), start, "received a message core 0 sent")
+    start = begin_wait(4)
+    val bits = raised.wait(p, WANTED, false, true, FOREVER)
+    report_wait(p, bits.is_some() && bits.unwrap() & WANTED != 0 && raised.get(p) == 0, start, "woke on an event flag core 0 set")
+    start = begin_wait(5)
+    report_wait(p, kernel.notify_take(p, true, FOREVER) == 1, start, "woke on a notification core 0 sent")
+    for _ in 0..<ROUNDS_ACROSS
+        if ping.take(p, FOREVER)
+            val _ = pong.give(p)
+
+// Say that wait `n` is about to be made, and answer the tick it starts on.
+private begin_wait(n: u32) -> u32
+    val start = kernel.ticks()
+    stage.store(n)
+    start
+
+// Say whether a wait that began on tick `start` got what it waited for after blocking a tick at least.
+private report_wait[P: Port](p: *P, got: bool, start: u32, what: string)
+    say(p, what)
+    if got && kernel.ticks() - start >= 1
+        p.write(" while it waited\n".bytes)
+    else if got
+        p.write(" without waiting\n".bytes)
+    else
+        p.write(" wrongly\n".bytes)
+
+// Sleep until both hammers have finished their waits across cores.
+private await_crossed[P: Port](p: *P)
+    while crossed.load() < u32(kernel.CORES) do kernel.sleep(p, 1)
+
+// The owner, on core 1: lock the mutex, work `OWNER_WORK` ticks, unlock, and say whether it ran on only
+// after the worker had finished.
+owner_task[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    await_crossed(p)
+    val _ = contended.lock(p, FOREVER)
+    contended_held.store(1)
+    busy(OWNER_WORK)
+    contended.unlock(p)
+    if worker_done.load() != 0
+        say(p, "the low task gave up the priority core 0's task lent it with the mutex\n")
+    else
+        say(p, "the low task kept the priority core 0's task lent it after unlocking\n")
+    val _ = waits_done[me].add(1)
+    kernel.exit(p)
+
+// The worker, on core 1: `WORKER_WORK` ticks of work from when it sees the mutex held.
+worker_task[P: Port](p: *P) -> never
+    await_crossed(p)
+    while contended_held.load() == 0 do kernel.sleep(p, 1)
+    busy(WORKER_WORK)
+    worker_done.store(1)
+    kernel.exit(p)
+
+// The waiter, on core 0: lock the mutex as soon as it sees it held, and say how long that took.
+waiter_task[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    await_crossed(p)
+    while contended_held.load() == 0 do kernel.sleep(p, 1)
+    val start = kernel.ticks()
+    val _ = contended.lock(p, FOREVER)
+    val waited = kernel.ticks() - start
+    contended.unlock(p)
+    if waited <= BOUND
+        say(p, "the high task had the mutex a task on core 1 held within 10 ticks\n")
+    else
+        say(p, "the high task waited ")
+        kernel.write_dec(p, waited)
+        p.write(" ticks for the mutex a task on core 1 held\n".bytes)
+    val _ = waits_done[me].add(1)
+    kernel.exit(p)

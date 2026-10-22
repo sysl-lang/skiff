@@ -4,7 +4,7 @@
 
 import sysl.sync.{Atomic, Lock}
 import skiff.kernel
-import skiff.kernel.{Port, Queue}
+import skiff.kernel.{Doorbell, Port, Queue}
 
 struct Nothing
 end Nothing
@@ -25,6 +25,9 @@ impl Port for Nothing
     spin_lock(*self, word: *Atomic[u32]) = ()
     spin_try_lock(*self, word: *Atomic[u32]) -> bool = true
     spin_unlock(*self, word: *Atomic[u32]) = ()
+
+impl Doorbell for Nothing
+    ring(*self, core: u32) = ()
 
 private var stack: [64]u32 = [0; 64]
 // Objects one core keeps are constant data: an export reaches them, and a freestanding artifact has no
@@ -75,6 +78,7 @@ probe() -> i32
     val t = kernel.create(&m, 1, stack, &body, 1)
     kernel.start(&m)
     kernel.await_tick(&m)
+    kernel.answer_doorbell(&m)
     kernel.fault(&m, "none")
     val here = kernel.here(&m)
     if !kernel.stopped(here.id) || kernel.expired(kernel.ticks(), 0) then return 1

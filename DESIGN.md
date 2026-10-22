@@ -39,8 +39,9 @@ Core (private, one per core)          .shared
   `*Port`: the board passes its port to each kernel call, and its tick, switch and fault handlers do the
   same. `Port` is `write`, `cores`, `core_id`, `start_ticks`, `idle`, `new_context`, `request_switch`,
   `start_first`, `mask`, `restore`, `spin_lock`, `spin_try_lock` and `spin_unlock`; the arch package
-  supplies the last eight. The idle task's body is the board's (`kernel.run(p, idle_stack, idle)`),
-  since a task entry takes no port.
+  supplies the last eight. `Port` extends **`Doorbell`** (`ring(core)`), which the chip supplies: MHU0
+  on the AN521. The idle task's body is the board's (`kernel.run(p, idle_stack, idle)`), since a task
+  entry takes no port.
 - **One image is built for the weakest core it runs on**: the AN521's core 0 has no FP registers, so its
   image is built for `thumb-freestanding-soft`, and no core of it saves or uses them.
 - Each core's start-up fills its own `Core`; core 0 zeroes `.bss` and `.shared` before releasing the
@@ -121,7 +122,10 @@ the object hands itself over, as a semaphore or a mutex does), and releases the 
 
 - **the waiter's owner is the waker's core**: make it ready locally, and ask for a switch if it outranks
   the running task;
-- **it is another core**: post `Wake(handle)` to that core's inbox and ring its doorbell.
+- **it is another core**: post `Wake(handle)` to that core's inbox and ring its doorbell. The post is
+  made under the object's lock; it never waits, so the lock is still held only for a few instructions.
+  A mutex's hand-over to a task of another core posts `Hand(handle, priority)` instead (see "Mutexes
+  across cores").
 
 ### What each object hands over
 
@@ -150,7 +154,10 @@ transition out of `Waiting` happens, and it happens under the object's lock**:
   nothing;
 - the waker only ever takes a waiter that is `Waiting`.
 
-So a wait ends exactly once, and a `Wake` message for a task that timed out cannot exist.
+So a wait ends exactly once, and a `Wake` message for a task that timed out cannot exist. The owner
+applies a `Wake` or a `Hand` only to a task still blocked whose outcome is no longer `Waiting`; the
+message may land before or after the deadline's tick moved the task to `expiring`, and either way the
+timeout then finds the outcome settled.
 
 The owner's tick works through its timeout list with only its own mask up; a blocked task whose
 deadline has come is not woken there but moved to the core's `expiring` list. After the ready set is
@@ -191,27 +198,44 @@ wake can find it.
   needs a compare-and-swap, so the same code runs on an M0+.
 - On the sending core, a task and an interrupt handler may both post to one ring; posting masks that
   core's kernel interrupts, which makes them one producer.
-- **A ring can never overflow**: it holds `option_tasks` messages, and every message kind is bounded by
-  one per target task in flight (a task is woken at most once per wait; a boost, a suspend and a resume
-  replace a pending one of their kind through a per-task pending mask kept beside the waiters).
-- **The doorbell** interrupt drains every ring addressed to its core: for each message it checks the
-  handle's generation (a stale one is dropped) and applies it to its own scheduler, then asks for one
-  switch if anything now outranks the running task.
-- Messages: `Wake(task)`, `Boost(task, priority)`, `Suspend(task)`, `Resume(task)`, `Stop(task)`.
+- **A ring holds `2 * option_tasks` messages** (one slot more stays empty, so full and empty differ):
+  one wake or hand-over for each task of the receiving core, of which there is at most one in flight
+  per task (a task is woken once per wait, and waits again only after the message has made it ready),
+  and one boost for each task of the sending core, which posts one each time it blocks on a mutex whose
+  owner is on the receiving core.
+- **A full ring stops the kernel; it never drops or overwrites a message.** A boost is bounded only
+  between two drains: a sending task that times out and waits again posts another. So a ring fills
+  only when the receiving core goes without taking its doorbell interrupt while the sender's tasks time
+  out and wait over and over, and then the post reports `skiff: core <to>'s inbox from core <from> is
+  full` and panics. A post never waits for room: it may be made under an object's lock that the
+  receiving core's drain needs.
+- **A message to a core a fault has stopped is dropped**, since none of its tasks runs again; one to a
+  core not yet started is a panic.
+- **The doorbell** interrupt drains every ring addressed to its core, in the order of the posting cores,
+  each ring oldest first: for each message it checks the handle's generation (a stale one is dropped)
+  and applies it to its own scheduler, then asks for one switch if anything now outranks the running
+  task. The chip clears the doorbell before the drain, so a message posted while it drains rings again.
+  The poster makes its writes visible before it rings (a `dsb` before the AN521's MHU write).
+- Messages: `Wake(task)`, `Hand(task, priority)`, `Boost(task, priority, mutex)`. Suspending, resuming
+  and stopping another core's task will be messages of their own, each bounded the same way.
 
 ## Mutexes across cores
 
 - A mutex records its owner as a handle. A waiter that outranks the owner raises the owner's effective
-  priority: directly when the owner is on the waiter's core, by `Boost` when it is not.
+  priority: directly when the owner is on the waiter's core, by `Boost(owner, priority, mutex)` when it
+  is not. Only the owner's core knows the owner's priority, so a waiter of another core always posts
+  the boost, and the owner's core applies it only if it raises the task and the task still holds that
+  mutex (read under the mutex's lock). A boost that arrives after the owner let the mutex go is
+  dropped, so it can never outlive the mutex it was for.
 - Inheritance is one level deep, as before: a boosted owner blocked on another object moves up that
   object's queue, but does not pass the boost on to that object's owner. The boost is dropped when the
   owner holds no mutex (`Tcb.held` counts them).
 - The locker raises a same-core owner after releasing the mutex's lock but before unmasking its core, so
   the raise never holds two object locks (a blocked owner's re-insertion takes the other object's).
 - An unlock hands the mutex to the best waiter (`Given`), and the new owner inherits at once from the
-  best of those still waiting.
-- Until the inboxes carry `Wake` and `Boost`, a wait on a mutex another core's task holds, and a wake for
-  another core's task, stop the kernel with a panic that says so.
+  best of those still waiting. A new owner on another core is told by `Hand(task, priority)`: its core
+  counts the mutex in `Tcb.held`, raises the task to `priority` if that is higher, and makes it ready.
+  The unlocking core never touches the new owner's `Tcb`.
 
 ## Time
 

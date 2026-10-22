@@ -1,0 +1,44 @@
+module skiff.chip.an521
+
+// The SSE-200's first message handling unit (MHU0, Secure alias 0x5000_3000): a doorbell each way between
+// the two cores. Writing a core's SET register raises interrupt `MHU0_IRQ` on that core, and it stays
+// raised until that core writes its CLR register. The interrupt goes to `skiff_an521_mhu0`, which clears
+// the running core's doorbell and calls the board's `skiff_doorbell`.
+
+private struct Mhu
+    cpu0_stat: volatile u32     // 0x00
+    cpu0_set: volatile u32      // 0x04
+    cpu0_clr: volatile u32      // 0x08
+    reserved: volatile u32      // 0x0c
+    cpu1_stat: volatile u32     // 0x10
+    cpu1_set: volatile u32      // 0x14
+    cpu1_clr: volatile u32      // 0x18
+
+@assert(offsetof(Mhu, cpu1_clr) == 0x18, "CPU1INTR_CLR is at 0x18")
+
+private const MHU0: usize = 0x5000_3000
+private mhu() -> *Mhu = ptr_cast(MHU0)
+
+// MHU0's interrupt, the same number on both cores.
+const MHU0_IRQ: u32 = 6
+
+// Ring core `to`'s doorbell. Every write to memory before it is complete first, so the other core's
+// handler finds whatever was posted to it.
+ring_doorbell(to: u32)
+    asm
+        [thumb] "dsb"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.an521 is for the AN521's Cortex-M33 cores"
+    if to == 0 then mhu().cpu0_set = 1 else mhu().cpu1_set = 1
+
+// The board's handler for a doorbell rung at the running core.
+extern "skiff_doorbell" board_doorbell()
+
+// MHU0's interrupt: clear the running core's doorbell before the board drains, so a ring that comes while
+// it drains raises the interrupt again.
+@export("skiff_an521_mhu0")
+private mhu0_handler()
+    if core_id() == 0 then mhu().cpu0_clr = 1 else mhu().cpu1_clr = 1
+    asm
+        [thumb] "dsb"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.an521 is for the AN521's Cortex-M33 cores"
+    board_doorbell()

@@ -6,16 +6,30 @@ import sysl.sync.{Atomic, Ordering}
 // the section between `__shared_start` and `__shared_end`, core 0 zeroes it before it releases the other
 // cores, and in a build of two images both link scripts put it at the same address.
 
-// What one core asks of another through its inbox: a kind and the task it is about.
-struct Message
-    kind: u32
-    task: u32
+// What a message asks of the core it is posted to (inbox.sysl). `Empty` is 0, what a zeroed slot holds.
+enum MessageKind: u8
+    Empty = 0
+    Wake = 1        // a wait of the task has ended: make it ready
+    Hand = 2        // a mutex was handed to the task: it holds one more, runs at `priority` at least, and is made ready
+    Boost = 3       // a task waiting on `mutex`, which the task holds, outranks it: it runs at `priority` at least
 
-// How many messages one inbox ring holds.
-const INBOX_SLOTS: usize = 16
+// What one core asks of another through its inbox: a kind, the task it is about, a priority, and for a
+// boost the mutex the waiter waits on, which lies in `.shared` since two cores use it. Only a boost
+// reads `mutex`; the other kinds leave it null, a raw pointer's zero, as a zeroed slot has it.
+struct Message
+    kind: MessageKind
+    task: Task
+    priority: u8
+    mutex: *Mutex
+
+// How many messages one inbox ring holds: one wake or hand-over for each task of the receiving core and
+// one boost for each task of the sending core (DESIGN "Inboxes"). One slot more stays empty, so that a
+// full ring and an empty one can be told apart.
+const INBOX_MESSAGES: usize = 2 * option_tasks
+private[kernel] const INBOX_SLOTS: usize = INBOX_MESSAGES + 1
 
 // A single-producer, single-consumer ring of messages: the sending core writes `tail` and the slots, the
-// receiving core writes `head`.
+// receiving core writes `head`. Both run from 0 to `INBOX_SLOTS - 1` and wrap; `head == tail` is empty.
 struct Ring
     head: Atomic[u32]
     tail: Atomic[u32]
@@ -86,6 +100,9 @@ private[kernel] in_shared(at: usize, bytes: usize) -> bool = within(at, bytes, s
 
 // The wait record at `index`: `core * option_tasks + slot`.
 private[kernel] waiter(index: u16) -> *Waiter = &shared.waiters[usize(index) / option_tasks][usize(index) % option_tasks]
+
+// The ring core `from` posts to core `to` through.
+private[kernel] inbox(to: u32, from: u32) -> *Ring = &shared.inboxes[to][from]
 
 // The notification of task `slot` of core `core`.
 private[kernel] note_of(core: u32, slot: usize) -> *Note = &shared.notes[core][slot]

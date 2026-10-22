@@ -52,6 +52,10 @@ impl Port for Recorder
     spin_try_lock(*self, word: *Atomic[u32]) -> bool = panic("one core never spins")
     spin_unlock(*self, word: *Atomic[u32]) = panic("one core never spins")
 
+// One core: the kernel has no other core to ring.
+impl Doorbell for Recorder
+    ring(*self, core: u32) = panic("one core never rings")
+
 private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0)
 
 // Whether `r` recorded exactly `want`.

@@ -2,10 +2,16 @@ module skiff.kernel
 
 import sysl.sync.Atomic
 
+// How one core interrupts another: the chip's doorbell. Ringing core `core`'s raises an interrupt on that
+// core, whose handler calls `kernel.answer_doorbell`; a ring while one is still pending may be merged
+// with it, since the handler drains everything there is. Only a machine with more than one core is asked.
+trait Doorbell
+    ring(*self, core: u32)
+
 // The kernel's view of the processor and the machine under it. An arch package, a chip package and a
 // board program together implement it; the kernel itself knows nothing about the hardware beyond what
 // this trait says.
-trait Port
+trait Port: Doorbell
     // Write `bytes` to this core's console, waiting for room as long as it takes.
     write(*self, bytes: []const u8)
 

@@ -1,0 +1,85 @@
+module skiff.kernel
+
+import sysl.sync.{Lock, Ordering}
+
+// Inboxes: how one core asks another to change something of its own. A core never edits another core's
+// scheduler. When a wake ends the wait of another core's task, or a waiter must raise the priority of a
+// mutex's owner on another core, the core posts a message to the owner's inbox in `.shared` and rings
+// its doorbell; the doorbell's interrupt on the owner applies it.
+//
+// There is one ring for each ordered pair of cores, `inboxes[to][from]`, with one producer (the posting
+// core, which masks its kernel interrupts while it posts, so a task and a handler of that core are one
+// producer) and one consumer (the doorbell's handler on `to`). Neither side needs more than a load and a
+// store, so the rings work on a core with no atomic read-modify-write.
+//
+// A message names its task by handle. The doorbell checks it before acting: a task deleted since the
+// message was posted is gone, and the message is dropped.
+
+// Post a message of `kind` about task `t`, at `priority`, to the inbox of `t`'s core, and ring that
+// core's doorbell. A message to a core a fault has stopped is dropped, since none of its tasks runs
+// again; one to a core that has not started stops the kernel, and so does a full ring, which is reported
+// on the running core's console first.
+private[kernel] post[P: Port](p: *P, kind: MessageKind, t: Task, priority: u8, mutex: *Mutex)
+    val to = t.core()
+    val state = core_state(to)
+    if state == CORE_STOPPED then return
+    if state != CORE_READY then panic("skiff: a message to a core that has not started")
+    val from = here_id(p)
+    val ring = inbox(to, from)
+    val mask = p.mask()
+    val tail = ring.tail.load(Ordering.Relaxed)
+    val next = following(tail)
+    if next == ring.head.load(Ordering.Acquire)
+        p.write("skiff: core ".bytes)
+        write_dec(p, to)
+        p.write("'s inbox from core ".bytes)
+        write_dec(p, from)
+        p.write(" is full\n".bytes)
+        panic("skiff: an inbox is full")
+    ring.slots[tail] = Message(kind, t, priority, mutex)
+    ring.tail.store(next, Ordering.Release)
+    p.restore(mask)
+    p.ring(to)
+
+// The slot after `at`, wrapping.
+private following(at: u32) -> u32 = if usize(at) + 1 == INBOX_SLOTS then 0 else at + 1
+
+// The running core's doorbell: apply every message in every ring addressed to it, the rings in the
+// order of the cores that post to them and each ring oldest first, then ask for a switch if a task made
+// ready or raised now outranks the running one. The board's doorbell interrupt calls it, having cleared
+// the doorbell first, so that a message posted while it drains rings again.
+answer_doorbell[P: Port](p: *P)
+    val c = here(p)
+    val state = p.mask()
+    for from in 0..<INBOX_CORES
+        val ring = inbox(c.id, u32(from))
+        var head = ring.head.load(Ordering.Relaxed)
+        while head != ring.tail.load(Ordering.Acquire)
+            val m = ring.slots[head]
+            head = following(head)
+            ring.head.store(head, Ordering.Release)
+            apply(p, c, m)
+    if c.sched.preempted() then p.request_switch()
+    p.restore(state)
+
+// Apply message `m` to core `c`, the running core. A handle that no longer names a task is dropped.
+private apply[P: Port](p: *P, c: *Core, m: Message)
+    val i = c.sched.check(m.task) match
+        Ok(i) -> i
+        Err(_) -> return
+    m.kind match
+        MessageKind.Wake ->
+            if wait_ended(c, i)
+                val _ = c.sched.wake(i)
+        MessageKind.Hand ->
+            if wait_ended(c, i)
+                c.sched.tasks[i].held += 1
+                if m.priority > c.sched.tasks[i].priority then c.sched.set_effective(i, m.priority)
+                val _ = c.sched.wake(i)
+        MessageKind.Boost ->
+            if m.priority > c.sched.tasks[i].priority && m.mutex.owned_by(p, m.task)
+                reprioritize(p, c, i, m.priority)
+        MessageKind.Empty -> ()
+
+// Whether task `i` of core `c` is blocked on a wait that has ended: what a wake or a hand-over finds.
+private wait_ended(c: *Core, i: usize) -> bool = c.sched.tasks[i].state == TaskState.Blocked && waiter(waiter_index(c.id, i)).outcome != Outcome.Waiting
