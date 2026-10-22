@@ -46,9 +46,10 @@ private following(at: u32) -> u32 = if usize(at) + 1 == INBOX_SLOTS then 0 else 
 
 // The running core's doorbell: apply every message in every ring addressed to it, the rings in the
 // order of the cores that post to them and each ring oldest first, then ask for a switch if a task made
-// ready or raised now outranks the running one. The board's doorbell interrupt calls it, having cleared
-// the doorbell first, so that a message posted while it drains rings again.
+// ready or raised now outranks the running one. It clears the doorbell before the first ring is read, so
+// that a message posted while it drains rings again instead of being wiped with the doorbell.
 answer_doorbell[P: Port](p: *P)
+    p.clear()
     val c = here(p)
     val state = p.mask()
     for from in 0..<INBOX_CORES

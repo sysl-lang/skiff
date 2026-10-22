@@ -2,8 +2,8 @@ module skiff.chip.an521
 
 // The SSE-200's first message handling unit (MHU0, Secure alias 0x5000_3000): a doorbell each way between
 // the two cores. Writing a core's SET register raises interrupt `MHU0_IRQ` on that core, and it stays
-// raised until that core writes its CLR register. The interrupt goes to `skiff_an521_mhu0`, which clears
-// the running core's doorbell and calls the board's `skiff_doorbell`.
+// raised until that core writes its CLR register (`clear_doorbell`). The interrupt goes to
+// `skiff_an521_mhu0`, which calls the board's `skiff_doorbell`.
 
 private struct Mhu
     cpu0_stat: volatile u32     // 0x00
@@ -33,12 +33,14 @@ ring_doorbell(to: u32)
 // The board's handler for a doorbell rung at the running core.
 extern "skiff_doorbell" board_doorbell()
 
-// MHU0's interrupt: clear the running core's doorbell before the board drains, so a ring that comes while
-// it drains raises the interrupt again.
-@export("skiff_an521_mhu0")
-private mhu0_handler()
+// Clear the running core's doorbell, so a ring that comes afterwards raises the interrupt again.
+clear_doorbell()
     if core_id() == 0 then mhu().cpu0_clr = 1 else mhu().cpu1_clr = 1
     asm
         [thumb] "dsb"
         [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.an521 is for the AN521's Cortex-M33 cores"
+
+// MHU0's interrupt: the board's handler drains the inboxes, clearing the doorbell first.
+@export("skiff_an521_mhu0")
+private mhu0_handler()
     board_doorbell()

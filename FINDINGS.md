@@ -133,4 +133,4 @@ its arguments left to the expected type, fails, and the diagnostic names the mod
 wrong. skiff's `tools/portable` hit it with `kernel.Queue.new("mail")`. Importing `Queue` by name is the
 ordinary spelling and is what skiff uses, so nothing here is contorted.
 
-Status: open; reported to sysl.
+Status: fixed in sysl 0.3.12.

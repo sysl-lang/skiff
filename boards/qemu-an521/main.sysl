@@ -48,6 +48,7 @@ impl Port for Board
 // The doorbells are MHU0's, one each way.
 impl Doorbell for Board
     ring(*self, core: u32) = an521.ring_doorbell(core)
+    clear(*self) = an521.clear_doorbell()
 
 // The status `boot` answered on core 0, which core 0's last task stops the machine with.
 private var status: i32 = 0
@@ -130,7 +131,7 @@ private task_r() -> never
         board.write("skiff: core 0 time base agrees\n".bytes)
     armv7m.halt(status)
 
-// MHU0's doorbell, on either core, once the chip has cleared it: that core's kernel drains its inboxes.
+// MHU0's doorbell, on either core: that core's kernel clears it and drains its inboxes.
 @export("skiff_doorbell")
 board_doorbell()
     var board = Board()

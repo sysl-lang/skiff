@@ -8,6 +8,10 @@ import sysl.sync.Atomic
 trait Doorbell
     ring(*self, core: u32)
 
+    // Clear the running core's doorbell, so that the next ring raises its interrupt again. The drain clears
+    // it before it reads any inbox: a message posted while the drain runs then rings once more.
+    clear(*self)
+
 // The kernel's view of the processor and the machine under it. An arch package, a chip package and a
 // board program together implement it; the kernel itself knows nothing about the hardware beyond what
 // this trait says.

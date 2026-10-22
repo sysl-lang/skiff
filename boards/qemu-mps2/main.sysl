@@ -37,6 +37,7 @@ impl Port for Board
 // One core: the kernel has no other core to ring.
 impl Doorbell for Board
     ring(*self, core: u32) = panic("skiff: one core rings no doorbell")
+    clear(*self) = panic("skiff: one core rings no doorbell")
 
 // The status `boot` answered, which the last task stops the machine with.
 private var status: i32 = 0

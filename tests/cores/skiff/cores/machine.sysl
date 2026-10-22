@@ -2,7 +2,7 @@ module skiff.cores
 
 import sysl.sync.{Atomic, Ordering}
 import skiff.kernel
-import skiff.kernel.{Doorbell, Port, Task}
+import skiff.kernel.{Doorbell, Port, Semaphore, Task}
 
 // A machine of `kernel.CORES` cores on the host, played one core at a time: `me` says which core is
 // running, and a test changes it to act as another. Its doorbell rings nothing; it counts the rings each
@@ -14,6 +14,8 @@ struct Machine
     rung: [kernel.CORES]u32        // how many times each core's doorbell was rung
     switches: [kernel.CORES]u32    // how many switches each core asked for
     masked: u32                     // how deep the running core's masking is nested
+    pending: [kernel.CORES]bool    // whether each core's doorbell is raised: a ring raises it, `clear` lowers it
+    late: *Semaphore                // given by core 0 as the running core's drain ends (null: nothing)
 
 // A tick is taken by hand. A new task's context is only its stack's address. The chip's lock is a word
 // that is never contended, since one core acts at a time: finding it taken is a lock left held.
@@ -36,6 +38,15 @@ impl Port for Machine
 
     restore(*self, state: u32)
         self.masked = state
+        if state == 0 && self.late != null
+            // The outermost restore is a drain's last act: what core 0 gives now lands in a ring the drain
+            // has already read.
+            val s = self.late
+            val core = self.me
+            self.late = null
+            self.me = 0
+            val _ = s.give(self)
+            self.me = core
 
     spin_lock(*self, word: *Atomic[u32])
         if word.swap(1, Ordering.Acquire) != 0 then panic("a kernel lock was left held")
@@ -46,12 +57,16 @@ impl Port for Machine
 impl Doorbell for Machine
     ring(*self, core: u32)
         self.rung[core] += 1
+        self.pending[core] = true
+
+    clear(*self)
+        self.pending[self.me] = false
 
 // A machine with every core offline, core 0 acting. The objects a test declares are its own locals, and
 // every one of them may be used by two cores, so the whole address space counts as `.shared`.
 machine() -> Machine
     kernel.shared_bounds(0, 0xffff_ffff_ffff_ffff)
-    Machine(0, [0; kernel.CORES], [0; kernel.CORES], 0)
+    Machine(0, [0; kernel.CORES], [0; kernel.CORES], 0, [false; kernel.CORES], null)
 
 // Act as core `core` from now on.
 on(m: *Machine, core: u32)

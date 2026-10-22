@@ -246,6 +246,34 @@ drain_order()
     for t in [x, y, z]
         assert(state_of(&m, t) == TaskState.Ready, "ready")
 
+@test("a message posted as a drain ends is not lost: its doorbell is still raised, and the next drain delivers it")
+post_while_draining()
+    var m = machine()
+    val a = task_on(&m, 1, 0, 2)
+    val b = task_on(&m, 1, 1, 2)
+    val _ = task_on(&m, 1, 2, 1)
+    val _ = task_on(&m, 0, 3, 1)
+    begin(&m)
+    var sa = Semaphore.new("a", 0, 1)
+    var sb = Semaphore.new("b", 0, 1)
+    on(&m, 1)
+    for s in [&sa, &sb]
+        val _ = s.take(&m, FOREVER)
+        switch_now(&m)
+    on(&m, 0)
+    assert(sa.give(&m), "a given")
+    assert(m.pending[1], "core 1's doorbell is raised")
+    // Core 1 drains; as it finishes, core 0 gives b.
+    m.late = &sb
+    on(&m, 1)
+    kernel.answer_doorbell(&m)
+    assert(state_of(&m, a) == TaskState.Ready, "a was in the drain")
+    assert(state_of(&m, b) == TaskState.Blocked, "b came too late for it")
+    assert(m.pending[1], "b's ring raised the doorbell again")
+    kernel.answer_doorbell(&m)
+    assert(state_of(&m, b) == TaskState.Ready, "the next drain delivers b")
+    assert(!m.pending[1], "and leaves the doorbell lowered")
+
 // Core 0's task, at priority 2, waits on a mutex core 1's task holds and times out, `times` times, while
 // core 1 never answers its doorbell: each wait posts a boost to core 1's ring from core 0.
 private fill_ring(m: *Machine, x: *Mutex, times: usize)

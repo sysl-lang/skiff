@@ -28,6 +28,7 @@ impl Port for Nothing
 
 impl Doorbell for Nothing
     ring(*self, core: u32) = ()
+    clear(*self) = ()
 
 private var stack: [64]u32 = [0; 64]
 // Objects one core keeps are constant data: an export reaches them, and a freestanding artifact has no
