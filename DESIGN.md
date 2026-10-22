@@ -88,11 +88,16 @@ waiter.
 - A task waits on at most one thing at a time, so each task has exactly one **`Waiter`** record, in
   `.shared` at `waiters[core][slot]`. It holds the handle, the effective priority, a link (the next
   waiter's index, `core * option_tasks + slot`, not a pointer), the wait's `outcome` (`Idle`,
-  `Waiting`, `Woken`, `Given`, `TimedOut`) and the value the wait carries (the bits that ended a flags
-  wait, a notification's value).
+  `Waiting`, `Woken`, `Given`, `TimedOut`), its `mode` (what kind of wait it is, as its object reads it:
+  a queue's side, a flags wait's terms) and its `value`: what the wait asks for going in (the bits a
+  flags wait names) and what it carries back (the bits that ended it).
 - A `WaitQueue` is a head index and a count, in the object, ordered by priority and first-come within a
   priority. Insertion walks the queue (bounded by the number of tasks); waking the best waiter is O(1).
-  The count alone says whether anyone waits, so a zeroed queue is empty.
+  The count alone says whether anyone waits, so a zeroed queue is empty. Two objects walk further: a
+  message queue's senders and receivers share its one `WaitQueue`, so a wake takes the best waiter of
+  the side it wants (`first_of(mode)`), walking past the other side, which waits only in the moment
+  between a kept slot or message and its taker running; and a flags set looks at every waiter, since
+  one set may satisfy several.
 - An object holds a `Waitable`: its `KernelLock` and its `WaitQueue`. A blocked task's private `Tcb.on`
   names it, which is how a timeout, a priority change or a delete reaches the queue under the lock.
 - A change of a waiter's priority while it waits (inheritance, `set_priority`) re-inserts it, under the
@@ -117,6 +122,23 @@ the object hands itself over, as a semaphore or a mutex does), and releases the 
 - **the waiter's owner is the waker's core**: make it ready locally, and ask for a switch if it outranks
   the running task;
 - **it is another core**: post `Wake(handle)` to that core's inbox and ring its doorbell.
+
+### What each object hands over
+
+- **Semaphore, mutex**: the wake is `Given`, and being woken is having the unit or the mutex.
+- **Message queue** (`Queue[T, N]`, the storage its own, so a queue in `.shared` carries messages with
+  no pointer in them): a send to a waiting receiver puts the message in and keeps it for that receiver
+  (`Given`), which takes the oldest message when it runs; a receive with a sender waiting keeps the
+  freed slot for that sender (`Given`), which fills it when it runs. What is kept is out of reach of
+  every other send and receive, so a woken receiver always has a message and a woken sender always has
+  room. Messages leave in the order they came, whichever receiver takes them.
+- **Event flags**: a set ends every wait it satisfies (`Woken`, the bits as the set left them in the
+  record's `value`), and clears the bits the woken waits asked to clear once all have been seen.
+- **Task notifications**: each task's note (value, pending mark, `Waitable`) is in `.shared` at
+  `notes[core][slot]`, so any core may send to any task. The note names its task by handle: it is
+  renewed when a task is created in its slot (before the task can run) and cleared when the task is
+  deleted (before it goes), and a send whose handle does not match it is refused as stale. Only the
+  task waits on its own note; a send wakes it with `Woken`, and it takes the value when it runs.
 
 ### Timeouts race with wakes, and the outcome decides
 

@@ -69,8 +69,8 @@ private[kernel] core_state(n: u32) -> u32 = shared.states[n].load(Ordering.Acqui
 private[kernel] time_base() -> *Atomic[u32] = &shared.time
 
 // Whether everything another core can reach lies in [start, end): the bounds the link script gives
-// `.shared`, which the board reads from `__shared_start` and `__shared_end`. The inboxes and the wait
-// records are named on their own, since they are what the other cores write.
+// `.shared`, which the board reads from `__shared_start` and `__shared_end`. The inboxes, the wait
+// records and the notes are named on their own, since they are what the other cores write.
 shared_within(start: usize, end: usize) -> bool
     within(usize(&shared), sizeof(Shared), start, end) && within(usize(&shared.inboxes), sizeof([INBOX_CORES][INBOX_CORES]Ring), start, end) && within(usize(&shared.waiters), sizeof([option_cores][option_tasks]Waiter), start, end) && within(usize(&shared.notes), sizeof([option_cores][option_tasks]Note), start, end)
 
