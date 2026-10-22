@@ -6,8 +6,8 @@ import skiff.kernel.{Buffer, Channel, FOREVER, Pool, Port}
 // Buffers handed over, never copied, each core with a pool and two channels of its own, between the
 // receiver (priority 4) and the sender (priority 3), from tick 130 of the core's epoch:
 //
-//   - The sender takes a buffer, fills it and sends it out; the receiver, waiting, checks every byte,
-//     adds 1 to each and sends it back; the sender, waiting, finds its bytes at the address it filled
+//   - The sender takes a buffer, fills it and sends it out; the receiver, waiting, checks that it lies
+//     where the sender filled it and every byte, adds 1 to each and sends it back; the sender, waiting, finds its bytes at the address it filled
 //     them, changed, and gives the buffer back to the pool. `ROUND_TRIPS` times, and then the pool holds
 //     every buffer again and the handle the sender last gave away is refused.
 //
@@ -32,6 +32,8 @@ private const STREAM_BUFFERS: usize = 4
 private var blocks: [kernel.CORES]Pool[2, 64] = [Pool.new("blocks", 1); kernel.CORES]
 private var outward: [kernel.CORES]Channel[1] = [Channel.new("outward"); kernel.CORES]
 private var homeward: [kernel.CORES]Channel[1] = [Channel.new("homeward"); kernel.CORES]
+// Where each core's sender filled the buffer it last sent.
+private var filled_at: [kernel.CORES]usize
 
 // The pool and the channel the cores pass buffers through: in `.shared`, so filled in by core 0.
 @section(".shared")
@@ -53,9 +55,11 @@ private[scenarios] buffers_receiver[P: Port](p: *P, me: u32)
     for round in 0..<ROUND_TRIPS
         val b = outward[me].receive(p, &blocks[me], FOREVER).unwrap()
         val bytes = blocks[me].bytes(p, b).unwrap()
-        // A byte not as the sender wrote it comes back 0, which the sender never expects.
+        // A buffer not where the sender filled it, or a byte not as the sender wrote it, comes back 0,
+        // which the sender never expects.
+        val moved = usize(&bytes[0]) != filled_at[me]
         for i in 0..<bytes.len
-            bytes[i] = if bytes[i] == u8(round + u32(i)) then bytes[i] + 1 else 0
+            bytes[i] = if !moved && bytes[i] == u8(round + u32(i)) then bytes[i] + 1 else 0
         val _ = homeward[me].send(p, &blocks[me], b, FOREVER)
 
 // The sender's side: take, fill and send a buffer, then take it back, and say whether every one came
@@ -68,6 +72,7 @@ private[scenarios] buffers_sender[P: Port](p: *P, me: u32)
         val bytes = blocks[me].bytes(p, b).unwrap()
         for i in 0..<bytes.len
             bytes[i] = u8(round + u32(i))
+        filled_at[me] = usize(&bytes[0])
         val _ = outward[me].send(p, &blocks[me], b, FOREVER)
         if blocks[me].bytes(p, b).is_ok() then in_place = false
         val back = homeward[me].receive(p, &blocks[me], FOREVER).unwrap()
