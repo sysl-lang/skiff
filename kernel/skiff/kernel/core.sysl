@@ -32,6 +32,9 @@ impl Core
 // How many cores the kernel was built for: its `cores` option, for a board sizing tables of its own.
 const CORES: usize = option_cores
 
+// How many tasks each core's table holds: its `tasks` option, for a port keeping something per task.
+const TASKS: usize = option_tasks
+
 private var cores_here:[option_cores]Core = [Core(0, Atomic(0), false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false); option_cores]
 
 // The running core's `Core`. With one core it is a constant, and the port is not asked.

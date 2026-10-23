@@ -11,8 +11,13 @@ MEMORY {
 
 SECTIONS {
   /* The architecture's sixteen words, then the chip's interrupts, in that order. */
+  /* The code and its constants run from __code_start to __code_end, both on 32-byte boundaries: an
+   * unprivileged task's code region is exactly that, one PMSAv8 region, holding nothing a task may not
+   * read. */
+  __code_start = ORIGIN(CODE);
   .vectors : { KEEP(*(.vectors)) KEEP(*(.vectors.irq)) } > CODE
-  .text    : { *(.text*) *(.rodata*) } > CODE
+  .text    : { *(.text*) *(.rodata*) . = ALIGN(32); } > CODE
+  __code_end = .;
   .data    : { *(.data*) } > CODE
 
   /* The reset handler zeroes everything between these two symbols. */

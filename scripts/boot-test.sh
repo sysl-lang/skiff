@@ -57,6 +57,25 @@ skiff: core $1 a flags wait timed out after 4 ticks
 skiff: core $1 a notification sent before the wait was kept, and one sent during it woke the task
 skiff: core $1 a buffer went to another task and back 8 times in place, and every buffer is back in the pool"
 }
+# Protection, every core (boards/scenarios, protection.sysl): a map the MPU cannot hold refused at
+# creation; an unprivileged task's round trips with a privileged one; a task reading kernel memory, a
+# stack overflow and a null load each stopped alone and reported; calls with buffers, grants or handles
+# outside the caller's refused, touching nothing; a granted UART written by its task, an ungranted one
+# stopping its task; a trap the kernel does not take stopping its task; BASEPRI and PRIMASK out of an
+# unprivileged task's reach; and every task stopped that should be, the rest running on.
+protection_expected() {
+    echo "skiff: core $1 refused a map its MPU cannot hold exactly when its task was created
+skiff: core $1 an unprivileged task made 5 round trips with a privileged task through a semaphore and notifications
+skiff: core $1 stopped a task that broke its memory protection
+skiff: core $1 stopped a task that overflowed its stack
+skiff: core $1 stopped a task that broke its memory protection
+skiff: core $1 kernel calls with buffers, grants or handles outside the caller's were refused, and touched nothing
+skiff: core $1 an unprivileged task granted the UART wrote this line itself
+skiff: core $1 stopped a task that broke its memory protection
+skiff: core $1 stopped a task that made a trap the kernel does not take
+skiff: core $1 an unprivileged task's writes to BASEPRI and PRIMASK held off nothing
+skiff: core $1 the tasks their protection stopped are stopped, and the rest ran on"
+}
 mps2_expected="skiff: hello
 skiff: .shared holds the shared state
 skiff: core 0 tick 1
@@ -65,7 +84,8 @@ skiff: core 0 tick 3
 skiff: core 0 time base agrees
 $(tasks_expected 0 "f32 registers survived the switches")
 $(waits_expected 0)
-$(messages_expected 0)"
+$(messages_expected 0)
+$(protection_expected 0)"
 
 # The AN521's two cores run one image, each greeting and ticking on the UART of its own number, then
 # running its own tasks at once with the other. Core 0 has no FPU (the SSE-200's CPU0, in QEMU as on
@@ -98,6 +118,8 @@ skiff: core 0 two cores passed event flags back and forth 1000 times
 skiff: core 0 two cores woke each other through semaphores 1000 times
 skiff: core 0 had every buffer it sent core 1 back in the pool
 skiff: core 0 the high task had the mutex a task on core 1 held within 10 ticks
+$(protection_expected 0)
+skiff: core 0 an unprivileged task on core 1 took a unit core 0 gave and set flags core 0 waited on, through its grants
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
 skiff: core 0 time base agrees"
@@ -118,6 +140,8 @@ skiff: core 1 woke on an event flag core 0 set while it waited
 skiff: core 1 woke on a notification core 0 sent while it waited
 skiff: core 1 received 100 buffers core 0 filled, in place and every byte as written
 skiff: core 1 the low task gave up the priority core 0's task lent it with the mutex
+$(protection_expected 1)
+skiff: core 1 an unprivileged task took a unit core 0 gave, through its grant
 skiff: core 1 fault BusFault"
 
 failed=0

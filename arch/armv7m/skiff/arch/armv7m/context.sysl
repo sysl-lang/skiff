@@ -18,8 +18,15 @@ module skiff.arch.armv7m
 // floating-point registers (`fpu` false) the FPU part is not assembled at all.
 //
 // **The first task starts through SVC**: an exception return is the only way into thread mode on the
-// PSP with a task's xPSR and pc. `start_first` makes the call with the stack pointer in r0; the handler
-// unwinds the task's context as PendSV does, unmasks, and returns into the task.
+// PSP with a task's xPSR and pc. `start_first` makes the call, on the main stack, with the stack pointer
+// in r0; the handler unwinds the task's context as PendSV does, sets the task's privilege through the
+// board's `skiff_first_privilege`, unmasks, and returns into the task. An SVC from the process stack is a
+// task's kernel call (calls.sysl).
+//
+// **Privilege is set on the way out of every switch**: thread mode runs unprivileged (CONTROL.nPRIV)
+// exactly while an unprivileged task outside a kernel call runs. CONTROL is written only from a handler,
+// where it takes effect on the return to the task: thread code that dropped its own privilege could not
+// go on to start the first task.
 //
 // **Masking is BASEPRI**, not PRIMASK: it holds off SysTick and PendSV, the handlers that touch the
 // kernel's state, and leaves faults, SVC and more urgent interrupts alone. SVC with interrupts masked by
@@ -59,10 +66,35 @@ asm
         ".thumb_func"
         ".globl skiff_svc"
         "skiff_svc:"
+        "tst lr, #4"
+        "bne 1f"
         "ldmia r0!, {{r4-r11, lr}}"
         "msr psp, r0"
+        "push {{r3, lr}}"
+        "bl skiff_first_privilege"
+        "pop {{r3, lr}}"
         "movs r1, #0"
         "msr basepri, r1"
+        "isb"
+        "bx lr"
+        // A kernel call from a task (calls.sysl). If the task has used the FPU, its frame has room for
+        // s0-s15 that the processor fills only lazily; an FPU instruction here fills it now, so that the
+        // frame is whole when the call returns through it. The task's r4-r11 and EXC_RETURN go on the
+        // main stack, r3 beside them to keep it 8-byte aligned; `skiff_call_entry` answers the process
+        // stack to return on and may rewrite them in place, so that a call's return brings back the
+        // registers the task trapped with, which the processor's frame does not hold.
+        "1:"
+        "mrs r0, psp"
+#if fpu
+        "tst lr, #0x10"
+        "it eq"
+        "vmoveq.f32 s0, s0"
+#endif
+        "push {{r3-r11, lr}}"
+        "mov r1, sp"
+        "bl skiff_call_entry"
+        "pop {{r3-r11, lr}}"
+        "msr psp, r0"
         "isb"
         "bx lr"
     [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
@@ -90,10 +122,10 @@ private[armv7m] const KERNEL_HANDLER_PRIORITY: u8 = 0xff
 private const MASK_PRIORITY: u32 = 0x80
 
 // EXC_RETURN for thread mode on the PSP with no FPU frame: what a new task's context says.
-private const EXC_RETURN_THREAD_PSP: u32 = 0xffff_fffd
+private[armv7m] const EXC_RETURN_THREAD_PSP: u32 = 0xffff_fffd
 
 // xPSR with only the Thumb bit set, the only state a new task's frame needs.
-private const XPSR_THUMB: u32 = 1 << 24
+private[armv7m] const XPSR_THUMB: u32 = 1 << 24
 
 // Lay out `stack` for a task that starts at `entry`, and answer its stack pointer. From the top of the
 // stack down: the eight words the processor pops on exception return (r0-r3, r12, lr, pc, xPSR), then
@@ -131,6 +163,30 @@ start_first(sp: usize) -> never
         [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
     loop
         ()
+
+private const CONTROL_NPRIV: u32 = 1 << 0
+
+// Make thread mode unprivileged, or privileged again, from the return to thread mode: CONTROL.nPRIV,
+// written only from a handler (IPSR not 0); in thread mode it does nothing, and the SVC that starts the
+// first task sets it. The other bits of CONTROL are kept.
+set_thread_privilege(unprivileged: bool)
+    var control: u32 = 0
+    var ipsr: u32 = 0
+    asm
+        [thumb]
+            "mrs {control}, control"
+            "mrs {ipsr}, ipsr"
+            out control : reg
+            out ipsr : reg
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+    if ipsr == 0 then return
+    val next = (control & ~CONTROL_NPRIV) | (if unprivileged then CONTROL_NPRIV else 0)
+    asm
+        [thumb]
+            "msr control, {next}"
+            "isb"
+            in next : reg
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
 
 // Hold off the kernel's handlers on the running core, answering the BASEPRI to restore.
 mask() -> u32

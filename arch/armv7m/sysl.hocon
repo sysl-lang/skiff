@@ -1,7 +1,13 @@
 // Armv7-M and Armv7E-M (Cortex-M3, M4, M7) and the Armv8-M Mainline cores that keep their exception
-// model (Cortex-M33): the vector table, the exception entry that stops the machine, and halting.
+// model (Cortex-M33): the vector table, the exception entry that stops the machine, halting, the context
+// switch, faults that stop a task, kernel calls through SVC, and the PMSAv7 MPU.
 
 package {
   name    = "armv7m"
   version = "0.0.1"
+}
+
+dependencies {
+  kernel { workspace = true }
+  pmsa { workspace = true }
 }

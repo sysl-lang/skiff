@@ -328,10 +328,11 @@ private[kernel] remote(core: u32, me: u32, state: u32) -> bool = core != me && s
 // handle. A core creates tasks on itself at any time; on another core only before that core starts,
 // which is how core 0 gives the other cores their tasks at boot. A task that outranks the running one
 // runs at once.
-create[P: Port](p: *P, core: u32, stack: []u32, entry: *extern() -> never, priority: u8) -> Result[Task, TaskError] = add_task(p, core, stack, entry, priority, NO_MAP)
+create[P: Port](p: *P, core: u32, stack: []u32, entry: *extern() -> never, priority: u8) -> Result[Task, TaskError] = add_task(p, core, stack, entry, priority, false, [], [])
 
-// Create a task as `create` does, with `map` as its map: an empty one for a privileged task.
-private[kernel] add_task[P: Port](p: *P, core: u32, stack: []u32, entry: *extern() -> never, priority: u8, map: Map) -> Result[Task, TaskError]
+// Create a task as `create` does: unprivileged under a map of its stack and `regions`, which
+// `check_map` has passed, and granted `grants`, if `user`; privileged with an empty map otherwise.
+private[kernel] add_task[P: Port](p: *P, core: u32, stack: []u32, entry: *extern() -> never, priority: u8, user: bool, regions: []const Region, grants: []const Grant) -> Result[Task, TaskError]
     if priority == IDLE_PRIORITY || usize(priority) >= PRIORITIES then return Err(TaskError.Priority)
     if usize(core) >= option_cores then return Err(TaskError.NoCore)
     val me = here_id(p)
@@ -341,7 +342,7 @@ private[kernel] add_task[P: Port](p: *P, core: u32, stack: []u32, entry: *extern
     val result = c.sched.free_slot() match
         Some(i) ->
             // The map goes in before the task can run: a reused slot never keeps its last task's.
-            c.maps[i] = map
+            set_map(p, &c.maps[i], user, stack, regions, grants)
             c.sched.add_on(i, stack, p.new_context(stack, entry), priority)
             // Its note is the new task's before the task can run, and before anyone has the handle.
             renew_note(p, core, i, c.sched.handle(core, i))
@@ -437,7 +438,7 @@ run[P: Port](p: *P, idle_stack: []u32, idle: *extern() -> never) -> never
     val _ = p.mask()
     c.sched.free_slot() match
         Some(i) ->
-            c.maps[i] = NO_MAP
+            set_map(p, &c.maps[i], false, idle_stack, [], [])
             c.sched.add_on(i, idle_stack, p.new_context(idle_stack, idle), IDLE_PRIORITY)
         None -> panic("skiff: no slot left for the idle task")
     val sp = c.sched.first()

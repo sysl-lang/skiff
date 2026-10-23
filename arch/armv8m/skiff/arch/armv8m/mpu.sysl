@@ -1,0 +1,129 @@
+module skiff.arch.armv8m
+
+import skiff.arch.pmsa
+import skiff.arch.pmsa.{MpuCtrl, MpuType}
+import skiff.kernel.{Access, Region, RegionError, Slot}
+
+// The Armv8-M memory protection unit (PMSAv8, Architecture Reference Manual B3.9) and the stack limit,
+// for a board's `Protection` and `Isolation` (kernel DESIGN "Protection"). Each core has its own of both.
+//
+// The MPU runs with PRIVDEFENA set, so privileged code sees the default memory map wherever no region
+// says otherwise, and unprivileged code sees only its map. Regions may not overlap: an address two
+// regions match faults, whoever makes the access. That is what the kernel refuses a map for, and what
+// the null guard is made of:
+//   - **The null guard** is the unit's last two regions over the same first `NULL_GUARD_BYTES` of the
+//     address space. PMSAv8 has no encoding that forbids every access, but an address two regions match
+//     always faults, privileged or not, so a read or write through a null pointer, or a small offset
+//     from one, faults.
+//   - **An unprivileged task's map** takes the regions below them.
+//   - **The stack needs no region**: PSPLIM guards it (`guard_stack_v8`).
+//
+// The memory kinds the regions name are MAIR0's attributes 0 (normal) and 1 (device), set by
+// `enable_protection_v8`.
+private struct Mpu8
+    kind: MpuType               // 0xE000_ED90 MPU_TYPE: how many regions
+    ctrl: MpuCtrl               // 0x94
+    rnr: volatile u32           // 0x98 region number
+    rbar: volatile u32          // 0x9c region base address, access and execute-never (`V8Rbar`)
+    rlar: volatile u32          // 0xa0 region limit address, attribute index and enable (`V8Rlar`)
+
+@assert(offsetof(Mpu8, rlar) == 0x10, "MPU_RLAR is at 0xE000EDA0")
+
+private struct Word
+    v: volatile u32
+
+private const MPU: usize = 0xE000_ED90
+private const MAIR0: usize = 0xE000_EDC0
+private mpu() -> *Mpu8 = ptr_cast(MPU)
+
+// How much of the address space from zero faults on any access.
+const NULL_GUARD_BYTES: usize = 256
+
+// The fewest regions a unit needs here: the null guard's two and a map of a stack and a region.
+private const REGIONS_NEEDED: u32 = 4
+
+// How many regions the unit has.
+private regions() -> u32 = u32(mpu().kind.dregion)
+
+// The regions an unprivileged task's map may take: all the unit has but the null guard's two.
+private map_regions() -> u32 = regions() - 2
+
+// How many regions a task's map may take: `Isolation.capacity`.
+capacity_v8() -> usize = usize(map_regions())
+
+// How the unit holds `r`: `Isolation.encode`.
+encode_v8(r: Region) -> Result[Slot, RegionError] = pmsa.encode_v8(r)
+
+// Hold `map` in the first regions, and nothing in the rest of the map's: `Isolation.load`.
+load_v8(map: []const Slot)
+    val m = mpu()
+    for k in 0u32..<map_regions()
+        m.rnr = k
+        if usize(k) < map.len
+            m.rbar = map[usize(k)].first
+            m.rlar = map[usize(k)].second
+        else
+            m.rlar = 0
+    barrier()
+
+// The null guard's region: never executed, read-only, normal memory, over the first bytes. Two of these
+// match every address in it, and that is what faults.
+private null_guard() -> Slot = pmsa.encode_v8(Region(0, NULL_GUARD_BYTES, Access.Read)).unwrap()
+
+// Turn the running core's MPU on with the null guard and no map, and give the regions their memory
+// kinds. Called on each core before it runs its tasks.
+enable_protection_v8()
+    val m = mpu()
+    if regions() < REGIONS_NEEDED then panic("skiff: this core's MPU has too few regions")
+    m.ctrl = MpuCtrl::Bits(0)
+    val mair: *Word = ptr_cast(MAIR0)
+    mair.v = pmsa.V8_MAIR0
+    for k in 0u32..<regions()
+        m.rnr = k
+        m.rlar = 0
+    val g = null_guard()
+    for k in map_regions()..<regions()
+        m.rnr = k
+        m.rbar = g.first
+        m.rlar = g.second
+    m.ctrl = MpuCtrl::Bits(0) with { privdefena = 1, enable = 1 }
+    barrier()
+
+// Make the MPU's new regions hold for the next instruction.
+private barrier()
+    asm
+        [thumb]
+            "dsb"
+            "isb"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv8m is for Armv8-M cores"
+
+// The most the switch writes below a task's stack pointer, rounded up to eight bytes: r4-r11 and
+// EXC_RETURN, and s16-s31 for a task that has used the FPU (armv7m context.sysl), 100 bytes at most.
+const SWITCH_RESERVE: usize = 104
+
+// Guard the stack at `base`, `bytes` long, with PSPLIM: the board's `Protection.guard` on an Armv8-M
+// core. An Armv8-M Mainline core checks every push to the process stack against PSPLIM: a push, or an
+// exception frame, that would put the stack pointer below it is not made, and the core raises a
+// UsageFault with STKOF instead. So the limit guards a stack whatever size of frame crosses it, needs no
+// MPU region and loses no memory to alignment.
+//
+// **The limit sits `SWITCH_RESERVE` bytes above the stack's base.** The switch saves the rest of a task's
+// context below its stack pointer through an ordinary register, which the limit does not check, so a
+// task stopped at its limit still leaves room for that. PSPLIM ignores its low three bits, so the limit
+// is rounded up to eight bytes.
+guard_stack_v8(base: usize, bytes: usize)
+    val at = limit_of(base)
+    if at >= base + bytes then panic("skiff: a task stack too small for its limit")
+    val limit = u32(at)
+    asm
+        [thumb]
+            "msr psplim, {limit}"
+            "isb"
+            in limit : reg
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv8m is for Armv8-M cores"
+
+// Everything below the limit: the switch's reserve and the rounding under it. `Protection.reserved`.
+reserved_v8(base: usize, bytes: usize) -> usize = limit_of(base) - base
+
+// Where the limit of a stack starting at `base` sits.
+private limit_of(base: usize) -> usize = ((base + 7) & ~7usize) + SWITCH_RESERVE

@@ -1,0 +1,156 @@
+module skiff.arch.pmsa
+
+import skiff.kernel.{Access, Region, RegionError, Slot}
+
+// How an Arm memory protection unit holds a region of an unprivileged task's map (kernel
+// isolation.sysl), for the two protected memory system architectures. Each answers a `Slot`: the two
+// words the unit's region registers take, less the region number, which the loader adds. A region the
+// unit cannot hold exactly is refused with the reason, never rounded to one it can.
+//
+// The accesses map onto the units' attributes so:
+//
+// | access    | unprivileged | privileged (v7 / v8) | execute | memory |
+// |-----------|--------------|----------------------|---------|--------|
+// | Read      | read         | read-write / read    | never   | normal, write-back |
+// | ReadWrite | read-write   | read-write           | never   | normal, write-back |
+// | Execute   | read         | read                 | yes     | normal, write-through |
+// | Device    | read-write   | read-write           | never   | device |
+//
+// PMSAv8 has no "privileged read-write, unprivileged read-only" encoding, so on Armv8-M a `Read` region
+// is read-only to privileged code too while its task's map is loaded, interrupt handlers included.
+
+// The span of a region in 64 bits, so that one ending at the top of the 32-bit address space does
+// not wrap: its start and end, or why it has none.
+private span(r: Region) -> Result[(u64, u64), RegionError]
+    if r.bytes == 0 then return Err(Empty)
+    val start = u64(r.base)
+    val end = start + u64(r.bytes)
+    if end > 0x1_0000_0000 then return Err(Wraps)
+    Ok((start, end))
+
+// The registers both architectures share, at 0xE000_ED90 and 0xE000_ED94.
+
+// MPU_TYPE: how many regions the unit has.
+@packed
+struct MpuType
+    separate: volatile u1
+    _: volatile u7
+    dregion: volatile u8
+    iregion: volatile u8
+    _: volatile u8
+
+// MPU_CTRL.
+@packed
+struct MpuCtrl
+    enable: volatile u1
+    hfnmiena: volatile u1           // the regions still hold in HardFault and NMI handlers
+    privdefena: volatile u1         // privileged code sees the default map where no region says otherwise
+    _: volatile u29
+
+// PMSAv7 (Armv7-M Architecture Reference Manual B3.5): RBAR and RASR.
+
+@packed
+struct V7Rbar
+    region: u4
+    valid: u1                       // take the region number from `region`, not from RNR
+    addr: u27                       // the base's bits 5-31
+
+// SIZE says the region is 2^(size + 1) bytes; SRD switches off its eighths, one bit each; TEX, S, C and B
+// are the kind of memory; AP is the access; XN forbids execution.
+@packed
+struct V7Rasr
+    enable: u1
+    size: u5
+    _: u2
+    srd: u8
+    b: u1
+    c: u1
+    s: u1
+    tex: u3
+    _: u2
+    ap: u3
+    _: u1
+    xn: u1
+    _: u3
+
+// AP for each access.
+private const V7_AP_PRIVILEGED_RW_USER_RO: u3 = 0b010
+private const V7_AP_RW: u3 = 0b011
+private const V7_AP_RO: u3 = 0b110
+
+// The smallest PMSAv7 region: 32 bytes. Only a region of 256 bytes or more has subregions, eight of
+// them.
+private const V7_SMALLEST_LOG: u32 = 5
+private const V7_SUBREGION_LOG: u32 = 8
+
+// How a PMSAv7 unit holds `r`: the smallest power-of-two block aligned to its size that contains the
+// region, with the eighths outside the region switched off (RASR.SRD). Refused when no such block
+// covers the region exactly: under 256 bytes the block must be the region itself, and above it the
+// region must begin and end on eighths of the block.
+encode_v7(r: Region) -> Result[Slot, RegionError]
+    val (start, end) = span(r)?
+    var log = V7_SMALLEST_LOG
+    while (start >> u64(log)) != ((end - 1) >> u64(log))
+        log += 1
+    val size = 1u64 << u64(log)
+    val block = start & ~(size - 1)
+    var srd: u8 = 0
+    if start != block || end != block + size
+        if log < V7_SUBREGION_LOG then return Err(NotPowerOfTwo)
+        val eighth = size >> 3
+        if (start - block) % eighth != 0 || (end - block) % eighth != 0 then return Err(NotPowerOfTwo)
+        val first = u32((start - block) / eighth)
+        val last = u32((end - block) / eighth)
+        for k in 0u32..<8
+            if k < first || k >= last then srd |= u8(1u32 << k)
+    val held = V7Rasr::Bits(0) with { enable = 1, size = u5(log - 1), srd = srd, xn = 1 }
+    // Normal write-back memory is TEX 001 with C and B; write-through is TEX 000 with C; shareable
+    // device memory is TEX 000 with S and B.
+    val rasr = r.access match
+        Read -> held with { ap = V7_AP_PRIVILEGED_RW_USER_RO, tex = 0b001, c = 1, b = 1 }
+        ReadWrite -> held with { ap = V7_AP_RW, tex = 0b001, c = 1, b = 1 }
+        Execute -> held with { ap = V7_AP_RO, c = 1, xn = 0 }
+        Device -> held with { ap = V7_AP_RW, s = 1, b = 1 }
+    Ok(Slot(u32(block), rasr.bits))
+
+// PMSAv8 (Armv8-M Architecture Reference Manual B3.9): RBAR and RLAR, with the memory kinds in MAIR0.
+
+private const V8_GRANULE: u64 = 32
+
+@packed
+struct V8Rbar
+    xn: u1
+    ap: u2
+    sh: u2                          // shareability
+    base: u27                       // the base's bits 5-31
+
+@packed
+struct V8Rlar
+    enable: u1
+    attrindx: u3                    // which of MAIR0's attributes the memory has
+    _: u1
+    limit: u27                      // bits 5-31 of the address of the region's last 32 bytes
+
+// AP for each access.
+private const V8_AP_RW: u2 = 0b01        // read-write, privileged or not
+private const V8_AP_RO: u2 = 0b11        // read-only, privileged or not
+
+// The MAIR0 attribute indices, and MAIR0 itself: normal write-back memory, then device memory.
+private const V8_ATTR_NORMAL: u3 = 0
+private const V8_ATTR_DEVICE: u3 = 1
+const V8_MAIR0: u32 = 0xff | (0x04 << 8)     // normal: write-back, read and write allocate; device: nGnRE
+
+// How a PMSAv8 unit holds `r`: its base and its limit (the address of its last 32 bytes). Refused
+// unless both its base and its size are multiples of 32 bytes.
+encode_v8(r: Region) -> Result[Slot, RegionError]
+    val (start, end) = span(r)?
+    if start % V8_GRANULE != 0 || end % V8_GRANULE != 0 then return Err(Unaligned)
+    val base = V8Rbar::Bits(u32(start)) with { xn = 1 }
+    val rbar = r.access match
+        Read -> base with { ap = V8_AP_RO }
+        ReadWrite -> base with { ap = V8_AP_RW }
+        Execute -> base with { ap = V8_AP_RO, xn = 0 }
+        Device -> base with { ap = V8_AP_RW }
+    val attr = if r.access == Device then V8_ATTR_DEVICE else V8_ATTR_NORMAL
+    val rlar = V8Rlar::Bits(u32(end - V8_GRANULE)) with { attrindx = attr, enable = 1 }
+    Ok(Slot(rbar.bits, rlar.bits))

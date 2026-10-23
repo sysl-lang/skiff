@@ -7,8 +7,12 @@ package {
   version = "0.0.1"
 }
 
+// A freestanding image keeps one error return trace for the whole program, and every statement that
+// handles a failure reads and restores it: an unprivileged task, whose map holds none of it, would fault.
+error_traces = false
+
 dependencies {
-  kernel { workspace = true }
+  kernel { workspace = true, options = { tasks = 32 } }
   armv7m { workspace = true }
   mps2 { workspace = true }
   scenarios { workspace = true }

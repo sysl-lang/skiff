@@ -53,6 +53,7 @@ fill_shared_objects()
     fill_shared_messages()
     fill_shared_crossing()
     fill_shared_buffers()
+    fill_shared_protection()
 
 // Work for `ticks` ticks of the time base without blocking or yielding.
 private[scenarios] busy(ticks: u32)

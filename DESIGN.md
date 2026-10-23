@@ -428,7 +428,11 @@ implements both traits and the board delegates.
   `BadArgument`, `BadBuffer`. **A refused call does nothing and touches nothing**; the task runs on.
 - **A malformed trap stops the task**: an SVC number the kernel does not take, a call frame outside the
   task's own stack, a return with no call in flight, a call made inside a call.
-- A privileged task may trap too, and every check passes for it; it has no need to.
+- A privileged task may trap too, and every buffer check passes for it; it has no grants, and no need
+  to trap: it calls the kernel directly.
+- **An unprivileged task's code may touch nothing outside its map**, the runtime's included: a board
+  that runs unprivileged tasks builds with `error_traces = false`, since a freestanding image keeps one
+  error return trace for the whole program, which every statement handling a failure reads and restores.
 
 ### Grants: how a task reaches objects, on its core or another
 

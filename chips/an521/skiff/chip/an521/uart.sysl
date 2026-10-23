@@ -38,3 +38,18 @@ put_byte(n: u32, b: u8)
 write(n: u32, bytes: []const u8)
     for b in bytes
         put_byte(n, b)
+
+// The SSE-200's Secure privilege control for the expansion APB peripherals, APBSPPPCEXP1. A peripheral
+// whose bit is clear answers only privileged accesses: an unprivileged one reads zero and writes nowhere,
+// with no fault, whatever the MPU allows. UART n is bit 5 + n.
+private const APBSPPPCEXP1: usize = 0x5008_00c4
+private const UART0_UNPRIVILEGED: u32 = 1 << 5
+
+private struct Gate
+    v: volatile u32
+
+// Let unprivileged code reach both cores' UARTs, where an MPU region grants them. Called once, by core
+// 0, before core 1 starts.
+open_uarts_to_unprivileged()
+    val g: *Gate = ptr_cast(APBSPPPCEXP1)
+    g.v = g.v | UART0_UNPRIVILEGED | (UART0_UNPRIVILEGED << 1)

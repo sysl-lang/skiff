@@ -1,0 +1,12 @@
+// The Arm protected memory system architectures' region encodings, PMSAv7 (Armv7-M) and PMSAv8
+// (Armv8-M), as pure arithmetic: no register is touched here, so the encodings are tested on the host
+// (`sysl test arch/pmsa`). armv7m and armv8m write what these answer into their MPUs.
+
+package {
+  name    = "pmsa"
+  version = "0.0.1"
+}
+
+dependencies {
+  kernel { workspace = true }
+}

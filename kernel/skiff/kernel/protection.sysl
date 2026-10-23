@@ -89,36 +89,51 @@ enum Violation
 // index. Answers its handle, or why its map or the task was refused, in which case nothing is created.
 // The map is encoded by the running core's unit, which is the owner's kind.
 create_unprivileged[P: Port](p: *P, core: u32, stack: []u32, entry: *extern() -> never, priority: u8, regions: []const Region, grants: []const Grant) -> Result[Task, MapError]
-    val map = build_map(p, Region(usize(&stack[0]), stack.len * 4, Access.ReadWrite), regions, grants)?
-    add_task(p, core, stack, entry, priority, map) match
+    check_map(p, stack_region(stack), regions, grants)?
+    add_task(p, core, stack, entry, priority, true, regions, grants) match
         Ok(t) -> Ok(t)
         Err(why) -> Err(MapError.Refused(why))
 
-// The map of a task whose stack is `stack`, whose creator named `regions` and `grants`, each region
-// encoded by the port's unit, or the first reason it cannot be held exactly.
-private[kernel] build_map[P: Port](p: *P, stack: Region, regions: []const Region, grants: []const Grant) -> Result[Map, MapError]
+// The region a task's own stack is in its map.
+private stack_region(stack: []u32) -> Region = Region(usize(&stack[0]), stack.len * 4, Access.ReadWrite)
+
+// Whether the port's unit holds exactly the map of a task whose stack is `stack` and whose creator named
+// `regions` and `grants`, or the first reason it does not.
+private[kernel] check_map[P: Port](p: *P, stack: Region, regions: []const Region, grants: []const Grant) -> Result[unit, MapError]
     val most = if p.capacity() < option_map_regions then p.capacity() else option_map_regions
     if regions.len + 1 > most then return Err(MapError.TooManyRegions)
     if grants.len > option_grants then return Err(MapError.TooManyGrants)
-    var map = NO_MAP
-    map.user = true
-    map.regions[0] = stack
-    map.slots[0] = p.encode(stack) match
-        Ok(s) -> s
+    p.encode(stack) match
+        Ok(_) -> ()
         Err(why) -> return Err(MapError.Stack(why))
     for k in 0..<regions.len
         val r = regions[k]
-        map.slots[k + 1] = p.encode(r) match
-            Ok(s) -> s
+        p.encode(r) match
+            Ok(_) -> ()
             Err(why) -> return Err(MapError.Bad(k, why))
         if overlaps(r, stack) then return Err(MapError.OverlapsStack(k))
         for j in 0..<k
             if overlaps(regions[j], r) then return Err(MapError.Overlap(j, k))
-        map.regions[k + 1] = r
-    map.len = regions.len + 1
-    for k in 0..<grants.len
-        map.grants[k] = grants[k]
-    Ok(map)
+    Ok(())
+
+// Fill `m`, the map of the task about to take its slot, in place: for an unprivileged task (`user`) its
+// stack and `regions` as the unit holds them, which `check_map` has passed, and `grants`; for a
+// privileged one, nothing. Every field is written, so nothing of the slot's last task is left.
+private[kernel] set_map[P: Port](p: *P, m: *Map, user: bool, stack: []u32, regions: []const Region, grants: []const Grant)
+    m.user = user
+    m.calling = false
+    m.len = 0
+    for k in 0..<option_grants
+        m.grants[k] = if k < grants.len then grants[k] else Grant.Nothing
+    if !user then return
+    m.regions[0] = stack_region(stack)
+    for k in 0..<regions.len
+        m.regions[k + 1] = regions[k]
+    m.len = regions.len + 1
+    for k in 0..<m.len
+        m.slots[k] = p.encode(m.regions[k]) match
+            Ok(s) -> s
+            Err(_) -> panic("skiff: a region the unit held when the map was checked is refused now")
 
 // Whether two regions, each of which the unit holds, share a byte. Each is reckoned by its last byte, so
 // that one ending at the very top of the address space does not wrap to zero.

@@ -20,13 +20,15 @@ import skiff.kernel.{Port, Task, TaskError, TaskState}
 //   - R, at priority 4, at tick 45: A's handle, kept since A was created, is refused now that A has
 //     exited, and still refused once a new task has A's slot. Core 0 of several may not create a task
 //     on core 1, which runs. Then it waits for the waits (waits.sysl), the messages (messages.sysl) and,
-//     on several cores, the waits across cores (crossing.sysl), and the board ends the run.
+//     on several cores, the waits across cores (crossing.sysl). Then it runs the protection scenarios
+//     (protection.sysl), and the board ends the run.
 
 // How many words each task's stack holds: 2 KiB, enough for a kernel call at -O0.
 const STACK_WORDS: usize = 512
 
-// How many stacks each core has: A, B, P1, P2, H, R, the six of the waits, the two of the messages,
-// the two of the inversion across cores (crossing.sysl) and the idle task.
+// How many stacks each core has: A, B, P1, P2, H, R's place (R has a bigger stack of its own,
+// `r_stacks`), the six of the waits, the two of the messages, the two of the inversion across cores
+// (crossing.sysl) and the idle task.
 private const STACKS: usize = 17
 private const IDLE_STACK: usize = 16
 
@@ -55,8 +57,14 @@ struct Entries
     owner: *extern() -> never
     worker: *extern() -> never
     waiter: *extern() -> never
+    echo: *extern() -> never
 
 private var stacks: [kernel.CORES][STACKS][STACK_WORDS]u32
+
+// R's stack is bigger: at -O0, creating the protection scenarios' tasks (protection.sysl) takes more than
+// 2 KiB.
+private const R_STACK_WORDS: usize = 2048
+private var r_stacks: [kernel.CORES][R_STACK_WORDS]u32
 private[scenarios] var epochs: [kernel.CORES]u32
 private var handles: [kernel.CORES]Task
 private var high: [kernel.CORES]Task
@@ -74,7 +82,7 @@ create_tasks[P: Port](p: *P, core: u32, e: *Entries)
     val _ = created(kernel.create(p, core, stacks[core][3], e.p2, 2))
 #endif
     high[core] = created(kernel.create(p, core, stacks[core][4], e.h, 3))
-    val _ = created(kernel.create(p, core, stacks[core][5], e.r, 4))
+    val _ = created(kernel.create(p, core, r_stacks[core], e.r, 4))
     if core == 0
         fill_shared_objects()
     val _ = created(kernel.create(p, core, stacks[core][6], e.low, 1))
@@ -92,7 +100,7 @@ create_tasks[P: Port](p: *P, core: u32, e: *Entries)
         val _ = created(kernel.create(p, core, stacks[core][14], e.owner, 1))
         val _ = created(kernel.create(p, core, stacks[core][15], e.worker, 2))
 
-private created(result: Result[Task, TaskError]) -> Task = result match
+private[scenarios] created(result: Result[Task, TaskError]) -> Task = result match
     Ok(t) -> t
     Err(_) -> panic("skiff: a scenario task was refused")
 

@@ -1,9 +1,56 @@
 module skiff.arch.armv7m
 
-// Faults. Each of the four has its own entry in the vector table, and each entry hands the exception's
-// number to `skiff_fault`, which the board exports: only the board knows its console and whether a fault
-// stops the machine or only the core that took it. The processor has already saved the caller-saved
-// registers on entry, so an ordinary function is a correct handler.
+import skiff.kernel
+import skiff.kernel.{Port, Violation}
+
+// Faults. Each of the four has its own entry in the vector table, which puts the exception's number in r0
+// and EXC_RETURN in r1 and calls `skiff_fault_entry`, which the board exports: only the board knows its
+// console, its port and whether a fault stops the machine or only the core that took it. The board asks
+// `task_fault` first.
+//
+// **A fault the protection raised in a task stops that task alone** (kernel DESIGN "Protection"): a
+// MemManage taken in thread mode on the process stack while the MPU is on (a guard or a map broken), a
+// UsageFault for a stack crossing its limit (STKOF, which an Armv8-M core raises against PSPLIM), and
+// any MemManage, BusFault or UsageFault an unprivileged task takes outside a kernel call. The kernel
+// stops the task and reports it, and `task_fault` answers a fresh frame at the top of the stopped
+// task's stack, since its own may be the very memory that faulted. The entry returns into thread mode on
+// that frame with BASEPRI cleared, and the switch the kernel asked for happens at once, before the frame
+// is ever unstacked: PendSV tail-chains onto the return. Every other fault never returns.
+asm
+    [thumb]
+        ".syntax unified"
+        ".text"
+        ".thumb_func"
+        ".globl skiff_hardfault"
+        "skiff_hardfault:"
+        "movs r0, #3"
+        "b 1f"
+        ".thumb_func"
+        ".globl skiff_memmanage"
+        "skiff_memmanage:"
+        "movs r0, #4"
+        "b 1f"
+        ".thumb_func"
+        ".globl skiff_busfault"
+        "skiff_busfault:"
+        "movs r0, #5"
+        "b 1f"
+        ".thumb_func"
+        ".globl skiff_usagefault"
+        "skiff_usagefault:"
+        "movs r0, #6"
+        "1:"
+        "mov r1, lr"
+        "push {{r4, lr}}"
+        "bl skiff_fault_entry"
+        "pop {{r4, lr}}"
+        "msr psp, r0"
+        "movs r1, #0"
+        "msr basepri, r1"
+        "mvn lr, #2"
+        "isb"
+        "bx lr"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
 
 private struct Word
     v: volatile u32
@@ -14,13 +61,26 @@ private const MEMFAULTENA: u32 = 1 << 16
 private const BUSFAULTENA: u32 = 1 << 17
 private const USGFAULTENA: u32 = 1 << 18
 
-private const HARDFAULT: u32 = 3
+// CFSR, the Configurable Fault Status Register, and MMFAR, the address a MemManage fault names.
+private const CFSR: usize = 0xE000_ED28
+private const MMFAR: usize = 0xE000_ED34
+private const MSTKERR: u32 = 1 << 4         // the exception frame could not be pushed
+private const MMARVALID: u32 = 1 << 7       // MMFAR holds the address that faulted
+private const STKOF: u32 = 1 << 20          // a push crossed the stack limit (Armv8-M)
+
 private const MEMMANAGE: u32 = 4
-private const BUSFAULT: u32 = 5
 private const USAGEFAULT: u32 = 6
 
-// The board's fault handler: report the fault with exception number `exception` and stop.
-extern "skiff_fault" board_fault(exception: u32) -> never
+// EXC_RETURN bit 2: the exception was taken from the process stack.
+private const EXC_RETURN_PSP: u32 = 1 << 2
+
+// FPCCR, whose LSPACT bit says a lazy save of the faulting task's FPU registers is still owed to the frame
+// the fault left behind.
+private const FPCCR: usize = 0xE000_EF34
+private const FPCCR_LSPACT: u32 = 1 << 0
+
+// xPSR with only the Thumb bit set.
+private const THUMB: u32 = 1 << 24
 
 // Give the running core's MemManage, BusFault and UsageFault their own handlers. Left off, each arrives
 // as a HardFault.
@@ -28,17 +88,56 @@ enable_faults()
     val shcsr: *Word = ptr_cast(SHCSR)
     shcsr.v = shcsr.v | MEMFAULTENA | BUSFAULTENA | USGFAULTENA
 
-@export("skiff_hardfault")
-hardfault() -> never = board_fault(HARDFAULT)
+// For the board's `skiff_fault_entry`: if fault `exception`, taken with `exc_return`, is one the running
+// task's protection raised, stop that task, and answer the process stack to return on. None for every
+// other fault, which the board then reports and stops on.
+task_fault[P: Port](p: *P, exception: u32, exc_return: u32) -> Option[usize]
+    if (exc_return & EXC_RETURN_PSP) == 0 || exception < MEMMANAGE || exception > USAGEFAULT then return None
+    val cfsr: *Word = ptr_cast(CFSR)
+    val status = cfsr.v
+    val limited = exception == USAGEFAULT && (status & STKOF) != 0
+    val guarded = exception == MEMMANAGE && protection_on()
+    if !limited && !guarded && !kernel.running_unprivileged(p) then return None
+    val why = if overflowed(p, status) then Violation.Overflow else Violation.Breach
+    cfsr.v = status         // the status bits clear when written with ones
+    stop(p, why)
 
-@export("skiff_memmanage")
-memmanage() -> never = board_fault(MEMMANAGE)
+// Whether a fault with status `status` is the running task's stack overflowing: it crossed its limit, the
+// processor could not push the exception's frame, or the address that faulted is in the stack's reserve.
+private overflowed[P: Port](p: *P, status: u32) -> bool
+    if (status & (STKOF | MSTKERR)) != 0 then return true
+    if (status & MMARVALID) == 0 then return false
+    val (base, bytes) = kernel.running_stack(p)
+    val mmfar: *Word = ptr_cast(MMFAR)
+    val at = usize(mmfar.v)
+    at >= base && at < base + p.reserved(base, bytes)
 
-@export("skiff_busfault")
-busfault() -> never = board_fault(BUSFAULT)
+// Stop the running task for `why`, and answer a frame at the top of its stack that would start
+// `stopped_task`, which it never does: the switch away from the task comes first. None when the kernel
+// cannot stop the running task.
+private[armv7m] stop[P: Port](p: *P, why: Violation) -> Option[usize]
+    val top = kernel.stop_running(p, why)?
+    drop_lazy_fpu_state()
+    val frame: *u32 = ptr_cast((top & ~7usize) - 32)
+    for i in 0..<6
+        frame[i] = 0
+    frame[6] = u32(usize(&stopped_task)) & ~1u32
+    frame[7] = THUMB
+    Some(usize(frame))
 
-@export("skiff_usagefault")
-usagefault() -> never = board_fault(USAGEFAULT)
+private stopped_task() -> never
+    loop
+        ()
+
+// Forget a lazy save of FPU registers still owed to a frame that will never be returned through. A core
+// built with no FPU registers owes none.
+private[armv7m] drop_lazy_fpu_state()
+#if fpu
+    val fpccr: *Word = ptr_cast(FPCCR)
+    fpccr.v = fpccr.v & ~FPCCR_LSPACT
+#else
+    ()
+#endif
 
 // The name of exception `n`, as a fault report reads it.
 exception_name(n: u32) -> string = n match
@@ -46,6 +145,7 @@ exception_name(n: u32) -> string = n match
     4 -> "MemManage"
     5 -> "BusFault"
     6 -> "UsageFault"
+    11 -> "SVCall"
     _ -> "exception"
 
 // Stop the running core for good and leave the others running: no interrupt is taken again, and the
