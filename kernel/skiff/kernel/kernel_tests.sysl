@@ -22,6 +22,37 @@ private[kernel] struct Recorder
     channel: *Channel[1]        // a channel to look at likewise (null: none)
     free_then: u32      // what `pool` had available at the last clean or invalidate
     waiting_then: u32   // what `channel` held at the last clean or invalidate
+    guards: u32         // how many stacks the kernel guarded
+    guarded: usize      // the base of the last one
+    loads: u32          // how many maps the kernel loaded, empty ones among them
+    loaded: usize       // how many regions the last one had
+    unprivileged: bool  // the privilege the kernel last set
+    unit: usize         // how many regions a map may take on its unit
+    reserve: usize      // the bytes at the bottom of every stack its guard takes
+
+// A protection unit that records what it is asked. It holds a region whose base and size are multiples of
+// 32 bytes, as PMSAv8 does, as the two words base and size.
+impl Protection for Recorder
+    guard(*self, base: usize, bytes: usize)
+        self.guards += 1
+        self.guarded = base
+
+    reserved(*self, base: usize, bytes: usize) -> usize = self.reserve
+
+impl Isolation for Recorder
+    capacity(*self) -> usize = self.unit
+
+    encode(*self, r: Region) -> Result[Slot, RegionError]
+        if r.bytes == 0 then return Err(RegionError.Empty)
+        if r.base % 32 != 0 || r.bytes % 32 != 0 then return Err(RegionError.Unaligned)
+        Ok(Slot(u32(r.base & 0xffff_ffff), u32(r.bytes)))
+
+    load(*self, map: []const Slot)
+        self.loads += 1
+        self.loaded = map.len
+
+    privilege(*self, unprivileged: bool)
+        self.unprivileged = unprivileged
 
 // A data cache that records what it is asked and, at that step, how full the watched pool and channel
 // are: what tells whether a buffer was cleaned before it could be seen and invalidated after it was taken.
@@ -83,10 +114,10 @@ impl Doorbell for Recorder
     ring(*self, core: u32) = panic("one core never rings")
     clear(*self) = panic("one core never rings")
 
-private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, [], [], null, null, 0, 0)
+private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, [], [], null, null, 0, 0, 0, 0, 0, 0, false, 8, 0)
 
 // Whether `r` recorded exactly `want`.
-private recorded(r: *Recorder, want: string) -> bool
+private[kernel] recorded(r: *Recorder, want: string) -> bool
     val w = want.bytes
     if r.used != w.len then return false
     for i in 0..<w.len
@@ -140,8 +171,8 @@ deadline_across_wrap()
 @test("core 0's tick advances the time base and another core's does not")
 only_core_0_keeps_time()
     var time: Atomic[u32] = Atomic(0)
-    var first = Core(0, Atomic(0), false, EMPTY_SCHEDULER)
-    var second = Core(1, Atomic(0), false, EMPTY_SCHEDULER)
+    var first = Core(0, Atomic(0), false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false)
+    var second = Core(1, Atomic(0), false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false)
     first.tick(&time)
     second.tick(&time)
     second.tick(&time)
@@ -154,7 +185,7 @@ only_core_0_keeps_time()
 @test("the time base wraps from the largest u32 to 0")
 time_base_wraps()
     var time: Atomic[u32] = Atomic(0xffff_ffff)
-    var first = Core(0, Atomic(0xffff_ffff), false, EMPTY_SCHEDULER)
+    var first = Core(0, Atomic(0xffff_ffff), false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false)
     first.tick(&time)
     assert_eq(time.load(), 0)
     assert_eq(first.own_ticks(), 0)

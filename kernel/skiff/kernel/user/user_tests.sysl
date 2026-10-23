@@ -1,0 +1,109 @@
+module skiff.kernel.user
+@tests
+
+import sysl.sync.Atomic
+import skiff.kernel
+import skiff.kernel.{Access, Cache, Doorbell, Grant, Isolation, Port, Protection, Region, RegionError, Semaphore, Slot}
+
+// `skiff.kernel.user` on the host: its trap lays the call's frame in the running task's stack and goes
+// through `begin_call`, `serve_call` and `end_call`, as the port's trap handler does, so each function
+// is checked against the call it makes and the answer it reads back.
+
+// One core whose console is a buffer, and whose unit holds 32-byte-granular regions.
+struct Desk
+    said: [64]u8
+    used: usize
+    masked: u32
+
+impl Port for Desk
+    write(*self, bytes: []const u8)
+        for b in bytes
+            self.said[self.used] = b
+            self.used += 1
+    cores(*self) -> u32 = 1
+    core_id(*self) -> u32 = 0
+    start_ticks(*self, hz: u32) = ()
+    idle(*self) = kernel.tick(self)
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize = usize(&stack[0])
+    request_switch(*self) = ()
+    start_first(*self, sp: usize) -> never = panic("the host runs no task")
+    mask(*self) -> u32
+        self.masked += 1
+        self.masked - 1
+    restore(*self, state: u32)
+        self.masked = state
+    spin_lock(*self, word: *Atomic[u32]) = panic("one core never spins")
+    spin_try_lock(*self, word: *Atomic[u32]) -> bool = panic("one core never spins")
+    spin_unlock(*self, word: *Atomic[u32]) = panic("one core never spins")
+
+impl Doorbell for Desk
+    ring(*self, core: u32) = panic("one core never rings")
+    clear(*self) = panic("one core never rings")
+
+impl Cache for Desk
+    clean(*self, bytes: []const u8) = ()
+    invalidate(*self, bytes: []u8) = ()
+
+impl Protection for Desk
+    guard(*self, base: usize, bytes: usize) = ()
+    reserved(*self, base: usize, bytes: usize) -> usize = 0
+
+impl Isolation for Desk
+    capacity(*self) -> usize = 8
+    encode(*self, r: Region) -> Result[Slot, RegionError]
+        if r.bytes == 0 || r.base % 32 != 0 || r.bytes % 32 != 0 then return Err(RegionError.Unaligned)
+        Ok(Slot(u32(r.base & 0xffff_ffff), u32(r.bytes)))
+    load(*self, map: []const Slot) = ()
+    privilege(*self, unprivileged: bool) = ()
+
+private var desk: Desk = Desk([0; 64], 0, 0)
+
+@align(32)
+private var stack: [64]u32
+@align(32)
+private var said: [32]u8
+
+// The trap, as the port's handler makes it: the call's frame in the task's stack, recorded, served on
+// the task's behalf, and ended.
+@export("skiff_trap")
+private host_trap(number: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> usize
+    val frame = usize(&stack[32])
+    val words: *usize = ptr_cast(frame)
+    words[0] = a0
+    words[1] = a1
+    words[2] = a2
+    words[3] = a3
+    words[4] = number
+    if !kernel.begin_call(&desk, frame, 64, 32) then panic("the call's frame was refused")
+    val r = kernel.serve_call(&desk)
+    if !kernel.end_call(&desk) then panic("the call did not end")
+    r
+
+private body() -> never
+    loop
+        ()
+
+@test("each user function makes its call and reads its answer; a refusal is an Err naming why")
+user_calls()
+    var s = Semaphore.new("s", 0, 1)
+    val t = kernel.create_unprivileged(&desk, 0, stack, &body, 2, [Region(usize(&said[0]), 32, Access.Read)], [Grant.Units(&s)]).unwrap()
+    val _ = kernel.here(&desk).sched.first()
+    assert(current() == t, "its own handle")
+    assert_eq(ticks(), kernel.ticks())
+    assert(give(0) == Ok(true), "a give")
+    assert(give(0) == Ok(false), "a give past the semaphore's room")
+    assert(take(0, 0) == Ok(true), "a take")
+    assert(take(1, 0) == Err(Refusal.BadHandle), "a grant it was not given")
+    said[0] = u8('o')
+    said[1] = u8('k')
+    assert(write(said[0..<2]) == Ok(2), "a write of its own bytes")
+    assert_eq(desk.used, 2)
+    assert_eq(desk.said[1], u8('k'))
+    var mine: [4]u8 = [0; 4]
+    assert(write(mine) == Err(Refusal.BadBuffer), "bytes on the host's stack, outside its map")
+    assert(notify(kernel.task_handle(0, 9, 1), 1, kernel.Action.SetBits) == Err(Refusal.BadHandle), "a task that does not exist")
+    assert(notify(t, 3, kernel.Action.SetBits) == Ok(true), "itself")
+    var into: u32 = 0
+    assert(notify_wait(0, 0, &into, 0) == Err(Refusal.BadBuffer), "a word outside its map")
+    assert(wait(0, 1, false, false, 0) == Err(Refusal.BadHandle), "flags it was not given")
+    assert_eq(desk.used, 2)

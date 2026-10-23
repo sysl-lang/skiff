@@ -65,6 +65,7 @@ enum TaskState
     Ready           // in its priority's FIFO; the running task is ready too
     Sleeping        // in the timeout list, or asleep for good
     Blocked         // waiting on an object (waits.sysl), and in the timeout list if the wait has one
+    Stopped         // stopped for good by a fault its protection raised (protection.sysl), until deleted
 
 // One slot of a core's table: private to the core, and never pointed at from `.shared`.
 struct Tcb
@@ -79,9 +80,11 @@ struct Tcb
     base: u8            // the priority the task was given
     held: u8            // how many mutexes it holds
     on: Option[*Waitable]   // what its last wait was on
+    stack: usize        // where its stack starts, and how many bytes it has: what the guard protects
+    stack_bytes: usize
 
 // An empty slot, in its first generation.
-private[kernel] val FREE_TCB: Tcb = Tcb(0, 0, TaskState.Free, 1, NONE, NONE, 0, NONE, 0, 0, None)
+private[kernel] val FREE_TCB: Tcb = Tcb(0, 0, TaskState.Free, 1, NONE, NONE, 0, NONE, 0, 0, None, 0, 0)
 
 // One core's table and the choices made over it. It holds no hardware state, so the host tests drive
 // one directly; each core's is in its `Core`.
@@ -108,6 +111,12 @@ impl Scheduler
         for i in 0..<option_tasks
             if self.tasks[i].state == TaskState.Free && i != usize(self.running) then return Some(i)
         None
+
+    // Put a ready task in free slot `i`, on `stack`, its saved stack pointer `sp`.
+    add_on(*self, i: usize, stack: []u32, sp: usize, priority: u8)
+        self.tasks[i].stack = usize(&stack[0])
+        self.tasks[i].stack_bytes = stack.len * 4
+        self.add_at(i, sp, priority)
 
     // Put a ready task in free slot `i`, its saved stack pointer `sp`.
     add_at(*self, i: usize, sp: usize, priority: u8)
@@ -178,6 +187,14 @@ impl Scheduler
         val i = usize(self.running)
         self.unlink(i)
         self.tasks[i].state = TaskState.Sleeping
+        self.tasks[i].later = NONE
+
+    // The running task stops for good: it waits in no list and is never made ready again, but keeps its
+    // slot, so its handle still names it.
+    stop(*self)
+        val i = usize(self.running)
+        self.unlink(i)
+        self.tasks[i].state = TaskState.Stopped
         self.tasks[i].later = NONE
 
     // One of the owner's ticks, at time `now`: wake every sleeper whose deadline has come, then end the
@@ -311,7 +328,10 @@ private[kernel] remote(core: u32, me: u32, state: u32) -> bool = core != me && s
 // handle. A core creates tasks on itself at any time; on another core only before that core starts,
 // which is how core 0 gives the other cores their tasks at boot. A task that outranks the running one
 // runs at once.
-create[P: Port](p: *P, core: u32, stack: []u32, entry: *extern() -> never, priority: u8) -> Result[Task, TaskError]
+create[P: Port](p: *P, core: u32, stack: []u32, entry: *extern() -> never, priority: u8) -> Result[Task, TaskError] = add_task(p, core, stack, entry, priority, NO_MAP)
+
+// Create a task as `create` does, with `map` as its map: an empty one for a privileged task.
+private[kernel] add_task[P: Port](p: *P, core: u32, stack: []u32, entry: *extern() -> never, priority: u8, map: Map) -> Result[Task, TaskError]
     if priority == IDLE_PRIORITY || usize(priority) >= PRIORITIES then return Err(TaskError.Priority)
     if usize(core) >= option_cores then return Err(TaskError.NoCore)
     val me = here_id(p)
@@ -320,7 +340,9 @@ create[P: Port](p: *P, core: u32, stack: []u32, entry: *extern() -> never, prior
     val state = p.mask()
     val result = c.sched.free_slot() match
         Some(i) ->
-            c.sched.add_at(i, p.new_context(stack, entry), priority)
+            // The map goes in before the task can run: a reused slot never keeps its last task's.
+            c.maps[i] = map
+            c.sched.add_on(i, stack, p.new_context(stack, entry), priority)
             // Its note is the new task's before the task can run, and before anyone has the handle.
             renew_note(p, core, i, c.sched.handle(core, i))
             if core == me && c.sched.outranks_running(i) then p.request_switch()
@@ -414,9 +436,13 @@ run[P: Port](p: *P, idle_stack: []u32, idle: *extern() -> never) -> never
     if c.sched.started() then panic("skiff: the core already runs its tasks")
     val _ = p.mask()
     c.sched.free_slot() match
-        Some(i) -> c.sched.add_at(i, p.new_context(idle_stack, idle), IDLE_PRIORITY)
+        Some(i) ->
+            c.maps[i] = NO_MAP
+            c.sched.add_on(i, idle_stack, p.new_context(idle_stack, idle), IDLE_PRIORITY)
         None -> panic("skiff: no slot left for the idle task")
-    p.start_first(c.sched.first())
+    val sp = c.sched.first()
+    protect_running(p, c)
+    p.start_first(sp)
 
 // The switch: called by the port with the running task's stack pointer `sp`; answers the stack pointer
 // of the task to run next.
@@ -424,6 +450,7 @@ switch_context[P: Port](p: *P, sp: usize) -> usize
     val c = here(p)
     val state = p.mask()
     val next = c.sched.switch(sp)
+    protect_running(p, c)
     p.restore(state)
     next
 

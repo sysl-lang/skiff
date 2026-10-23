@@ -1,0 +1,155 @@
+module skiff.kernel
+
+// Kernel calls from unprivileged tasks (DESIGN "Kernel calls").
+//
+// An unprivileged task cannot run kernel code itself: the code would run under the task's map, and the
+// task cannot mask the interrupts that use the kernel. So every call it makes goes through the port's
+// trap, and the kernel runs it privileged on the task's behalf:
+//   1. The task traps with a call number and four word arguments (`skiff.kernel.user` has a function
+//      per call).
+//   2. The port's trap handler passes the frame the trap left to `begin_call`, which checks that the
+//      frame lies in the task's own stack and records the call. The port then runs `serve_call` in the
+//      task's own thread, privileged, on the task's stack below the frame. So a call may block and be
+//      switched away from like any other kernel code.
+//   3. When `serve_call` answers, the port traps again; `end_call` clears the record, and the port drops
+//      the privilege and hands the answer back as the trap's result.
+//
+// **`dispatch` checks everything the task passed before acting on it.** A task's handle is checked as
+// every handle is; a grant must be in the caller's own list and of the kind the call needs; a buffer must
+// lie wholly in one region of the caller's map with the access the call needs (`may_reach`). A call that
+// fails a check is refused: it answers one of the `REFUSED_*` values, does nothing, and touches no memory.
+// The task runs on. A trap whose frame does not lie in the task's own stack is another matter: the port
+// stops the task, as a fault would.
+
+// The calls, by number.
+const CALL_YIELD: usize = 0         // yield_now()
+const CALL_SLEEP: usize = 1         // sleep(ticks)
+const CALL_TICKS: usize = 2         // ticks(): the time base
+const CALL_CURRENT: usize = 3       // the caller's own handle
+const CALL_NOTIFY: usize = 4        // notify(task, value, action): 1 if sent, 0 if not
+const CALL_NOTIFY_WAIT: usize = 5   // notify_wait(clear on entry, clear on exit, into, timeout): 1 and the value in the word at `into`, or 0
+const CALL_TAKE: usize = 6          // grant `g`, a semaphore: take(timeout), 1 or 0
+const CALL_GIVE: usize = 7          // grant `g`, a semaphore: give(), 1 or 0
+const CALL_SET: usize = 8           // grant `g`, flags: set(bits), the bits after
+const CALL_WAIT: usize = 9          // grant `g`, flags: wait(wanted, mode, timeout), the bits it ended on, or 0 if none came
+const CALL_WRITE: usize = 10        // write(bytes at address, length) on the core's console: the length
+
+// The mode bits of `CALL_WAIT`.
+const WAIT_ALL: usize = 1           // every wanted bit, not any one of them
+const WAIT_CLEAR: usize = 2         // clear the wanted bits once the wait is answered
+
+// The answers of a refused call, the top four values of a word: no count a call answers comes near them.
+// Any answer at or above `REFUSED` is a refusal. `CALL_TICKS` is never refused, so the time base may take
+// any value.
+const REFUSED_CALL: usize = usize::Max - 3          // no call has this number
+const REFUSED_HANDLE: usize = usize::Max - 2        // no task has this handle, or the caller was granted no such object
+const REFUSED_ARGUMENT: usize = usize::Max - 1      // an argument is out of range
+const REFUSED_BUFFER: usize = usize::Max            // a buffer is not wholly inside one region of the caller's map that allows the access
+const REFUSED: usize = REFUSED_CALL
+
+// For the port's trap handler: record the call whose frame, `bytes` long, is at `frame` in the running
+// task's stack. The frame's first five words are a `CallFrame`; `room` is how many bytes below it the port
+// will use to run the call. Answers false, recording nothing, if the frame or the room below it lies
+// outside the task's stack above its reserve, or the task is in a call already; the port then stops the
+// task.
+begin_call[P: Port](p: *P, frame: usize, bytes: usize, room: usize) -> bool
+    val c = here(p)
+    if !c.sched.started() then return false
+    val i = usize(c.sched.running)
+    val t = &c.sched.tasks[i]
+    if c.maps[i].calling then return false
+    val low = u64(t.stack) + u64(p.reserved(t.stack, t.stack_bytes))
+    val top = u64(t.stack) + u64(t.stack_bytes)
+    if u64(frame) < low + u64(room) || u64(frame) + u64(bytes) > top then return false
+    val f: *CallFrame = ptr_cast(frame)
+    val state = p.mask()
+    c.maps[i].call = *f
+    c.maps[i].calling = true
+    p.restore(state)
+    true
+
+// Run the running task's recorded call, in its own thread and privileged, and answer the call's result.
+serve_call[P: Port](p: *P) -> usize
+    val c = here(p)
+    val i = usize(c.sched.running)
+    dispatch(p, c, i, c.maps[i].call)
+
+// For the port's trap handler, when a call's code has answered: answers false if the running task was not
+// in a call, so that the trap came from the task itself, and the port stops it.
+end_call[P: Port](p: *P) -> bool
+    val c = here(p)
+    if !c.sched.started() then return false
+    val i = usize(c.sched.running)
+    if !c.maps[i].calling then return false
+    val state = p.mask()
+    c.maps[i].calling = false
+    p.restore(state)
+    true
+
+// Run call `call` for task `i` of core `c`, which is running, after checking its handles, grants and
+// buffers.
+private[kernel] dispatch[P: Port](p: *P, c: *Core, i: usize, call: CallFrame) -> usize
+    val a = call.args
+    call.number match
+        CALL_YIELD ->
+            yield_now(p)
+            0
+        CALL_SLEEP ->
+            sleep(p, u32(a[0]))
+            0
+        CALL_TICKS -> usize(ticks())
+        CALL_CURRENT -> usize(current(p).bits)
+        CALL_NOTIFY ->
+            if a[0] > 0xffff_ffff then return REFUSED_HANDLE
+            val action = action_of(a[2]) match
+                Some(n) -> n
+                None -> return REFUSED_ARGUMENT
+            notify(p, Task(u32(a[0])), u32(a[1]), action) match
+                Ok(sent) -> if sent then 1 else 0
+                Err(_) -> REFUSED_HANDLE
+        CALL_NOTIFY_WAIT ->
+            if a[2] % 4 != 0 || !may_reach(p, c, i, a[2], 4, true) then return REFUSED_BUFFER
+            notify_wait(p, u32(a[0]), u32(a[1]), u32(a[3])) match
+                Some(v) ->
+                    val into: *u32 = ptr_cast(a[2])
+                    *into = v
+                    1
+                None -> 0
+        CALL_TAKE ->
+            granted(c, i, a[0]) match
+                Grant.Units(s) -> if s.take(p, u32(a[1])) then 1 else 0
+                _ -> REFUSED_HANDLE
+        CALL_GIVE ->
+            granted(c, i, a[0]) match
+                Grant.Units(s) -> if s.give(p) then 1 else 0
+                _ -> REFUSED_HANDLE
+        CALL_SET ->
+            granted(c, i, a[0]) match
+                Grant.Bits(f) -> usize(f.set(p, u32(a[1])))
+                _ -> REFUSED_HANDLE
+        CALL_WAIT ->
+            val f = granted(c, i, a[0]) match
+                Grant.Bits(f) -> f
+                _ -> return REFUSED_HANDLE
+            if a[1] == 0 || a[1] > 0xffff_ffff || a[2] > (WAIT_ALL | WAIT_CLEAR) then return REFUSED_ARGUMENT
+            f.wait(p, u32(a[1]), (a[2] & WAIT_ALL) != 0, (a[2] & WAIT_CLEAR) != 0, u32(a[3])) match
+                Some(bits) -> usize(bits)
+                None -> 0
+        CALL_WRITE ->
+            if !may_reach(p, c, i, a[0], a[1], false) then return REFUSED_BUFFER
+            if a[1] > 0
+                val at: *u8 = ptr_cast(a[0])
+                p.write(at[0..<a[1]])
+            a[1]
+        _ -> REFUSED_CALL
+
+// Grant `g` of task `i` of core `c`: `Nothing` past the end of its list.
+private granted(c: *Core, i: usize, g: usize) -> Grant = if g >= option_grants then Grant.Nothing else c.maps[i].grants[g]
+
+// The action a call's argument names: 0 to 3 in `Action`'s order.
+private action_of(n: usize) -> Option[Action] = n match
+    0 -> Some(Action.SetBits)
+    1 -> Some(Action.Increment)
+    2 -> Some(Action.Overwrite)
+    3 -> Some(Action.NoOverwrite)
+    _ -> None

@@ -1,0 +1,208 @@
+module skiff.kernel
+
+// Protection (DESIGN "Protection"): every task's stack guarded, and unprivileged tasks that each run
+// under a map of the memory they may reach.
+//
+// A privileged task (`create`) reaches everything, as the kernel does. An unprivileged one
+// (`create_unprivileged`) reaches only its map: its own stack, read and written and never executed, and
+// the regions its creator names, such as its code and a buffer it shares. Everything else faults on the
+// first access, and the fault stops that task alone. Its kernel calls go through a trap (calls.sysl),
+// and it names the kernel objects it was granted by their index in its own grant list.
+//
+// Each core keeps its tasks' maps in its private `Core`, beside their rows in its table, and programs
+// only its own unit: on every switch it guards the incoming task's stack, loads that task's map, and
+// sets thread mode's privilege.
+
+// How a region of a task's map may be reached by the task.
+enum Access
+    Read                // read only, never executed: data the task may look at but not change
+    ReadWrite           // read and written, never executed: its stack, a buffer it shares
+    Execute             // read and executed, never written: code and the constants beside it
+    Device              // a peripheral's registers: read and written in order, never cached or executed
+
+// A run of memory a task may reach, and how.
+struct Region
+    base: usize
+    bytes: usize
+    access: Access
+
+// A region as a protection unit holds it: two words, whose meaning is the unit's.
+struct Slot
+    first: u32
+    second: u32
+
+val NO_SLOT: Slot = Slot(0, 0)
+val NO_REGION: Region = Region(0, 0, Access.Read)
+
+// Why a protection unit cannot hold a region exactly.
+enum RegionError
+    Empty               // it has no bytes
+    Wraps               // it runs past the top of the address space
+    Unaligned           // its base or its end is off the unit's granule (32 bytes on PMSAv8)
+    NotPowerOfTwo       // no power-of-two block aligned to its size, less whole eighths, is exactly it (PMSAv7)
+
+// Why a task's map was refused at creation. A region is named by its index in the list the creator gave.
+enum MapError derives Eq
+    TooManyRegions                          // more than the unit, or `option_map_regions`, holds beside the stack
+    TooManyGrants                           // more than `option_grants` objects
+    Stack(why: RegionError)                 // the unit cannot hold the task's stack as one region
+    Bad(region: usize, why: RegionError)    // the unit cannot hold this region
+    Overlap(first: usize, second: usize)    // these two regions share bytes
+    OverlapsStack(region: usize)            // this region shares bytes with the task's stack
+    Refused(why: TaskError)                 // the task itself was refused, as `create` refuses one
+
+// A kernel object an unprivileged task may use through its calls. The object itself is in no map: the
+// kernel reaches it on the task's behalf.
+enum Grant
+    Nothing
+    Units(semaphore: *Semaphore)    // take and give
+    Bits(flags: *Flags)             // set and wait
+
+// A kernel call in flight: the four arguments the task passed and the call's number, as the port's trap
+// leaves them (calls.sysl).
+struct CallFrame
+    args: [4]usize
+    number: usize
+
+// What a core keeps for each of its tasks beside its row in the table: for an unprivileged task, its map
+// and its grants; for a privileged one, nothing.
+struct Map
+    user: bool                              // the task runs unprivileged
+    calling: bool                           // it is inside a kernel call, which runs privileged
+    len: usize                              // regions in use
+    regions: [option_map_regions]Region     // the stack first, then the creator's regions
+    slots: [option_map_regions]Slot         // the same, as the unit holds them
+    grants: [option_grants]Grant            // the objects it may name, by index
+    call: CallFrame                         // the call it is making, while `calling`
+
+// A privileged task's map: nothing.
+val NO_MAP: Map = Map(false, false, 0, [NO_REGION; option_map_regions], [NO_SLOT; option_map_regions], [Grant.Nothing; option_grants], CallFrame([0; 4], 0))
+
+// What a task broke, as a fault that stops it reports it.
+enum Violation
+    Overflow            // its stack ran into its guard
+    Breach              // it reached memory its protection does not let it reach
+    Trap                // it made a trap the kernel does not take
+
+// Create an unprivileged task, as `create` creates a privileged one, on core `core`, running `entry` on
+// `stack` at `priority`. It may reach its stack and `regions`, and name `grants` in its calls by their
+// index. Answers its handle, or why its map or the task was refused, in which case nothing is created.
+// The map is encoded by the running core's unit, which is the owner's kind.
+create_unprivileged[P: Port](p: *P, core: u32, stack: []u32, entry: *extern() -> never, priority: u8, regions: []const Region, grants: []const Grant) -> Result[Task, MapError]
+    val map = build_map(p, Region(usize(&stack[0]), stack.len * 4, Access.ReadWrite), regions, grants)?
+    add_task(p, core, stack, entry, priority, map) match
+        Ok(t) -> Ok(t)
+        Err(why) -> Err(MapError.Refused(why))
+
+// The map of a task whose stack is `stack`, whose creator named `regions` and `grants`, each region
+// encoded by the port's unit, or the first reason it cannot be held exactly.
+private[kernel] build_map[P: Port](p: *P, stack: Region, regions: []const Region, grants: []const Grant) -> Result[Map, MapError]
+    val most = if p.capacity() < option_map_regions then p.capacity() else option_map_regions
+    if regions.len + 1 > most then return Err(MapError.TooManyRegions)
+    if grants.len > option_grants then return Err(MapError.TooManyGrants)
+    var map = NO_MAP
+    map.user = true
+    map.regions[0] = stack
+    map.slots[0] = p.encode(stack) match
+        Ok(s) -> s
+        Err(why) -> return Err(MapError.Stack(why))
+    for k in 0..<regions.len
+        val r = regions[k]
+        map.slots[k + 1] = p.encode(r) match
+            Ok(s) -> s
+            Err(why) -> return Err(MapError.Bad(k, why))
+        if overlaps(r, stack) then return Err(MapError.OverlapsStack(k))
+        for j in 0..<k
+            if overlaps(regions[j], r) then return Err(MapError.Overlap(j, k))
+        map.regions[k + 1] = r
+    map.len = regions.len + 1
+    for k in 0..<grants.len
+        map.grants[k] = grants[k]
+    Ok(map)
+
+// Whether two regions, each of which the unit holds, share a byte. Each is reckoned by its last byte, so
+// that one ending at the very top of the address space does not wrap to zero.
+private overlaps(a: Region, b: Region) -> bool = a.base <= last_byte(b) && b.base <= last_byte(a)
+
+// The address of a region's last byte; it has at least one.
+private last_byte(r: Region) -> usize = r.base + (r.bytes - 1)
+
+// Whether task `i` of core `c` may hand the kernel the `bytes` bytes at `addr`, to be read, or written
+// too if `write`. A privileged task may hand it anything. An unprivileged one must hand it bytes lying
+// wholly inside one region of its map whose access allows it: its stack above the stack's reserve, a
+// `ReadWrite` region, or for reading only a `Read` or `Execute` one. A buffer straddling two regions is
+// refused even when both would allow it, and a `Device` region is never a buffer: the kernel copies with
+// ordinary loads and stores. An empty buffer reaches nothing, and is allowed.
+private[kernel] may_reach[P: Port](p: *P, c: *Core, i: usize, addr: usize, bytes: usize, write: bool) -> bool
+    val m = &c.maps[i]
+    if !m.user || bytes == 0 then return true
+    if bytes - 1 > usize::Max - addr then return false
+    val last = addr + (bytes - 1)
+    for k in 0..<m.len
+        val r = m.regions[k]
+        val low = if k == 0 then r.base + p.reserved(r.base, r.bytes) else r.base
+        val inside = addr >= low && last <= last_byte(r)
+        val allowed = r.access match
+            Access.ReadWrite -> true
+            Access.Read | Access.Execute -> !write
+            Access.Device -> false
+        if inside && allowed then return true
+    false
+
+// Guard the running task's stack on core `c`, load its map if it is unprivileged or empty the unit after
+// an unprivileged task, and set thread mode's privilege: unprivileged exactly while an unprivileged task
+// outside a call runs. Called with the core's interrupts masked, on every switch and before the first.
+private[kernel] protect_running[P: Port](p: *P, c: *Core)
+    val i = usize(c.sched.running)
+    p.guard(c.sched.tasks[i].stack, c.sched.tasks[i].stack_bytes)
+    val m = &c.maps[i]
+    if m.user
+        p.load(m.slots[0..<m.len])
+        c.mapped = true
+    else if c.mapped
+        p.load([])
+        c.mapped = false
+    p.privilege(m.user && !m.calling)
+
+// Whether the running task runs unprivileged now: an unprivileged task, outside a kernel call.
+running_unprivileged[P: Port](p: *P) -> bool
+    val c = here(p)
+    if !c.sched.started() then return false
+    val m = &c.maps[usize(c.sched.running)]
+    m.user && !m.calling
+
+// The stack of the running task: where it starts and how many bytes it has; none before the core runs
+// its first task.
+running_stack[P: Port](p: *P) -> (usize, usize)
+    val c = here(p)
+    if !c.sched.started() then return (0, 0)
+    val t = &c.sched.tasks[usize(c.sched.running)]
+    (t.stack, t.stack_bytes)
+
+// For a fault handler: stop the running task for good, for having done `why`, and report it on the
+// core's console. A switch away from it is asked for; the task keeps its slot, and its handle answers
+// `Stopped`. Answers the address just past the top of its stack, where the port may lay a frame to
+// return on until the switch, or None when the running task cannot be stopped (the idle task, or no task
+// before the core runs its first): the port then stops the core.
+stop_running[P: Port](p: *P, why: Violation) -> Option[usize]
+    val c = here(p)
+    if !c.sched.started() then return None
+    val i = usize(c.sched.running)
+    if c.sched.tasks[i].base == IDLE_PRIORITY then return None
+    val state = p.mask()
+    c.sched.stop()
+    c.maps[i].calling = false
+    p.request_switch()
+    p.restore(state)
+    p.write("skiff: core ".bytes)
+    write_dec(p, c.id)
+    p.write(" stopped a task that ".bytes)
+    p.write(violation_text(why).bytes)
+    p.write("\n".bytes)
+    Some(c.sched.tasks[i].stack + c.sched.tasks[i].stack_bytes)
+
+// What a stopped task did, as its report says it.
+private violation_text(why: Violation) -> string = why match
+    Violation.Overflow -> "overflowed its stack"
+    Violation.Breach -> "broke its memory protection"
+    Violation.Trap -> "made a trap the kernel does not take"

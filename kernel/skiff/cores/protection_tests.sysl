@@ -1,0 +1,73 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+import skiff.kernel.{Access, Action, Grant, Region, Semaphore, TaskState}
+
+// Unprivileged tasks on several cores (machine.sysl): each core keeps its own tasks' maps and loads only
+// its own unit, and a task reaches an object another core uses through its own core's grant list, its
+// calls crossing as any privileged caller's would.
+
+private body() -> never
+    loop
+        ()
+
+@align(32)
+private var ustacks: [2][64]u32
+@align(32)
+private var code: [64]u8
+
+// Make call `number` as the running task of the acting core, through the frame a trap would leave.
+private call(m: *Machine, n: usize, number: usize, a0: usize, a1: usize) -> usize
+    val frame = usize(&ustacks[n][32])
+    val words: *usize = ptr_cast(frame)
+    words[0] = a0
+    words[1] = a1
+    words[2] = 0
+    words[3] = 0
+    words[4] = number
+    assert(kernel.begin_call(m, frame, 64, 32), "the frame is in the caller's stack")
+    val r = kernel.serve_call(m)
+    assert(kernel.end_call(m), "the call ends")
+    r
+
+@test("a task on core 1 waits on an object core 0 gives, through its own grant and core 1's inbox")
+grant_across()
+    var m = machine()
+    var s = Semaphore.new("s", 0, 1)
+    val u = kernel.create_unprivileged(&m, 1, ustacks[0], &body, 2, [Region(usize(&code[0]), 64, Access.Execute)], [Grant.Units(&s)]).unwrap()
+    val _ = task_on(&m, 1, 1, 1)
+    val _ = task_on(&m, 0, 2, 1)
+    begin(&m)
+    on(&m, 1)
+    switch_now(&m)
+    assert(kernel.current(&m) == u, "the unprivileged task runs on core 1")
+    assert(kernel.here(&m).mapped, "core 1's unit holds its map")
+    assert_eq(kernel.here(&m).maps[u.slot()].len, 2)
+    assert_eq(call(&m, 0, kernel.CALL_TAKE, 0, 5), 0)
+    assert(kernel.state(&m, u) == Ok(TaskState.Blocked), "blocked on the semaphore")
+    switch_now(&m)
+    on(&m, 0)
+    assert(!kernel.here(&m).mapped, "core 0's unit holds no map")
+    assert(!kernel.here(&m).maps[u.slot()].user, "core 0's slot of the same number has none")
+    assert(s.give(&m), "core 0 gives")
+    assert_eq(m.rung[1], 1)
+    on(&m, 1)
+    kernel.answer_doorbell(&m)
+    assert(kernel.state(&m, u) == Ok(TaskState.Ready), "woken by its own core")
+
+@test("a task on core 1 notifies a task of core 0 by handle; a stale handle there is refused")
+notify_across()
+    var m = machine()
+    val u = kernel.create_unprivileged(&m, 1, ustacks[1], &body, 2, [], []).unwrap()
+    val w = task_on(&m, 0, 2, 1)
+    val _ = task_on(&m, 1, 1, 1)
+    begin(&m)
+    on(&m, 1)
+    switch_now(&m)
+    assert(kernel.current(&m) == u, "the unprivileged task runs on core 1")
+    assert_eq(call(&m, 1, kernel.CALL_NOTIFY, usize(w.bits), 7), 1)
+    val stale = kernel.task_handle(0, w.slot(), w.generation() + 1)
+    assert_eq(call(&m, 1, kernel.CALL_NOTIFY, usize(stale.bits), 7), kernel.REFUSED_HANDLE)
+    on(&m, 0)
+    assert(kernel.notify(&m, w, 0, Action.NoOverwrite) == Ok(false), "core 0's task has the notification pending")

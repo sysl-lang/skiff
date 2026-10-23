@@ -3,7 +3,7 @@ module skiff.cores
 
 import sysl.sync.{Atomic, Ordering}
 import skiff.kernel
-import skiff.kernel.{Cache, Doorbell, Port, Semaphore, Task}
+import skiff.kernel.{Cache, Doorbell, Isolation, Port, Protection, Region, RegionError, Semaphore, Slot, Task}
 
 // A machine of `kernel.CORES` cores on the host, played one core at a time: `me` says which core is
 // running, and a test changes it to act as another. Its doorbell rings nothing; it counts the rings each
@@ -72,6 +72,23 @@ impl Cache for Machine
 
     invalidate(*self, bytes: []u8)
         self.invalidates[self.me] += 1
+
+// A protection unit that guards nothing and holds a region whose base and size are multiples of 32
+// bytes, as PMSAv8 does.
+impl Protection for Machine
+    guard(*self, base: usize, bytes: usize) = ()
+    reserved(*self, base: usize, bytes: usize) -> usize = 0
+
+impl Isolation for Machine
+    capacity(*self) -> usize = 8
+
+    encode(*self, r: Region) -> Result[Slot, RegionError]
+        if r.bytes == 0 then return Err(RegionError.Empty)
+        if r.base % 32 != 0 || r.bytes % 32 != 0 then return Err(RegionError.Unaligned)
+        Ok(Slot(u32(r.base & 0xffff_ffff), u32(r.bytes)))
+
+    load(*self, map: []const Slot) = ()
+    privilege(*self, unprivileged: bool) = ()
 
 // A machine with every core offline, core 0 acting. The objects a test declares are its own locals, and
 // every one of them may be used by two cores, so the whole address space counts as `.shared`.

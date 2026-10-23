@@ -1,0 +1,298 @@
+module skiff.kernel
+@tests
+
+// Protection on the host: maps checked at creation, the guard and the map on every switch, the buffer
+// check, the calls and their refusals, and a task stopped by a fault, over the recording port
+// (kernel_tests.sysl), whose unit holds 32-byte-granular regions as PMSAv8 does.
+
+private body() -> never
+    loop
+        ()
+
+@align(32)
+private var ustacks: [3][64]u32
+private var pstacks: [3][64]u32
+
+// What the tasks here are granted: a page they write, a page they only read, code, a device.
+@align(32)
+private var page: [64]u8
+@align(32)
+private var notice: [64]u8
+@align(32)
+private var code: [64]u8
+@align(32)
+private var device: [32]u8
+
+private region(bytes: []u8, access: Access) -> Region = Region(usize(&bytes[0]), bytes.len, access)
+
+// An unprivileged task on stack `n`, at `priority`, granted the page read-write, the notice read-only,
+// the code and the device, and `grants`.
+private user_task(r: *Recorder, n: usize, priority: u8, grants: []const Grant) -> Task
+    val regions = [region(page, Access.ReadWrite), region(notice, Access.Read), region(code, Access.Execute), region(device, Access.Device)]
+    create_unprivileged(r, 0, ustacks[n], &body, priority, regions, grants).unwrap()
+
+private privileged_task(r: *Recorder, n: usize, priority: u8) -> Task = create(r, 0, pstacks[n], &body, priority).unwrap()
+
+private switch_now(r: *Recorder)
+    val _ = switch_context(r, 0)
+
+// Make `t` the running task: the only task above the others, chosen by a switch.
+private run_alone(r: *Recorder, t: Task)
+    if !here(r).sched.started()
+        val _ = here(r).sched.first()
+    switch_now(r)
+    assert(current(r) == t, "the task runs")
+
+// A call from the running task, as the port's trap hands it over.
+private call(r: *Recorder, number: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> usize
+    val c = here(r)
+    dispatch(r, c, usize(c.sched.running), CallFrame([a0, a1, a2, a3], number))
+
+private addr(bytes: []u8) -> usize = usize(&bytes[0])
+
+@test("an unprivileged task's map holds its stack first, then its regions, encoded by the unit")
+map_built()
+    var r = recorder(1, 0)
+    var s = Semaphore.new("s", 0, 1)
+    val t = user_task(&r, 0, 2, [Grant.Units(&s)])
+    val m = &here(&r).maps[t.slot()]
+    assert(m.user && !m.calling, "unprivileged, outside a call")
+    assert_eq(m.len, 5)
+    assert_eq(m.regions[0].base, usize(&ustacks[0][0]))
+    assert_eq(m.regions[0].bytes, 256)
+    assert(m.regions[0].access == Access.ReadWrite, "its stack, read-write")
+    assert_eq(m.regions[2].base, addr(notice))
+    assert_eq(m.slots[1].first, u32(addr(page) & 0xffff_ffff))
+    assert_eq(m.slots[4].second, 32)
+    m.grants[0] match
+        Grant.Units(g) -> assert(g == &s, "the semaphore granted")
+        _ -> assert(false, "the grant")
+
+@test("a map the unit cannot hold exactly is refused, naming the region, and nothing is created")
+map_refused()
+    var r = recorder(1, 0)
+    r.unit = 3
+    val code_region = region(code, Access.Execute)
+    val odd = Region(addr(page) + 4, 32, Access.ReadWrite)
+    val before = here(&r).sched.free_slot()
+    assert(create_unprivileged(&r, 0, ustacks[0], &body, 2, [code_region, odd], []) == Err(MapError.Bad(1, RegionError.Unaligned)), "an unaligned region")
+    assert(create_unprivileged(&r, 0, ustacks[0], &body, 2, [code_region, region(page, Access.Read), region(notice, Access.Read)], []) == Err(MapError.TooManyRegions), "more than the unit holds")
+    assert(create_unprivileged(&r, 0, ustacks[0][1..<64], &body, 2, [], []) == Err(MapError.Stack(RegionError.Unaligned)), "a stack the unit cannot hold")
+    assert(create_unprivileged(&r, 0, ustacks[0], &body, 2, [region(page, Access.Read), Region(addr(page) + 32, 32, Access.ReadWrite)], []) == Err(MapError.Overlap(0, 1)), "two regions sharing bytes")
+    assert(create_unprivileged(&r, 0, ustacks[0], &body, 2, [Region(usize(&ustacks[0][8]), 32, Access.Read)], []) == Err(MapError.OverlapsStack(0)), "a region in the stack")
+    assert(create_unprivileged(&r, 0, ustacks[0], &body, 0, [], []) == Err(MapError.Refused(TaskError.Priority)), "the idle task's priority")
+    var s = Semaphore.new("s", 0, 1)
+    val too_many = [Grant.Units(&s); option_grants + 1]
+    assert(create_unprivileged(&r, 0, ustacks[0], &body, 2, [], too_many) == Err(MapError.TooManyGrants), "more grants than a task holds")
+    assert(here(&r).sched.free_slot() == before, "nothing created")
+
+@test("every switch guards the incoming stack, loads an unprivileged map, and empties it once after")
+switch_protects()
+    var r = recorder(1, 0)
+    val u = user_task(&r, 0, 3, [])
+    val p1 = privileged_task(&r, 0, 2)
+    val _ = privileged_task(&r, 1, 1)
+    run_alone(&r, u)
+    assert_eq(r.guarded, usize(&ustacks[0][0]))
+    assert_eq(r.loads, 1)
+    assert_eq(r.loaded, 5)
+    assert(r.unprivileged, "the unprivileged task runs unprivileged")
+    assert(running_unprivileged(&r), "and the kernel says so")
+    sleep(&r, 5)
+    switch_now(&r)
+    assert(current(&r) == p1, "the privileged task runs")
+    assert_eq(r.guarded, usize(&pstacks[0][0]))
+    assert_eq(r.loads, 2)
+    assert_eq(r.loaded, 0)
+    assert(!r.unprivileged, "privileged again")
+    val guards = r.guards
+    sleep(&r, 5)
+    switch_now(&r)
+    assert_eq(r.guards, guards + 1)
+    assert_eq(r.loads, 2)
+
+@test("a slot an unprivileged task had starts empty for the next task")
+slot_reused()
+    var r = recorder(1, 0)
+    val u = user_task(&r, 0, 2, [])
+    assert(delete(&r, u).is_ok(), "deleted")
+    val p = privileged_task(&r, 0, 2)
+    assert_eq(p.slot(), u.slot())
+    assert(!here(&r).maps[p.slot()].user, "no map")
+    run_alone(&r, p)
+    assert(!r.unprivileged, "it runs privileged")
+
+@test("a buffer must lie wholly in one region of the map that allows the access")
+buffers_checked()
+    var r = recorder(1, 0)
+    r.reserve = 64
+    val u = user_task(&r, 0, 2, [])
+    val c = here(&r)
+    val i = u.slot()
+    val stack = usize(&ustacks[0][0])
+    assert(may_reach(&r, c, i, addr(page), 64, true), "the page, written")
+    assert(may_reach(&r, c, i, addr(page) + 60, 4, true), "its last word")
+    assert(!may_reach(&r, c, i, addr(page) + 60, 8, true), "past its end")
+    assert(may_reach(&r, c, i, addr(notice), 16, false), "the notice, read")
+    assert(!may_reach(&r, c, i, addr(notice), 16, true), "the notice, written")
+    assert(may_reach(&r, c, i, addr(code), 16, false), "code, read")
+    assert(!may_reach(&r, c, i, addr(code), 16, true), "code, written")
+    assert(!may_reach(&r, c, i, addr(device), 4, false), "a device is never a buffer")
+    assert(may_reach(&r, c, i, stack + 64, 16, true), "its stack above the reserve")
+    assert(!may_reach(&r, c, i, stack + 60, 8, true), "its stack's reserve")
+    assert(!may_reach(&r, c, i, usize(&pstacks[0][0]), 4, false), "memory outside the map")
+    assert(!may_reach(&r, c, i, usize::Max - 3, 8, false), "a buffer that wraps")
+    assert(may_reach(&r, c, i, 0, 0, true), "an empty buffer")
+    val p = privileged_task(&r, 0, 2)
+    assert(may_reach(&r, c, p.slot(), usize(&pstacks[1][0]), 4, true), "a privileged task's buffer")
+
+@test("calls on granted objects act; a grant of another kind, or past the list, is refused")
+grants_used()
+    var r = recorder(1, 0)
+    var s = Semaphore.new("s", 0, 2)
+    var f = Flags.new("f", 0)
+    val u = user_task(&r, 0, 2, [Grant.Units(&s), Grant.Bits(&f)])
+    run_alone(&r, u)
+    assert_eq(call(&r, CALL_GIVE, 0, 0, 0, 0), 1)
+    assert_eq(s.count, 1)
+    assert_eq(call(&r, CALL_TAKE, 0, 0, 0, 0), 1)
+    assert_eq(call(&r, CALL_TAKE, 0, 0, 0, 0), 0)
+    assert_eq(call(&r, CALL_SET, 1, 0b101, 0, 0), 0b101)
+    assert_eq(call(&r, CALL_WAIT, 1, 0b100, WAIT_CLEAR, 0), 0b101)
+    assert_eq(f.bits, 0b001)
+    assert_eq(call(&r, CALL_WAIT, 1, 0b110, WAIT_ALL, 0), 0)
+    assert_eq(call(&r, CALL_TAKE, 1, 0, 0, 0), REFUSED_HANDLE)
+    assert_eq(call(&r, CALL_SET, 0, 1, 0, 0), REFUSED_HANDLE)
+    assert_eq(call(&r, CALL_GIVE, 2, 0, 0, 0), REFUSED_HANDLE)
+    assert_eq(call(&r, CALL_GIVE, 1000, 0, 0, 0), REFUSED_HANDLE)
+    assert_eq(call(&r, CALL_WAIT, 1, 0, 0, 0), REFUSED_ARGUMENT)
+    assert_eq(call(&r, CALL_WAIT, 1, 1, 4, 0), REFUSED_ARGUMENT)
+    assert_eq(s.count, 0)
+    assert_eq(f.bits, 0b001)
+
+@test("the plain calls: ticks, the caller's handle, a notification sent and one waited for")
+plain_calls()
+    var r = recorder(1, 0)
+    val u = user_task(&r, 0, 3, [])
+    val other = privileged_task(&r, 0, 1)
+    run_alone(&r, u)
+    assert_eq(call(&r, CALL_TICKS, 0, 0, 0, 0), usize(ticks()))
+    assert_eq(call(&r, CALL_CURRENT, 0, 0, 0, 0), usize(u.bits))
+    assert_eq(call(&r, CALL_NOTIFY, usize(other.bits), 7, 0, 0), 1)
+    assert(notify(&r, u, 0x42, Action.SetBits).is_ok(), "a note for the caller")
+    val into = addr(page) + 8
+    assert_eq(call(&r, CALL_NOTIFY_WAIT, 0, 0xffff_ffff, into, 0), 1)
+    val word: *u32 = ptr_cast(into)
+    assert_eq(*word, 0x42)
+    assert_eq(call(&r, CALL_NOTIFY_WAIT, 0, 0, into, 0), 0)
+    val before = r.used
+    assert_eq(call(&r, CALL_WRITE, addr(notice), 3, 0, 0), 3)
+    assert_eq(r.used, before + 3)
+    assert_eq(call(&r, CALL_YIELD, 0, 0, 0, 0), 0)
+
+@test("a refused call does nothing and touches nothing")
+refusals_touch_nothing()
+    var r = recorder(1, 0)
+    val u = user_task(&r, 0, 3, [])
+    val p = privileged_task(&r, 0, 1)
+    run_alone(&r, u)
+    assert(notify(&r, u, 0x5a, Action.SetBits).is_ok(), "a note waiting for the caller")
+    for k in 0..<64
+        pstacks[2][k] = 0x5a5a_5a5a
+    val theirs = usize(&pstacks[2][0])
+    val stale = task_handle(0, p.slot(), next_generation(p.generation()))
+    assert_eq(call(&r, 99, 0, 0, 0, 0), REFUSED_CALL)
+    assert_eq(call(&r, CALL_NOTIFY_WAIT, 0, 0xffff_ffff, theirs, 0), REFUSED_BUFFER)
+    assert_eq(call(&r, CALL_NOTIFY_WAIT, 0, 0xffff_ffff, addr(notice), 0), REFUSED_BUFFER)
+    assert_eq(call(&r, CALL_NOTIFY_WAIT, 0, 0xffff_ffff, addr(page) + 2, 0), REFUSED_BUFFER)
+    assert_eq(call(&r, CALL_NOTIFY_WAIT, 0, 0xffff_ffff, addr(page) + 62, 0), REFUSED_BUFFER)
+    val before = r.used
+    assert_eq(call(&r, CALL_WRITE, theirs, 16, 0, 0), REFUSED_BUFFER)
+    assert_eq(call(&r, CALL_WRITE, addr(page) + 56, 16, 0, 0), REFUSED_BUFFER)
+    assert_eq(r.used, before)
+    assert_eq(call(&r, CALL_NOTIFY, usize(stale.bits), 1, 0, 0), REFUSED_HANDLE)
+    assert_eq(call(&r, CALL_NOTIFY, usize(task_handle(5, 0, 1).bits), 1, 0, 0), REFUSED_HANDLE)
+    assert_eq(call(&r, CALL_NOTIFY, usize(p.bits), 1, 9, 0), REFUSED_ARGUMENT)
+    for k in 0..<64
+        assert_eq(pstacks[2][k], 0x5a5a_5a5a)
+    assert_eq(call(&r, CALL_NOTIFY_WAIT, 0, 0xffff_ffff, addr(page), 0), 1)
+    val word: *u32 = ptr_cast(addr(page))
+    assert_eq(*word, 0x5a)
+
+@test("a call frame must lie in the caller's stack above its reserve, and a call never nests")
+call_frames()
+    var r = recorder(1, 0)
+    r.reserve = 64
+    val u = user_task(&r, 0, 2, [])
+    run_alone(&r, u)
+    val stack = usize(&ustacks[0][0])
+    assert(!begin_call(&r, usize(&pstacks[0][32]), 32, 32), "a frame outside the stack")
+    assert(!begin_call(&r, stack + 64, 32, 32), "room for the call in the reserve")
+    assert(!begin_call(&r, stack + 240, 32, 32), "a frame past the top")
+    assert(!end_call(&r), "a return with no call")
+    val frame: *usize = ptr_cast(stack + 192)
+    frame[0] = usize(task_handle(0, 0, 1).bits)
+    frame[4] = CALL_TICKS
+    assert(begin_call(&r, stack + 192, 32, 32), "a frame in the stack")
+    assert(!begin_call(&r, stack + 192, 32, 32), "a call inside a call")
+    assert(here(&r).maps[u.slot()].calling, "calling")
+    assert(!running_unprivileged(&r), "privileged while in the call")
+    assert_eq(serve_call(&r), usize(ticks()))
+    assert(end_call(&r), "the call returns")
+    assert(running_unprivileged(&r), "unprivileged again")
+
+@test("a task in a call is privileged across a switch, and unprivileged again after the call")
+call_switch_privileged()
+    var r = recorder(1, 0)
+    val u = user_task(&r, 0, 2, [])
+    val _ = privileged_task(&r, 0, 2)
+    run_alone(&r, u)
+    val stack = usize(&ustacks[0][0])
+    assert(begin_call(&r, stack + 192, 32, 32), "a call")
+    switch_now(&r)
+    switch_now(&r)
+    assert(current(&r) == u, "back in the call")
+    assert(!r.unprivileged, "privileged in its call")
+    assert(end_call(&r), "the call returns")
+    switch_now(&r)
+    switch_now(&r)
+    assert(r.unprivileged, "unprivileged outside it")
+
+@test("a fault stops the running task alone: reported, switched away from, its handle answering Stopped")
+fault_stops_task()
+    var r = recorder(1, 0)
+    val u = user_task(&r, 0, 3, [])
+    val p = privileged_task(&r, 0, 2)
+    run_alone(&r, u)
+    val before = r.switches
+    assert(stop_running(&r, Violation.Breach) == Some(usize(&ustacks[0][0]) + 256), "the top of its stack")
+    assert(recorded(&r, "skiff: core 0 stopped a task that broke its memory protection\n"), "the report")
+    assert_eq(r.switches, before + 1)
+    assert(state(&r, u) == Ok(TaskState.Stopped), "stopped")
+    switch_now(&r)
+    assert(current(&r) == p, "the next task runs")
+    sleep(&r, 3)
+    for _ in 0..<5
+        tick(&r)
+    assert(state(&r, u) == Ok(TaskState.Stopped), "never made ready again")
+    assert(notify(&r, u, 1, Action.Increment).is_ok(), "its handle still names it")
+    assert(delete(&r, u).is_ok(), "and it may be deleted")
+    assert(state(&r, u) == Err(TaskError.Stale), "gone")
+
+@test("each report names what the stopped task did; the idle task is never stopped")
+stop_reports()
+    var r = recorder(1, 0)
+    val a = privileged_task(&r, 0, 3)
+    val _ = privileged_task(&r, 1, 2)
+    run_alone(&r, a)
+    assert(stop_running(&r, Violation.Overflow).is_some(), "stopped")
+    assert(recorded(&r, "skiff: core 0 stopped a task that overflowed its stack\n"), "an overflow")
+    switch_now(&r)
+    r.used = 0
+    assert(stop_running(&r, Violation.Trap).is_some(), "stopped")
+    assert(recorded(&r, "skiff: core 0 stopped a task that made a trap the kernel does not take\n"), "a trap")
+    var idle_stack: [64]u32
+    here(&r).sched.add_on(2, idle_stack, usize(&idle_stack[0]), IDLE_PRIORITY)
+    switch_now(&r)
+    assert_eq(here(&r).sched.tasks[usize(here(&r).sched.running)].base, IDLE_PRIORITY)
+    assert(stop_running(&r, Violation.Breach).is_none(), "the idle task is not stopped")

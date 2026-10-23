@@ -4,7 +4,7 @@
 
 import sysl.sync.{Atomic, Lock}
 import skiff.kernel
-import skiff.kernel.{Cache, Channel, Doorbell, Pool, Port, Queue}
+import skiff.kernel.{Access, Cache, Channel, Doorbell, Grant, Isolation, Pool, Port, Protection, Queue, Region, RegionError, Slot}
 
 struct Nothing
 end Nothing
@@ -33,6 +33,16 @@ impl Doorbell for Nothing
 impl Cache for Nothing
     clean(*self, bytes: []const u8) = ()
     invalidate(*self, bytes: []u8) = ()
+
+impl Protection for Nothing
+    guard(*self, base: usize, bytes: usize) = ()
+    reserved(*self, base: usize, bytes: usize) -> usize = 0
+
+impl Isolation for Nothing
+    capacity(*self) -> usize = 4
+    encode(*self, r: Region) -> Result[Slot, RegionError] = Ok(Slot(u32(r.base), u32(r.bytes)))
+    load(*self, map: []const Slot) = ()
+    privilege(*self, unprivileged: bool) = ()
 
 private var stack: [64]u32 = [0; 64]
 // Objects one core keeps are constant data: an export reaches them, and a freestanding artifact has no
@@ -88,6 +98,19 @@ private body() -> never
     loop
         ()
 
+private var user_stack: [64]u32 = [0; 64]
+
+// Unprivileged tasks, their calls, and stopping a task, over the port.
+private protection(m: *Nothing) -> bool
+    val code = Region(0, 4096, Access.Execute)
+    val t = kernel.create_unprivileged(m, 0, user_stack, &body, 1, [code], [Grant.Units(&units), Grant.Bits(&events)])
+    if t.is_err() || kernel.running_unprivileged(m) then return false
+    val (base, bytes) = kernel.running_stack(m)
+    if kernel.begin_call(m, base + bytes - 32, 32, 32)
+        val _ = kernel.serve_call(m)
+        if !kernel.end_call(m) then return false
+    kernel.stop_running(m, kernel.Violation.Breach).is_none()
+
 @export("main")
 probe() -> i32
     var m = Nothing()
@@ -101,6 +124,7 @@ probe() -> i32
     val here = kernel.here(&m)
     if !kernel.stopped(here.id) || kernel.expired(kernel.ticks(), 0) then return 1
     if t.is_err() || kernel.delete(&m, t.unwrap()).is_ok() then return 1
+    if !protection(&m) then return 1
     if here.sched.started()
         kernel.sleep(&m, 1)
         kernel.sleep_until(&m, 1)

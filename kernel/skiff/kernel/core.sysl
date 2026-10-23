@@ -13,6 +13,8 @@ struct Core
     ticks: Atomic[u32]      // the ticks this core has taken, counted by its own tick interrupt
     stopped: bool           // a fault has stopped the core
     sched: Scheduler        // its tasks and the choices made over them (tasks.sysl)
+    maps: [option_tasks]Map // each task's map, by slot: empty for a privileged task (protection.sysl)
+    mapped: bool            // the core's protection unit holds an unprivileged task's map
 
 impl Core
     // Take one tick: count it, and on core 0 advance the time base `time` that every core reads.
@@ -30,7 +32,7 @@ impl Core
 // How many cores the kernel was built for: its `cores` option, for a board sizing tables of its own.
 const CORES: usize = option_cores
 
-private var cores_here:[option_cores]Core = [Core(0, Atomic(0), false, EMPTY_SCHEDULER); option_cores]
+private var cores_here:[option_cores]Core = [Core(0, Atomic(0), false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false); option_cores]
 
 // The running core's `Core`. With one core it is a constant, and the port is not asked.
 here[P: Port](p: *P) -> *Core = if option_cores == 1 then &cores_here[0] else &cores_here[p.core_id()]

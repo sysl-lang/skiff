@@ -23,10 +23,37 @@ trait Cache
     // Drop the core's lines over `bytes`, so the next read of them comes from memory.
     invalidate(*self, bytes: []u8)
 
+// The running core's guard on the stack of the task it runs (DESIGN "Protection"). A core with no means
+// to guard a stack guards nothing and reserves nothing.
+trait Protection
+    // Guard the stack at `base`, `bytes` long, of the task the core is about to run: an access below its
+    // reserve faults from now on.
+    guard(*self, base: usize, bytes: usize)
+
+    // The bytes at the bottom of the stack at `base`, `bytes` long, that its task can never use: the
+    // guard and whatever lies below it.
+    reserved(*self, base: usize, bytes: usize) -> usize
+
+// The running core's memory protection unit, as unprivileged tasks run under it (DESIGN "Protection").
+// A core with no unit has a capacity of 0, and no unprivileged task is created on it.
+trait Isolation
+    // How many regions one task's map may take on this unit, its stack among them.
+    capacity(*self) -> usize
+
+    // How the unit holds `r`, or why it cannot hold exactly `r`. Called when a task is created.
+    encode(*self, r: Region) -> Result[Slot, RegionError]
+
+    // Hold `map` for the task the core is about to run: an unprivileged task's map, or an empty one
+    // after an unprivileged task, so that a privileged one reaches memory through the default map.
+    load(*self, map: []const Slot)
+
+    // Run thread mode unprivileged, or privileged, from the return to the task about to run.
+    privilege(*self, unprivileged: bool)
+
 // The kernel's view of the processor and the machine under it. An arch package, a chip package and a
 // board program together implement it; the kernel itself knows nothing about the hardware beyond what
 // this trait says.
-trait Port: Doorbell + Cache
+trait Port: Doorbell + Cache + Protection + Isolation
     // Write `bytes` to this core's console, waiting for room as long as it takes.
     write(*self, bytes: []const u8)
 

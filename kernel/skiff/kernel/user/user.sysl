@@ -1,0 +1,92 @@
+module skiff.kernel.user
+
+import skiff.kernel
+import skiff.kernel.{Action, Task}
+
+// The kernel as an unprivileged task calls it: one function per call, each trapping into the kernel with
+// the call's number and its arguments (kernel calls.sysl). A privileged task calls the kernel directly
+// and has no need of these.
+//
+// An object is named by its grant: its index in the list the task's creator gave. A call whose arguments
+// the kernel refuses (a handle that names no task, an object the task was not granted, a buffer outside
+// its map) answers `Err` with the reason and does nothing else.
+
+// The port's trap: enter the kernel with call `number` and four arguments, and answer its result. The
+// arch package supplies it (armv7m: `svc 1`).
+private extern "skiff_trap" trap(number: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> usize
+
+// Why the kernel refused a call.
+enum Refusal
+    NoSuchCall          // the kernel has no call of that number
+    BadHandle           // no task has that handle, or the task was granted no such object
+    BadArgument         // an argument is out of range
+    BadBuffer           // a buffer is not wholly inside one region of the task's map that allows the access
+
+// A call's result, or why it was refused.
+private answer(r: usize) -> Result[usize, Refusal]
+    if r < kernel.REFUSED then return Ok(r)
+    Err(r match
+        kernel.REFUSED_CALL -> Refusal.NoSuchCall
+        kernel.REFUSED_HANDLE -> Refusal.BadHandle
+        kernel.REFUSED_ARGUMENT -> Refusal.BadArgument
+        _ -> Refusal.BadBuffer)
+
+// Where a buffer starts, as a call passes it: an empty one starts nowhere.
+private address(bytes: []const u8) -> usize = if bytes.len == 0 then 0 else usize(&bytes[0])
+
+// Make call `number` with arguments the kernel has no reason to refuse, and answer its result.
+private call(number: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> Result[usize, Refusal] = answer(trap(number, a0, a1, a2, a3))
+
+// Give up the processor to the next ready task of the same priority, if there is one.
+yield_now()
+    val _ = trap(kernel.CALL_YIELD, 0, 0, 0, 0)
+
+// Sleep for `count` ticks, or for good with `kernel.FOREVER`.
+sleep(count: u32)
+    val _ = trap(kernel.CALL_SLEEP, usize(count), 0, 0, 0)
+
+// Sleep until tick `tick`; not at all if it has come.
+sleep_until(tick: u32)
+    val left = i32(tick - ticks())
+    if left > 0 then sleep(u32(left))
+
+// The time base.
+ticks() -> u32 = u32(trap(kernel.CALL_TICKS, 0, 0, 0, 0))
+
+// The calling task's own handle, which other tasks notify it by.
+current() -> Task = Task(u32(trap(kernel.CALL_CURRENT, 0, 0, 0, 0)))
+
+// Notify task `t`, on any core, as `kernel.notify` does. Answers whether the notification was sent.
+notify(t: Task, value: u32, action: Action) -> Result[bool, Refusal]
+    val n: usize = action match
+        Action.SetBits -> 0
+        Action.Increment -> 1
+        Action.Overwrite -> 2
+        Action.NoOverwrite -> 3
+    Ok(call(kernel.CALL_NOTIFY, usize(t.bits), usize(value), n, 0)? == 1)
+
+// Wait up to `timeout` ticks for a notification, as `kernel.notify_wait` does, the value it ended on
+// written to `into`. Answers whether one came.
+notify_wait(clear_on_entry: u32, clear_on_exit: u32, into: *u32, timeout: u32) -> Result[bool, Refusal]
+    Ok(call(kernel.CALL_NOTIFY_WAIT, usize(clear_on_entry), usize(clear_on_exit), usize(into), usize(timeout))? == 1)
+
+// Take a unit of the semaphore granted as `grant`, waiting up to `timeout` ticks. Answers whether one
+// was taken.
+take(grant: usize, timeout: u32) -> Result[bool, Refusal] = Ok(call(kernel.CALL_TAKE, grant, usize(timeout), 0, 0)? == 1)
+
+// Give a unit to the semaphore granted as `grant`. Answers whether it had room.
+give(grant: usize) -> Result[bool, Refusal] = Ok(call(kernel.CALL_GIVE, grant, 0, 0, 0)? == 1)
+
+// Set `bits` in the flags granted as `grant`; answers the bits after.
+set(grant: usize, bits: u32) -> Result[u32, Refusal] = Ok(u32(call(kernel.CALL_SET, grant, usize(bits), 0, 0)?))
+
+// Wait up to `timeout` ticks on the flags granted as `grant` for `wanted` (every bit of it if `all`),
+// clearing them once the wait is answered if `clear`. Answers the bits the wait ended on, or None if they
+// never came.
+wait(grant: usize, wanted: u32, all: bool, clear: bool, timeout: u32) -> Result[Option[u32], Refusal]
+    val mode = (if all then kernel.WAIT_ALL else 0) | (if clear then kernel.WAIT_CLEAR else 0)
+    val bits = call(kernel.CALL_WAIT, grant, usize(wanted), mode, usize(timeout))?
+    Ok(if bits == 0 then None else Some(u32(bits)))
+
+// Write `bytes` on the core's console.
+write(bytes: []const u8) -> Result[usize, Refusal] = call(kernel.CALL_WRITE, address(bytes), bytes.len, 0, 0)
