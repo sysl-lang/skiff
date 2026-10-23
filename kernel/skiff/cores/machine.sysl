@@ -1,4 +1,5 @@
 module skiff.cores
+@tests
 
 import sysl.sync.{Atomic, Ordering}
 import skiff.kernel
