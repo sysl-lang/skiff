@@ -349,6 +349,114 @@ With `option_cores == 1`: `here()` is a constant, `KernelLock` is the mask alone
 every "is it another core" test is a constant `false`, and the cross-core paths are not in the image.
 The single-core boots stay in the gate so that stays true.
 
+## Protection
+
+The MPU protects without translating: every address means the same thing to every task, and what
+changes from task to task is only what may be touched. Each core has its own MPU, so **each core's
+protection state is its own**: the map it has loaded, the stack it guards. Nothing about protection is
+in `.shared`, and no core ever programs another's MPU.
+
+### What is guarded
+
+- **The null guard**: the first `NULL_GUARD_BYTES` (256) of the address space fault on any access,
+  privileged or not, from every core, all the time. A vector fetch ignores the MPU, so a table may sit
+  there. PMSAv7: the highest region, no access. PMSAv8 has no "no access" encoding, so the guard is two
+  regions over the same bytes: an address two regions match always faults.
+- **The stack guard**: the bottom of the running task's stack faults, so an overflow stops the task
+  before it writes past its stack. PMSAv7: a 64-byte no-access region at the stack's first 64-byte
+  boundary, moved on every switch. Armv8-M: PSPLIM, `SWITCH_RESERVE` above the base, which checks every
+  push whatever the size of the frame and costs no region. The bytes below the guard's end are the
+  stack's **reserve** (`Protection.reserved`): no task, and no call made for it, may use them.
+- **What a fault stops**: a fault taken in thread mode on a task's stack that the protection raised (a
+  MemManage, or an Armv8-M stack-limit UsageFault), or any MemManage, BusFault or UsageFault an
+  unprivileged task takes outside a call, stops **that task alone**: `kernel.stop_running` marks it
+  `Stopped` (its slot stays in use, so its handle answers `Stopped` until it is deleted), reports
+  `skiff: core <n> stopped a task that <overflowed its stack | broke its memory protection | made a
+  trap the kernel does not take>`, and asks for a switch. Every other fault stops the core, as before.
+  A stopped task keeps what it held: a mutex it owned stays owned.
+
+### The kernel's side: two traits on the port
+
+`Port: Doorbell + Cache + Protection + Isolation`. The kernel names no register; the arch package
+implements both traits and the board delegates.
+
+- `Protection`: `guard(base, bytes)` guards the stack the core is about to run on; `reserved(base,
+  bytes)` is that stack's reserve.
+- `Isolation`: `capacity()` (regions a map may take on this unit), `encode(Region) -> Result[Slot,
+  RegionError]` (how the unit holds a region, or why it cannot hold it **exactly**: never rounded),
+  `load(map: []const Slot)` (hold this map; an empty one for a privileged task) and `privilege(bool)`
+  (thread mode unprivileged or not, set in the switch, taking effect on the return to the task).
+- **On every switch and at `run`**, the core guards the incoming task's stack, loads its map if it is
+  unprivileged, empties the unit once for a privileged task after an unprivileged one (the core's
+  `mapped` flag), and sets thread privilege: unprivileged exactly while an unprivileged task outside a
+  call runs.
+
+### Unprivileged tasks and their maps
+
+- `create_unprivileged(p, core, stack, entry, priority, regions, grants) -> Result[Task, MapError]`
+  creates a task under the same rules as `create` (on itself any time, on another core only before it
+  starts), with a **map** beside its `Tcb` in the owner's `Core`: its stack (region 0, `ReadWrite`)
+  and the creator's `Region(base, bytes, Access)`s, `Access` one of `Read`, `ReadWrite`, `Execute`,
+  `Device`. At most `option_map_regions` regions (default 6, the stack included) and no more than the
+  unit's `capacity`.
+- **A map is checked at creation and refused, never rounded**: each region through `encode`; regions
+  may not share a byte with one another or with the stack (PMSAv8 faults on an address two regions
+  match). The refusal names the region (`MapError.Bad(k, why)`, `Overlap(j, k)`, `OverlapsStack(k)`,
+  `TooManyRegions`, `Stack(why)`, `TooManyGrants`), and nothing is created. The encoded slots are kept,
+  so a switch loads them with no arithmetic.
+- A slot reused by any task, privileged or not, starts with an empty map: no grant outlives its task.
+
+### Kernel calls
+
+- **The trap**: `svc 1`, the call's number in r12 and four word arguments in r0-r3 (`skiff.kernel.user`
+  is one plain function per call over `extern "skiff_trap"`, which the arch supplies). The arch hands
+  the frame the processor pushed to `kernel.begin_call`, which checks it lies in the task's own stack
+  above its reserve with room below it, and records the call; the arch then lays a fresh frame below it
+  that starts the board's call thread, privileged, **on the task's own stack**: a call may block and be
+  switched away from like any kernel code, and the switch keeps it privileged (`calling`). The thread
+  runs `kernel.serve_call` and returns its answer with `svc 2`; `end_call` clears the record, the arch
+  drops the privilege again and writes the answer over the r0 of the task's frame.
+- **`dispatch` is one checked `match`, one function per call**: yield, sleep, ticks, current,
+  notify, notify_wait (its value into a word of the caller's), take and give (a granted semaphore), set
+  and wait (granted flags), and write (bytes to the core's console). **Everything a task passes is
+  checked before anything is done**: a task handle as every handle is (stale, no such core); a grant
+  index against the caller's own grant list and the kind the call needs; a buffer must lie wholly inside
+  one region of the caller's map that allows the access (`may_reach`: `ReadWrite` for a write, `Read`,
+  `Execute` or `ReadWrite` for a read, never `Device`, never in the stack's reserve, never straddling
+  two regions, never wrapping). A call failing a check answers one of the `REFUSED_*` words (the top
+  four values of a word), which `user` turns into `Err(Refusal)`: `NoSuchCall`, `BadHandle`,
+  `BadArgument`, `BadBuffer`. **A refused call does nothing and touches nothing**; the task runs on.
+- **A malformed trap stops the task**: an SVC number the kernel does not take, a call frame outside the
+  task's own stack, a return with no call in flight, a call made inside a call.
+- A privileged task may trap too, and every check passes for it; it has no need to.
+
+### Grants: how a task reaches objects, on its core or another
+
+- **A task names objects by its own grant index**, never by address: the creator lists `Grant`s
+  (`Grant.Units(*Semaphore)`, `Grant.Bits(*Flags)`), and index k is the k-th of them, at most
+  `option_grants` (default 4). An index past the list, or of another kind than the call needs, is
+  `BadHandle`. There is no global object table, so no task can name an object nobody gave it.
+- **Objects stay out of every map.** The kernel reaches a granted object privileged, under the object's
+  own lock, exactly as for a privileged caller; the task's map grants it none of the object's bytes. So
+  an object in `.shared` used from both cores is granted to an unprivileged task on each core through
+  that core's private grant list (a pointer kept in private memory, never in `.shared`), and the
+  `.shared` rule and the outcome rule hold unchanged: a cross-core wake from a call is the same inbox
+  message a privileged caller's would be.
+- **Tasks by handle**: `notify` takes any task's handle, on any core, checked like every handle.
+- **Queues, channels and pool buffers are not granted yet.** They are generic over their sizes, and a
+  grant list is one table of every kind. The decided form is a grant per object whose call methods the
+  kernel reaches through a trait object; it needs a trait object of the port, which a kernel generic
+  over `p: *P` cannot pass on (FINDINGS 9). Once it can, a buffer a call hands the task (take,
+  receive) is **loaned** into a free region of the task's map for as long as the task holds it, and
+  taken out of the map by the give or send that hands it on: the map always allows exactly the buffers
+  the task holds, never the pool's other buffers or its records. A pool is refused as a grant at
+  creation if the unit cannot hold one of its buffers exactly.
+
+### Options
+
+`map_regions` (usize, default 6, [2, 16]): regions in an unprivileged task's map, its stack among
+them. `grants` (usize, default 4, [0, 32]): objects one task may be granted.
+
 ## Open questions
 
 - **32 priorities, settled with no option.** The bitmap is one `u32` and the FIFOs cost two `u16` a

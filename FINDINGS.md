@@ -134,3 +134,64 @@ wrong. skiff's `tools/portable` hit it with `kernel.Queue.new("mail")`. Importin
 ordinary spelling and is what skiff uses, so nothing here is contorted.
 
 Status: fixed in sysl 0.3.12.
+
+## FINDINGS 9 — a trait object cannot be passed where a generic takes a pointer to its bound
+
+```sysl
+trait Port
+    mask(*self) -> u32
+
+struct Board
+    level: u32
+
+impl Port for Board
+    mask(*self) -> u32 = self.level
+
+struct Queue[const N: usize]
+    slots: [N]u32
+
+impl[const N: usize] Queue[N]
+    send[P: Port](*self, p: *P, v: u32) -> u32 = p.mask() + v + u32(N)
+
+// What a kernel keeps for a task: the objects it may name, of any size, in one table.
+trait Object
+    put(*self, p: *Port, v: u32) -> u32
+
+impl[const N: usize] Object for Queue[N]
+    put(*self, p: *Port, v: u32) -> u32 = self.send(p, v)
+
+var q: Queue[2] = Queue([0; 2])
+var b = Board(40)
+val o: *Object = &q
+val port: *Port = &b
+print(o.put(port, 1))
+```
+
+is refused (sysl 0.5.0) with "cannot infer the type argument 'P' of 'Queue.send' here — annotate the
+expected type" at `self.send`, and `self.send[Port](p, v)` with "'Port' is a trait, so it describes
+behaviour rather than a layout — write '*Port' or '&Port' for a trait object, or bound a type parameter
+with '[T: Port]'". The reference (generics, "A trait object satisfies a bound on the trait it dispatches
+through") has the object satisfy a bound when the parameter *is* the object type (`total[T: Shape](x: T)`
+called with a `&Shape`); a parameter written `p: *P` has no `P` for which `*P` is `*Port`, so an object
+can never reach it.
+
+skiff's whole kernel takes its port as `p: *P` with `[P: Port]`. Milestone 6 needs one table per task of
+the objects it was granted (queues, channels, pools: generic over their sizes), each called later with the
+running core's port: a trait object per object, whose members take the port. They can take neither `*P`
+(a member with type parameters of its own is left out of the table) nor `*Port` (the case above). The
+other spellings fail too: an `impl` for `Queue[u32, N]` alone is refused ("an 'impl' covers the whole of a
+generic type", deliberate per traits, "Overlapping implementations"), and a table generic over the port
+has nowhere to live in a `Core` that is not.
+
+What would have been written instead: a concrete `CallPort` struct holding the port as a `*Port` and
+implementing `Port` by forwarding every member to it (fifteen one-line members), or each grant holding an
+address and a function pointer to a generic instantiation with the port erased to a `usize`. Both are the
+contortion rule 9 forbids, so milestone 6 grants only objects that are not generic (semaphores, flags)
+and notifications by handle; queues, channels and loaned pool buffers wait for this (DESIGN "Grants").
+
+A language move that would discharge it: let `[P: Port](p: *P)` bind `P` to the trait itself when
+handed a `*Port`, so `*P` is the object (Rust's `?Sized`), or any other spelling of "a pointer to
+something implementing `Port`, concrete or erased".
+
+Status: open.
+
