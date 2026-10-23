@@ -12,3 +12,8 @@ options {
   tasks   { type = usize, default = 16, range = [2, 4096], doc = "how many tasks each core's table holds, its idle task among them; a handle's slot has 12 bits" }
   cache_line { type = usize, default = 32, range = [4, 256], doc = "the data cache's line in bytes, a power of two: every pool buffer starts on one and fills whole lines" }
 }
+
+// The kernel's tests run in two builds. With one core, where no path between cores is in the build:
+// `sysl test kernel --filter skiff.kernel`. For the paths between cores, the kernel is built for three
+// and the tests of skiff.cores (skiff/cores/) play each core in turn over one port:
+// `sysl test kernel --option cores=3 --filter skiff.cores`.

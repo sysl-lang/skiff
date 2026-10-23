@@ -1,4 +1,4 @@
-// The kernel instantiated over a port with no hardware behind it (see package.hocon). Each piece of the
+// The kernel instantiated over a port with no hardware behind it (see sysl.hocon). Each piece of the
 // kernel that is generic over the port is called from here as well. The kernel is built for two cores,
 // so the paths between cores are built for every CPU family too.
 
