@@ -195,3 +195,22 @@ something implementing `Port`, concrete or erased".
 
 Status: open.
 
+## FINDINGS 10 — the standard module lays down no `__aeabi_memmove`
+
+`sysl.softint.aeabi` says it carries "the Arm run-time ABI's names for the block operations, which LLVM
+calls in place of C's for a struct copied or cleared on every Thumb core", since nothing short of the
+back end can say which copies become calls. It carries `__aeabi_memcpy`/`4`/`8`, `__aeabi_memset`/`4`/`8`
+and `__aeabi_memclr`/`4`/`8`, but no `__aeabi_memmove`. A first version of skiff's `add_task` took a
+180-byte `Map` by value and stored it into the core's table (`c.maps[i] = map`, inside a `match` arm after
+a call to the port); sysl 0.5.0 emits two `llvm.memcpy`s through a temporary, the optimiser merges them
+into a move, and both MPS2 links failed: `ld.lld: error: undefined symbol: __aeabi_memmove4 >>> referenced
+by ...(kernel.skiff.kernel$add_task.Board)`. Three smaller programs of the same shape did not reproduce
+it, so there is no minimal reduction yet. The design changed for its own reasons (the map is now written
+in place into the owner's slot, with no 180-byte copy under the mask), so nothing in skiff works around
+it; any freestanding program whose copy the optimiser turns into a move fails to link the same way.
+
+What would discharge it: `__aeabi_memmove`/`4`/`8` beside the others, calling the board's `memmove` as the
+others call `memcpy` and `memset`.
+
+Status: open.
+
