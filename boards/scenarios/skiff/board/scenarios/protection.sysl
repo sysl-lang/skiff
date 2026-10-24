@@ -43,7 +43,7 @@ struct Exchange
     forger_got: u32
     masked_ticks: u32       // masker's
     basepri_seen: u32
-    finished: u32           // a bit for each of worker, forger, masker and speaker once it is done, and R's
+    finished: u32           // a bit for each of worker, forger, masker and speaker once it is done
     unused: [54]u32
 
 // The bits of `finished`.
@@ -51,7 +51,6 @@ private const WORKER_DONE: u32 = 1
 private const FORGER_DONE: u32 = 2
 private const MASKER_DONE: u32 = 4
 private const SPOKEN: u32 = 8
-private const TRIPS_JUDGED: u32 = 16
 
 @assert(sizeof(Exchange) == EXCHANGE_BYTES, "the exchange fills one 256-byte region")
 
@@ -125,7 +124,6 @@ protection[P: Port](p: *P, e: *Entries, code: Region, uart: Region)
         say(p, "an unprivileged task made 5 round trips with a privileged task through a semaphore and notifications\n")
     else
         say(p, "the unprivileged task's round trips went wrong\n")
-    x.finished |= TRIPS_JUDGED
     // A notification waiting for forger, which its refused calls must leave alone.
     val _ = kernel.notify(p, forger, 0x77, Action.Overwrite)
     await_finished(p, x, FORGER_DONE, t + 7)
@@ -218,7 +216,6 @@ echo_task[P: Port](p: *P) -> never
 private snoop_task() -> never
     val x = mine()
     user.sleep_until(x.start + 3)
-    await_judged(x)
     x.unused[0] = kernel.ticks()        // the load faults; the store is never reached
     rest()
 
@@ -252,9 +249,7 @@ private null_task() -> never
 // A privileged task with no port sleeps through the trap, as an unprivileged one does, until tick
 // `offset` of its core's scenarios.
 private sleep_privileged(offset: u32)
-    val x = &exchanges[user.current().core()]
-    user.sleep_until(x.start + offset)
-    await_judged(x)
+    user.sleep_until(exchanges[user.current().core()].start + offset)
 
 // Forger: buffers, grants and handles that are not its own.
 private forger_task() -> never
@@ -326,11 +321,6 @@ private trapper_task() -> never
 // scenarios' tasks would otherwise break into it.
 private await_spoken(x: *Exchange)
     while (x.finished & SPOKEN) == 0 do user.sleep(1)
-
-// The same for snoop's, deep's and null's stops, which wait until R has given its verdict on the round
-// trips.
-private await_judged(x: *Exchange)
-    while (x.finished & TRIPS_JUDGED) == 0 do user.sleep(1)
 
 // Masker: try to mask, then watch the ticks go by.
 private masker_task() -> never
