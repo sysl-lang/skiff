@@ -4,7 +4,7 @@
 
 import sysl.sync.{Atomic, Lock}
 import skiff.kernel
-import skiff.kernel.{Access, Cache, Channel, Doorbell, Grant, Isolation, MessageBuffer, Pool, Port, Protection, Queue, Region, RegionError, Slot, StreamBuffer}
+import skiff.kernel.{Access, Cache, Channel, Doorbell, Grant, Isolation, MessageBuffer, Pool, Port, Protection, Queue, Region, RegionError, RunCounter, Slot, StreamBuffer}
 
 struct Nothing
 end Nothing
@@ -43,6 +43,9 @@ impl Isolation for Nothing
     encode(*self, r: Region) -> Result[Slot, RegionError] = Ok(Slot(u32(r.base), u32(r.bytes)))
     load(*self, map: []const Slot) = ()
     privilege(*self, unprivileged: bool) = ()
+
+impl RunCounter for Nothing
+    run_count(*self) -> u32 = 0
 
 private var stack: [64]u32 = [0; 64]
 // Objects one core keeps are constant data: an export reaches them, and a freestanding artifact has no
@@ -158,7 +161,13 @@ private protection(m: *Nothing) -> bool
 // Task control, here and through another core's inbox.
 private control(m: *Nothing, t: kernel.Task) -> bool
     if kernel.suspend(m, t).is_ok() || kernel.resume(m, t).is_ok() || kernel.set_priority(m, t, 2).is_ok() then return false
-    kernel.stop(m, t).is_err() && kernel.suspended(m, t).is_err() && kernel.priority(m, t).is_err()
+    kernel.stop(m, t).is_err() && kernel.suspended(m, t).is_err() && kernel.priority(m, t).is_err() && stats(m, t)
+
+// Run-time statistics and stack high-water marks, of a task of another core and of the running core.
+private stats(m: *Nothing, t: kernel.Task) -> bool
+    if kernel.task_stats(m, t).is_ok() || kernel.stack_high_water(m, t).is_ok() then return false
+    kernel.reset_stats(m)
+    kernel.core_stats(m).elapsed == 0
 
 @export("main")
 probe() -> i32

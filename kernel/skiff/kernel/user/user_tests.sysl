@@ -3,7 +3,7 @@ module skiff.kernel.user
 
 import sysl.sync.Atomic
 import skiff.kernel
-import skiff.kernel.{Access, Cache, Doorbell, Grant, Isolation, Port, Protection, Region, RegionError, Semaphore, Slot}
+import skiff.kernel.{Access, Cache, Doorbell, Grant, Isolation, Port, Protection, Region, RegionError, RunCounter, Semaphore, Slot}
 
 // `skiff.kernel.user` on the host: its trap lays the call's frame in the running task's stack and goes
 // through `begin_call`, `serve_call` and `end_call`, as the port's trap handler does, so each function
@@ -55,6 +55,10 @@ impl Isolation for Desk
         Ok(Slot(u32(r.base & 0xffff_ffff), u32(r.bytes)))
     load(*self, map: []const Slot) = ()
     privilege(*self, unprivileged: bool) = ()
+
+// A counter that stands still: the calls charge nothing.
+impl RunCounter for Desk
+    run_count(*self) -> u32 = 0
 
 private var desk: Desk = Desk([0; 64], 0, 0)
 

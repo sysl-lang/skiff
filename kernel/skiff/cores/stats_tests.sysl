@@ -1,0 +1,55 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+import skiff.kernel.{Task, TaskError}
+
+// Run-time statistics on several cores: each core charges its tasks in its own counter, from its own last
+// reading, and answers for its own tasks alone.
+
+private run_time(m: *Machine, t: Task) -> u64 = kernel.task_stats(m, t).unwrap().run_time
+
+@test("each core charges its tasks in its own counter, whatever the other cores' counters read")
+own_counter_per_core()
+    var m = machine()
+    val a = task_on(&m, 0, 0, 1)
+    val b = task_on(&m, 1, 1, 1)
+    m.clocks[0] = 1_000_000
+    m.clocks[1] = 5
+    begin(&m)
+    // Each core counts from its own reading once it runs its tasks.
+    on(&m, 0)
+    kernel.reset_stats(&m)
+    on(&m, 1)
+    kernel.reset_stats(&m)
+    m.clocks[0] = 1_000_300
+    m.clocks[1] = 12
+    on(&m, 0)
+    kernel.tick(&m)
+    on(&m, 1)
+    kernel.tick(&m)
+    m.clocks[0] = 1_000_350
+    on(&m, 0)
+    assert_eq(run_time(&m, a), 350)
+    assert_eq(kernel.core_stats(&m).elapsed, 350)
+    on(&m, 1)
+    assert_eq(run_time(&m, b), 7)
+    assert_eq(kernel.core_stats(&m).elapsed, 7)
+    m.clocks[1] = 20
+    kernel.reset_stats(&m)
+    on(&m, 0)
+    assert_eq(run_time(&m, a), 350)
+
+@test("another core's task statistics and high-water mark are refused as Remote")
+remote_refused()
+    var m = machine()
+    val a = task_on(&m, 0, 0, 1)
+    val b = task_on(&m, 1, 1, 1)
+    begin(&m)
+    on(&m, 0)
+    assert(kernel.task_stats(&m, b) == Err(TaskError.Remote), "statistics")
+    assert(kernel.stack_high_water(&m, b) == Err(TaskError.Remote), "high-water mark")
+    assert(kernel.stack_high_water(&m, a).is_ok(), "its own task's")
+    on(&m, 1)
+    assert(kernel.task_stats(&m, a) == Err(TaskError.Remote), "and the other way")
+    assert_eq(m.rung[0] + m.rung[1], 0)

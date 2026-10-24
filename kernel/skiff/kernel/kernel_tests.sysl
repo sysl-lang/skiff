@@ -29,6 +29,11 @@ private[kernel] struct Recorder
     unprivileged: bool  // the privilege the kernel last set
     unit: usize         // how many regions a map may take on its unit
     reserve: usize      // the bytes at the bottom of every stack its guard takes
+    clock: u32          // the core's counter, moved by hand
+
+// The counter is whatever the test last set it to.
+impl RunCounter for Recorder
+    run_count(*self) -> u32 = self.clock
 
 // A protection unit that records what it is asked. It holds a region whose base and size are multiples of
 // 32 bytes, as PMSAv8 does, as the two words base and size.
@@ -114,7 +119,7 @@ impl Doorbell for Recorder
     ring(*self, core: u32) = panic("one core never rings")
     clear(*self) = panic("one core never rings")
 
-private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, [], [], null, null, 0, 0, 0, 0, 0, 0, false, 8, 0)
+private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, [], [], null, null, 0, 0, 0, 0, 0, 0, false, 8, 0, 0)
 
 // Whether `r` recorded exactly `want`.
 private[kernel] recorded(r: *Recorder, want: string) -> bool
@@ -171,8 +176,8 @@ deadline_across_wrap()
 @test("core 0's tick advances the time base and another core's does not")
 only_core_0_keeps_time()
     var time: Atomic[u32] = Atomic(0)
-    var first = Core(0, Atomic(0), false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false)
-    var second = Core(1, Atomic(0), false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false)
+    var first = Core(0, Atomic(0), false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false, 0, 0, 0)
+    var second = Core(1, Atomic(0), false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false, 0, 0, 0)
     first.tick(&time)
     second.tick(&time)
     second.tick(&time)
@@ -185,7 +190,7 @@ only_core_0_keeps_time()
 @test("the time base wraps from the largest u32 to 0")
 time_base_wraps()
     var time: Atomic[u32] = Atomic(0xffff_ffff)
-    var first = Core(0, Atomic(0xffff_ffff), false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false)
+    var first = Core(0, Atomic(0xffff_ffff), false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false, 0, 0, 0)
     first.tick(&time)
     assert_eq(time.load(), 0)
     assert_eq(first.own_ticks(), 0)

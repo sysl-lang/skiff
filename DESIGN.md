@@ -65,7 +65,7 @@ Core (private, one per core)          .shared
 - A task ends by `exit`, which deletes it. The running task's freed slot is not handed out again until
   the switch away from it, which still saves its stack pointer there.
 - A `Tcb` is private: saved stack pointer, base, inherited and effective priority, state, suspended, the stack's
-  bounds, statistics, the MPU map. Nothing in `.shared` points at one.
+  bounds, its run time ("Statistics"), the MPU map. Nothing in `.shared` points at one.
 
 ## Scheduling
 
@@ -299,6 +299,38 @@ outside 1 to 31 (`Priority`).
   suspend, re-prioritize or stop another task. Granting it would need a task grant, which the grant list
   does not have.
 
+## Statistics
+
+`task_stats(p, t) -> Result[TaskStats, TaskError]` (run time, state, suspended, effective priority),
+`core_stats(p) -> CoreStats` (counts elapsed, of them idle, slots in use), `reset_stats(p)` and
+`stack_high_water(p, t) -> Result[usize, TaskError]`.
+
+- **Run time is counted in the core's own counter**, the port's `RunCounter` (`run_count`, free-running,
+  wrapping at 2^32): the kernel names no timer. A chip with a cycle counter per core (DWT CYCCNT) uses it;
+  QEMU models no DWT, so the MPS2 boards use CMSDK timer 1, and on the AN521 core 0 timer 1 and core 1 the
+  dual timer, each core its own. The rates may differ: a count is only ever compared with counts of the
+  same core.
+- **A charge** is a counter read, a subtraction and adds: the running task is charged the counts since
+  the core's last reading (`Core.counted_at`), and so is the core's total (`elapsed`), and its idle time
+  when the idle task ran. It is made at every switch, before the next task is chosen, on every tick (so a
+  counter that wraps no more than once a tick is enough) and at every query, so the running task is
+  charged up to now. Counting starts when `run` starts the first task; `reset_stats` zeroes the core's
+  counts and every task's and counts from then.
+- **A slot's run time starts at 0 whenever a task is put in it**, a stopped task's slot included, so a
+  handle never shows its slot's last task's. A stopped task keeps its count until its slot is reused.
+- **Stack high-water marks**: every stack is filled with `STACK_PAINT` (0xa5a5_a5a5) when its task is
+  created (before its first frame, outside the mask). The mark is the bytes still painted, counted from
+  the bottom up from just above the stack's reserve (`Protection.reserved`: PMSAv7's guard and what lies
+  below its boundary, everything below PSPLIM on Armv8-M): no task may use the reserve, the v8 switch may
+  write into it, and reading the running task's v7 guard would fault. It is a lower bound on the room
+  left. An unprivileged task's stack is scanned the same way: its kernel calls run on it, so they count.
+  The scan runs unmasked; the handle is checked before and after it, and a task deleted or replaced
+  meanwhile is `Stale`.
+- **Another core's task is `Remote`, refused**, as `state` is, not asked through its inbox: an answer
+  would need a reply carried back and the asking task blocked on it, for numbers that are already stale
+  when they arrive. A core's statistics are read on that core: a monitoring task of its own reports them.
+- **Privileged only**, like task control: no kernel call reads them.
+
 ## Channels and the buffer pool
 
 Bulk data (an audio block, a frame, a packet) moves between tasks, on one core or across cores, by
@@ -409,6 +441,15 @@ A software timer calls a function once a period has passed (one-shot), or every 
   called, late and in deadline order among every timer due, in the same turn. A one-shot is inactive
   before its callback runs, and a periodic timer is already back in the list, so a callback may command
   its own timer.
+- **A command a callback sends is the service's own, and takes effect before the callback returns**: the
+  service owns the list, so it has no reason to queue to itself, and a queued stop would wait for the end
+  of the turn while the turn went on calling the timer's overdue expiries (a late turn with six due and a
+  stop at the third made six calls). This holds for start, stop, reset and change of period, for any
+  timer of the core, and needs no room in the queue. The commands already queued are carried out first,
+  so commands still take effect in the order they were sent. The service knows its own command by the
+  running task being the one that called the callback; an interrupt handler arriving during the callback
+  is indistinguishable from it and is carried out at once too, which is safe because the list is settled
+  while a callback runs. One arriving while the service carries out a command of its own is queued.
 - **The service waits through the one `WaitQueue`**: it receives on its command queue with a timeout of
   the ticks to the soonest expiry (`FOREVER` with none active), so a command wakes it as any send wakes
   a receiver, and the expiry is the wait's timeout ending on the owner's tick. A turn is: carry out every

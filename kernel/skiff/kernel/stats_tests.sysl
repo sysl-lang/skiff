@@ -1,0 +1,178 @@
+module skiff.kernel
+@tests
+
+// Run-time statistics and stack high-water marks on the host, over the recording port
+// (kernel_tests.sysl), whose counter is `clock`, moved by hand. No task runs: a test makes the scheduler
+// choose, as the switch would, and writes a stack's words itself, as its task would.
+
+private body() -> never
+    loop
+        ()
+
+private var stat_stacks: [4][64]u32
+
+private on_stack(r: *Recorder, n: usize, priority: u8) -> Task = create(r, 0, stat_stacks[n], &body, priority).unwrap()
+
+private switch_to_next(r: *Recorder)
+    val _ = switch_context(r, 0)
+
+private run_time(r: *Recorder, t: Task) -> u64 = task_stats(r, t).unwrap().run_time
+
+// The idle task, in a free slot, as `run` adds it.
+private add_idle(r: *Recorder) -> Task
+    val c = here(r)
+    val i = c.sched.free_slot().unwrap()
+    c.sched.add_on(i, stat_stacks[3], 0, IDLE_PRIORITY)
+    c.sched.handle(0, i)
+
+@test("each task is charged the counts it ran, at the switch away from it and at a query")
+charged_at_switches()
+    var r = recorder(1, 0)
+    val a = on_stack(&r, 0, 2)
+    val b = on_stack(&r, 1, 1)
+    here(&r).sched.first()
+    r.clock = 40
+    sleep(&r, 5)
+    switch_to_next(&r)
+    assert(current(&r) == b, "b runs")
+    r.clock = 100
+    assert_eq(run_time(&r, b), 60)
+    assert_eq(run_time(&r, a), 40)
+    r.clock = 130
+    val all = core_stats(&r)
+    assert_eq(all.elapsed, 130)
+    assert_eq(run_time(&r, b), 90)
+    assert_eq(all.tasks, 2)
+    assert_eq(r.masked, 0)
+
+@test("a tick charges the running task, so a task that runs alone is charged before the counter wraps")
+charged_at_ticks()
+    var r = recorder(1, 0)
+    val a = on_stack(&r, 0, 2)
+    here(&r).sched.first()
+    here(&r).counted_at = 0xffff_ff00
+    r.clock = 0xffff_ff80
+    tick(&r)
+    assert_eq(here(&r).sched.tasks[a.slot()].run_time, 0x80)
+    r.clock = 0x100
+    tick(&r)
+    assert_eq(here(&r).sched.tasks[a.slot()].run_time, 0x200)
+    assert_eq(core_stats(&r).elapsed, 0x200)
+
+@test("the idle task's counts are the core's idle time, and no other task's are")
+idle_time_counted()
+    var r = recorder(1, 0)
+    val a = on_stack(&r, 0, 1)
+    val idle = add_idle(&r)
+    here(&r).sched.first()
+    r.clock = 70
+    sleep(&r, 2)
+    switch_to_next(&r)
+    assert(current(&r) == idle, "the idle task runs")
+    r.clock = 100
+    tick(&r)
+    tick(&r)
+    switch_to_next(&r)
+    assert(current(&r) == a, "a runs again")
+    r.clock = 125
+    val all = core_stats(&r)
+    assert_eq(all.idle, 30)
+    assert_eq(all.elapsed, 125)
+    assert_eq(run_time(&r, a), 95)
+    assert_eq(run_time(&r, idle), 30)
+
+@test("reset_stats sets every run time and the core's counts to 0 and counts on from now")
+reset_counts_from_now()
+    var r = recorder(1, 0)
+    val a = on_stack(&r, 0, 1)
+    val idle = add_idle(&r)
+    here(&r).sched.first()
+    r.clock = 50
+    sleep(&r, 1)
+    switch_to_next(&r)
+    r.clock = 80
+    reset_stats(&r)
+    assert_eq(run_time(&r, a), 0)
+    assert_eq(run_time(&r, idle), 0)
+    assert_eq(core_stats(&r).idle, 0)
+    r.clock = 95
+    val all = core_stats(&r)
+    assert_eq(all.elapsed, 15)
+    assert_eq(all.idle, 15)
+
+@test("a task in a deleted or stopped task's slot starts its run time at 0, and the old handle is stale")
+reused_slot_resets()
+    var r = recorder(1, 0)
+    val a = on_stack(&r, 0, 2)
+    val b = on_stack(&r, 1, 1)
+    here(&r).sched.first()
+    r.clock = 500
+    assert(delete(&r, a).is_ok(), "deleted")
+    switch_to_next(&r)
+    val c = on_stack(&r, 2, 1)
+    assert_eq(c.slot(), a.slot())
+    assert_eq(run_time(&r, c), 0)
+    assert(task_stats(&r, a) == Err(TaskError.Stale), "the old handle is stale")
+    assert(stack_high_water(&r, a) == Err(TaskError.Stale), "for its stack too")
+    r.clock = 600
+    assert(stop(&r, b).is_ok(), "b stopped")
+    switch_to_next(&r)
+    assert_eq(run_time(&r, b), 100)
+    assert(task_stats(&r, b).unwrap().state == TaskState.Stopped, "a stopped task keeps its count")
+
+@test("a stopped task's slot, taken when no slot is free, starts its new task's run time at 0")
+stopped_slot_reused_resets()
+    var r = recorder(1, 0)
+    val first = on_stack(&r, 0, 2)
+    for _ in 1..<option_tasks
+        val _ = create(&r, 0, stat_stacks[1], &body, 1).unwrap()
+    here(&r).sched.first()
+    r.clock = 300
+    assert(stop(&r, first).is_ok(), "stopped")
+    switch_to_next(&r)
+    assert_eq(here(&r).sched.tasks[first.slot()].run_time, 300)
+    val again = on_stack(&r, 2, 1)
+    assert_eq(again.slot(), first.slot())
+    assert_eq(run_time(&r, again), 0)
+    assert(task_stats(&r, first) == Err(TaskError.Stale), "the stopped task's handle is stale")
+
+@test("a fresh stack is painted: its high-water mark is all of it above the reserve")
+fresh_stack_untouched()
+    var r = recorder(1, 0)
+    stat_stacks[0][10] = 7
+    val a = on_stack(&r, 0, 1)
+    assert(stack_high_water(&r, a) == Ok(64 * 4), "all 256 bytes")
+    r.reserve = 40
+    assert(stack_high_water(&r, a) == Ok(64 * 4 - 40), "above the reserve")
+    r.reserve = 42
+    assert(stack_high_water(&r, a) == Ok(64 * 4 - 44), "from the first word above it")
+    r.reserve = 64 * 4
+    assert(stack_high_water(&r, a) == Ok(0), "a stack all reserve has no room")
+
+@test("a deeper task's high-water mark is lower, and stops at the first word it reached")
+deep_lower_than_shallow()
+    var r = recorder(1, 0)
+    val deep = on_stack(&r, 0, 1)
+    val shallow = on_stack(&r, 1, 1)
+    // Each writes down from the top, as a stack is pushed.
+    for k in 56..<64
+        stat_stacks[1][k] = 0
+    for k in 20..<64
+        stat_stacks[0][k] = u32(k)
+    assert(stack_high_water(&r, shallow) == Ok(56 * 4), "shallow: 8 words used")
+    assert(stack_high_water(&r, deep) == Ok(20 * 4), "deep: 44 words used")
+    // A word written lower down, the words between it and the frames still painted, lowers the mark: the
+    // scan stops at the lowest word ever reached.
+    stat_stacks[0][5] = 1
+    assert(stack_high_water(&r, deep) == Ok(5 * 4), "the lowest word reached decides")
+    r.reserve = 8
+    assert(stack_high_water(&r, deep) == Ok(3 * 4), "the reserve is not counted")
+
+@test("statistics and high-water marks refuse a handle of no core and a never-created slot")
+refused_handles()
+    var r = recorder(1, 0)
+    val _ = on_stack(&r, 0, 1)
+    assert(task_stats(&r, task_handle(1, 0, 1)) == Err(TaskError.Stale), "no core 1")
+    assert(stack_high_water(&r, task_handle(0, 3, 1)) == Err(TaskError.Stale), "a free slot")
+    assert(stack_high_water(&r, task_handle(0, option_tasks + 1, 1)) == Err(TaskError.Stale), "no such slot")
+    assert(task_stats(&r, task_handle(0, 0, 2)) == Err(TaskError.Stale), "the wrong generation")

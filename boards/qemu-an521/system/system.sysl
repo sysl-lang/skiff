@@ -42,8 +42,9 @@ var placed: System
 enum Resource: u8
     Uart0 = 0       // UART 0, core 0's console
     Uart1 = 1       // UART 1, core 1's console
-    Timer0 = 2      // timer 0's interrupt, which the scenarios raise from software
-    Timer1 = 3      // timer 1's interrupt, the same for another core
+    Timer0 = 2      // timer 0, whose interrupt the scenarios raise from software
+    Timer1 = 3      // timer 1, the run-time counter of core 0's statistics
+    DualTimer = 7   // the dual timer: core 1's run-time counter, and its interrupt the one raised there
     Doorbell0 = 4   // MHU0's interrupt as core 0's NVIC takes it: the doorbell rung for core 0
     Doorbell1 = 5   // the same, for core 1
     Security = 6    // the SSE-200's system control and peripheral protection: core 1's release, the UARTs' access
@@ -53,13 +54,14 @@ struct Owned
     core: u32
 
 // Which core owns what.
-val OWNERS: [7]Owned = [
+val OWNERS: [8]Owned = [
     Owned(Resource.Uart0, 0),
     Owned(Resource.Timer0, 0),
+    Owned(Resource.Timer1, 0),
     Owned(Resource.Doorbell0, 0),
     Owned(Resource.Security, 0),
     Owned(Resource.Uart1, 1),
-    Owned(Resource.Timer1, 1),
+    Owned(Resource.DualTimer, 1),
     Owned(Resource.Doorbell1, 1),
 ]
 

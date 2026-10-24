@@ -1,0 +1,124 @@
+module skiff.kernel
+
+// Run-time statistics and stack high-water marks (DESIGN "Statistics").
+//
+// **Run time.** Each core charges its tasks in its own counter, the port's `RunCounter`. At every switch,
+// before the next task is chosen, and on every tick, the running task is charged the counts since the
+// core's last charge, and so is the core's total; the idle task's are its idle time as well. A charge is
+// a counter read, a subtraction and two or three adds, and the switch does no division. A slot's run
+// time starts at 0 whenever a task is put in it, so a reused slot never shows its last task's.
+//
+// **Stack high-water marks.** Every task's stack is filled with `STACK_PAINT` when the task is created,
+// before its first frame is laid on top. A stack grows down, so the painted words left at its bottom are
+// the ones its task has never reached. The scan starts above the stack's reserve (`Protection.reserved`:
+// the guard and what lies below it), which no task may use and a running task may not even read.
+//
+// Both answer for the running core's own tasks alone: a task of another core is `Remote`.
+
+// What every word of a stack holds until its task reaches it.
+const STACK_PAINT: u32 = 0xa5a5_a5a5
+
+// One task's statistics, as `task_stats` answers them.
+struct TaskStats derives Eq
+    run_time: u64       // the counts of its core's counter it has run since it was created or the core's statistics were reset
+    state: TaskState
+    suspended: bool
+    priority: u8        // the effective priority, an inherited one included
+
+// One core's statistics, as `core_stats` answers them.
+struct CoreStats derives Eq
+    elapsed: u64        // the counts of the core's counter since it ran its tasks or its statistics were reset
+    idle: u64           // of them, the counts its idle task ran: what the core had nothing to do for
+    tasks: usize        // the slots in use, stopped tasks' and the idle task's among them
+
+// Charge the running task on core `c` for the counts since the core's last charge. Called with the
+// core's interrupts masked, by the switch, the tick and the queries; before the core runs its tasks there
+// is no task to charge.
+private[kernel] charge[P: Port](p: *P, c: *Core)
+    if !c.sched.started() then return
+    val now = p.run_count()
+    val spent = u64(now - c.counted_at)
+    c.counted_at = now
+    c.elapsed += spent
+    val i = usize(c.sched.running)
+    c.sched.tasks[i].run_time += spent
+    if c.sched.tasks[i].base == IDLE_PRIORITY then c.idle_time += spent
+
+// Count from now on core `c`: what came before belongs to no task.
+private[kernel] start_counting[P: Port](p: *P, c: *Core)
+    c.counted_at = p.run_count()
+    c.elapsed = 0
+    c.idle_time = 0
+
+// Set the running core's statistics back to 0, every task's run time with them, and count from now.
+reset_stats[P: Port](p: *P)
+    val c = here(p)
+    val state = p.mask()
+    for i in 0..<option_tasks
+        c.sched.tasks[i].run_time = 0
+    start_counting(p, c)
+    p.restore(state)
+
+// The statistics of the task `t` names, the running task charged up to now. Only the owner asks.
+task_stats[P: Port](p: *P, t: Task) -> Result[TaskStats, TaskError]
+    owned(p, t)?
+    val c = here(p)
+    val state = p.mask()
+    charge(p, c)
+    val result = c.sched.check(t) match
+        Ok(i) ->
+            val k = &c.sched.tasks[i]
+            Ok(TaskStats(k.run_time, k.state, k.suspended, k.priority))
+        Err(e) -> Err(e)
+    p.restore(state)
+    result
+
+// The running core's statistics, the running task charged up to now.
+core_stats[P: Port](p: *P) -> CoreStats
+    val c = here(p)
+    val state = p.mask()
+    charge(p, c)
+    var tasks: usize = 0
+    for i in 0..<option_tasks
+        if c.sched.tasks[i].state != TaskState.Free then tasks += 1
+    val result = CoreStats(c.elapsed, c.idle_time, tasks)
+    p.restore(state)
+    result
+
+// The bytes of the stack of the task `t` names that it has never reached: the least room it has ever
+// had left above its stack's reserve. It is a lower bound on the room left, since a word the task wrote
+// with `STACK_PAINT` itself reads as never reached. The scan runs with the core's interrupts unmasked;
+// a task deleted, or its slot reused, while it ran is `Stale`. Only the owner asks.
+stack_high_water[P: Port](p: *P, t: Task) -> Result[usize, TaskError]
+    owned(p, t)?
+    val c = here(p)
+    val (base, bytes) = stack_of(p, c, t)?
+    val free = untouched(base + p.reserved(base, bytes), base + bytes)
+    // The handle still names the task the bounds were read for: a stack reused under the scan is not its.
+    val _ = stack_of(p, c, t)?
+    Ok(free)
+
+// The bounds of the stack of the task `t` names on core `c`, read with the core's interrupts masked.
+private stack_of[P: Port](p: *P, c: *Core, t: Task) -> Result[(usize, usize), TaskError]
+    val state = p.mask()
+    val result = c.sched.check(t) match
+        Ok(i) -> Ok((c.sched.tasks[i].stack, c.sched.tasks[i].stack_bytes))
+        Err(e) -> Err(e)
+    p.restore(state)
+    result
+
+// The bytes from `low` up towards `top` that still hold `STACK_PAINT`, a word at a time.
+private[kernel] untouched(low: usize, top: usize) -> usize
+    var at = (low + 3) & ~3usize
+    var free: usize = 0
+    while at + 4 <= top
+        val word: *u32 = ptr_cast(at)
+        if *word != STACK_PAINT then break
+        free += 4
+        at += 4
+    free
+
+// Fill `stack` with `STACK_PAINT`.
+private[kernel] paint(stack: []u32)
+    for k in 0..<stack.len
+        stack[k] = STACK_PAINT

@@ -84,9 +84,10 @@ struct Tcb
     stack_bytes: usize
     suspended: bool     // kept out of its FIFO whatever its state, until resumed
     boost: u8           // the highest priority it inherited while it holds a mutex, or 0
+    run_time: u64       // the core's counter counts it has run since it was created or the core's statistics were reset
 
 // An empty slot, in its first generation.
-private[kernel] val FREE_TCB: Tcb = Tcb(0, 0, TaskState.Free, 1, NONE, NONE, 0, NONE, 0, 0, None, 0, 0, false, 0)
+private[kernel] val FREE_TCB: Tcb = Tcb(0, 0, TaskState.Free, 1, NONE, NONE, 0, NONE, 0, 0, None, 0, 0, false, 0, 0)
 
 // One core's table and the choices made over it. It holds no hardware state, so the host tests drive
 // one directly; each core's is in its `Core`.
@@ -134,6 +135,7 @@ impl Scheduler
         self.tasks[i].held = 0
         self.tasks[i].boost = 0
         self.tasks[i].suspended = false
+        self.tasks[i].run_time = 0
         self.tasks[i].state = TaskState.Ready
         self.push(i)
 
@@ -384,6 +386,8 @@ private[kernel] add_task[P: Port](p: *P, core: u32, stack: []u32, entry: *extern
     val me = here_id(p)
     if remote(core, me, core_state(core)) then return Err(TaskError.Remote)
     val c = core_at(core)
+    // Painted before its first frame is laid on top, and before the mask: no task runs on it yet.
+    paint(stack)
     val state = p.mask()
     val result = c.sched.free_slot() match
         Some(i) ->
@@ -482,6 +486,7 @@ yield_now[P: Port](p: *P)
 run[P: Port](p: *P, idle_stack: []u32, idle: *extern() -> never) -> never
     val c = here(p)
     if c.sched.started() then panic("skiff: the core already runs its tasks")
+    paint(idle_stack)
     val _ = p.mask()
     c.sched.free_slot() match
         Some(i) ->
@@ -490,13 +495,15 @@ run[P: Port](p: *P, idle_stack: []u32, idle: *extern() -> never) -> never
         None -> panic("skiff: no slot left for the idle task")
     val sp = c.sched.first()
     protect_running(p, c)
+    start_counting(p, c)
     p.start_first(sp)
 
 // The switch: called by the port with the running task's stack pointer `sp`; answers the stack pointer
-// of the task to run next.
+// of the task to run next. The task switched away from is charged its run time first.
 switch_context[P: Port](p: *P, sp: usize) -> usize
     val c = here(p)
     val state = p.mask()
+    charge(p, c)
     val next = c.sched.switch(sp)
     protect_running(p, c)
     p.restore(state)

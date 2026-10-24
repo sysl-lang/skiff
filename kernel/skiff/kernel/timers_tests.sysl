@@ -247,3 +247,127 @@ service_waits()
     assert(waiter(waiter_index(0, service.slot())).outcome == Outcome.TimedOut, "by its timeout")
     timer_turn(&r)
     assert(were([t], [3]), "and the turn calls the timer")
+
+// The port the commanding callbacks below command through, set by the test.
+private var port: *Recorder = null
+
+// Record, then stop the timer at its third call.
+private stop_third(t: *Timer, due: u32)
+    record(t, due)
+    if calls == 3 then assert(t.stop(port, 0).is_ok(), "stopped from its callback")
+
+// Record, then reset the timer at its second call.
+private reset_second(t: *Timer, due: u32)
+    record(t, due)
+    if calls == 2 then assert(t.reset(port, 0).is_ok(), "reset from its callback")
+
+// Record, then give the timer a period of 5 at its first call.
+private stretch_first(t: *Timer, due: u32)
+    record(t, due)
+    if calls == 1 then assert(t.change_period(port, 5, 0).is_ok(), "changed from its callback")
+
+// Record, and at timer 0's first call stop timer 1.
+private stop_other(t: *Timer, due: u32)
+    record(t, due)
+    if t == &timers[0] && calls == 1 then assert(timers[1].stop(port, 0).is_ok(), "stopped from another's callback")
+
+// The slot of a task other than the service, which `queued_then_own` plays.
+private var other: u16 = 0
+
+// Record; at the first call, as another task, start the timer (queued: the other task is not the
+// service), then, as the service again, stop it.
+private queued_then_own(t: *Timer, due: u32)
+    record(t, due)
+    if calls != 1 then return
+    val c = here(port)
+    val service = c.sched.running
+    c.sched.running = other
+    assert(t.start(port, 0).is_ok(), "started by another task")
+    c.sched.running = service
+    assert_eq(timers_here(port).commands.waiting(port), 1)
+    assert(t.stop(port, 0).is_ok(), "stopped from its callback")
+    assert_eq(timers_here(port).commands.waiting(port), 0)
+
+// A periodic timer of period 3 started on tick 0 and calling `callback`, with the service's first turn
+// late, on tick 20, with six expiries overdue.
+private bunched(r: *Recorder, callback: TimerCallback) -> *Timer
+    port = r
+    assert(create_timer(r, &timers[0], "t", 3, true, callback).is_ok(), "created")
+    val t = &timers[0]
+    assert(t.start(r, 0).is_ok(), "started")
+    turn_at(r, 20)
+    t
+
+@test("a callback's stop of its own timer takes effect at once, so a late turn calls none of the overdue expiries after it")
+stop_from_callback()
+    var r = recorder(1, 0)
+    val t = bunched(&r, &stop_third)
+    assert(were([t, t, t], [3, 6, 9]), "three calls, the third stopping it")
+    assert(t.is_active(&r) == Ok(false), "inactive")
+    assert_eq(timers_here(&r).commands.waiting(&r), 0)
+    turn_at(&r, 40)
+    assert_eq(calls, 3)
+    assert_eq(r.masked, 0)
+
+@test("a callback's reset of its own timer counts from the tick it was sent on, so a late turn calls none of the overdue expiries after it")
+reset_from_callback()
+    var r = recorder(1, 0)
+    val t = bunched(&r, &reset_second)
+    assert(were([t, t], [3, 6]), "two calls, the second resetting it")
+    assert_eq(t.expiry, 23)
+    turn_at(&r, 22)
+    assert_eq(calls, 2)
+    turn_at(&r, 23)
+    assert(were([t, t, t], [3, 6, 23]), "next due a period after the reset")
+
+@test("a callback's change of its own timer's period counts from the tick it was sent on, so a late turn calls none of the overdue expiries after it")
+change_period_from_callback()
+    var r = recorder(1, 0)
+    val t = bunched(&r, &stretch_first)
+    assert(were([t], [3]), "one call, changing it")
+    assert_eq(t.expiry, 25)
+    assert_eq(t.period, 5)
+    turn_at(&r, 30)
+    assert(were([t, t, t], [3, 25, 30]), "every 5 from the change")
+
+@test("a callback's stop of another timer of its core takes effect at once, before that timer's overdue expiry is called")
+stop_other_from_callback()
+    var r = recorder(1, 0)
+    port = &r
+    val a = make(&r, 0, 3, false)
+    assert(create_timer(&r, &timers[1], "u", 4, false, &stop_other).is_ok(), "created")
+    a.callback = &stop_other
+    assert(a.start(&r, 0).is_ok(), "a started")
+    assert(timers[1].start(&r, 0).is_ok(), "b started")
+    turn_at(&r, 0)
+    turn_at(&r, 10)
+    assert(were([a], [3]), "only the first, which stopped the second")
+    assert(timers[1].is_active(&r) == Ok(false), "the second inactive")
+
+@test("a command another task sent while a callback runs is carried out before the callback's own, in the order they were sent")
+queued_before_own()
+    var r = recorder(1, 0)
+    val service = create(&r, 0, serving_stacks[0], &serving, 3).unwrap()
+    other = u16(create(&r, 0, serving_stacks[1], &serving, 1).unwrap().slot())
+    here(&r).sched.first()
+    assert_eq(usize(here(&r).sched.running), service.slot())
+    val t = bunched(&r, &queued_then_own)
+    assert(were([t], [3]), "one call: the start before the stop, so the stop stands")
+    assert(t.is_active(&r) == Ok(false), "inactive")
+    turn_at(&r, 40)
+    assert_eq(calls, 1)
+
+@test("a command sent while no callback runs waits for the service's next turn")
+outside_callback_queues()
+    var r = recorder(1, 0)
+    port = &r
+    val t = make(&r, 0, 3, true)
+    assert(t.start(&r, 0).is_ok(), "started")
+    turn_at(&r, 0)
+    val s = timers_here(&r)
+    assert(!s.calling, "not calling between callbacks")
+    assert(t.stop(&r, 0).is_ok(), "stopped outside a callback")
+    assert_eq(s.commands.waiting(&r), 1)
+    assert(t.is_active(&r) == Ok(true), "still active: the service has not taken it")
+    turn_at(&r, 10)
+    assert_eq(calls, 0)

@@ -50,10 +50,19 @@ trait Isolation
     // Run thread mode unprivileged, or privileged, from the return to the task about to run.
     privilege(*self, unprivileged: bool)
 
+// The running core's own free-running counter, which the kernel charges each task's run time in (DESIGN
+// "Statistics"). It counts up by one per unit of time, at whatever rate the chip has, and wraps at 2^32.
+// The kernel only takes the difference of two readings on one core, so the counter needs no particular
+// start, and each core may have its own at a rate of its own; but two readings on a core must come less
+// than 2^32 counts apart, and every tick takes one, so a counter that wraps no more than once a tick is
+// enough.
+trait RunCounter
+    run_count(*self) -> u32
+
 // The kernel's view of the processor and the machine under it. An arch package, a chip package and a
 // board program together implement it; the kernel itself knows nothing about the hardware beyond what
 // this trait says.
-trait Port: Doorbell + Cache + Protection + Isolation
+trait Port: Doorbell + Cache + Protection + Isolation + RunCounter
     // Write `bytes` to this core's console, waiting for room as long as it takes.
     write(*self, bytes: []const u8)
 

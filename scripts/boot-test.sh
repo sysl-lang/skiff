@@ -77,6 +77,13 @@ skiff: core $1 a mutex holder kept the priority it inherited through two changes
 skiff: core $1 a stopped waiter left its queue, and the unit given after it stayed
 skiff: core $1 task control refuses a stale handle"
 }
+# Statistics, every core (boards/scenarios, stats.sysl), each judged by relations between measurements:
+# a spinning task charged more than a sleeping one, and the idle task more at rest than while it spun; a
+# deep task's stack high-water mark below a shallow one's, and both handles refused once deleted.
+stats_expected() {
+    echo "skiff: core $1 a busy task ran more than a sleeping one, and the idle task ran most once neither did
+skiff: core $1 a task recursing 8 deep left less of its stack untouched than a shallow one, and both handles went stale"
+}
 # Software timers, every core (boards/scenarios, timers.sysl): a periodic timer called a period apart
 # with no drift though one call ran late, a one-shot called once, a timer stopped before its expiry never
 # called, a reset and a changed period counting from their commands, and every callback in its own core's
@@ -118,6 +125,7 @@ $(waits_expected 0)
 $(messages_expected 0)
 $(timers_expected 0)
 $(control_expected 0)
+$(stats_expected 0)
 $(protection_expected 0)"
 
 # The AN521's two cores run one image, each greeting and ticking on the UART of its own number, then
@@ -136,7 +144,8 @@ $(protection_expected 0)"
 # of core 1 holds while a task of middling priority works on core 1, and must have it within a bound
 # through the boost core 1's inbox carries, which the owner gives up with the mutex. Each core runs its own
 # software timers, and core 0 may not command one of core 1's. Core 0 suspends, resumes, re-prioritizes
-# and stops a task of core 1 through core 1's inbox, and core 1 checks each step. Core 1 then faults
+# and stops a task of core 1 through core 1's inbox, and core 1 checks each step. Each core measures its
+# own tasks on its own counter, and core 0 is refused core 1's. Core 1 then faults
 # on purpose: it
 # reports the fault on its own console and stops. Core 0 sees it stopped, takes more ticks, finds that
 # the time base counted its own ticks and none of core 1's, and stops the machine with status 0.
@@ -158,6 +167,8 @@ $(timers_expected 0)
 skiff: core 0 may not command a timer of core 1
 $(control_expected 0)
 skiff: core 0 asked core 1 to suspend, resume, re-prioritize and stop a task of its own, and core 1 did
+$(stats_expected 0)
+skiff: core 0 is refused another core's task statistics and high-water marks
 $(protection_expected 0)
 skiff: core 0 an unprivileged task on core 1 took a unit core 0 gave and set flags core 0 waited on, through its grants
 skiff: core 0 sees core 1 stopped
@@ -185,6 +196,7 @@ skiff: core 1 the low task gave up the priority core 0's task lent it with the m
 $(timers_expected 1)
 $(control_expected 1)
 skiff: core 1 core 0 suspended, resumed, re-prioritized and stopped a task of core 1 through its inbox
+$(stats_expected 1)
 $(protection_expected 1)
 skiff: core 1 an unprivileged task took a unit core 0 gave, through its grant
 skiff: core 1 fault BusFault"
