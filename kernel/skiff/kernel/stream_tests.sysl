@@ -1,0 +1,408 @@
+module skiff.kernel
+@tests
+
+// Stream and message buffers on the host, over the recording port (kernel_tests.sysl). A call that
+// blocks returns at once, with the task blocked and the switch asked for; the test makes the scheduler
+// choose, as the switch would, and a woken task's second look is the test calling again, as the task's
+// loop does when it runs.
+
+private loop_body() -> never
+    loop
+        ()
+
+private var stream_stacks: [4][64]u32
+
+// A task at `priority` on core 0 of `r`, on stack `i`.
+private stream_task(r: *Recorder, i: usize, priority: u8) -> Task = create(r, 0, stream_stacks[i], &loop_body, priority).unwrap()
+
+// The switch the port was asked for: the scheduler's choice runs.
+private pick(r: *Recorder)
+    val _ = switch_context(r, 0)
+
+// `t`'s wait record.
+private record_of(t: Task) -> *Waiter = waiter(waiter_index(t.core(), t.slot()))
+
+// Bytes `from`, `from + 1`, … into `buf`.
+private count_into(buf: []u8, from: u8)
+    for i in 0..<buf.len
+        buf[i] = from + u8(i)
+
+// Whether `buf` holds `from`, `from + 1`, ….
+private counts(buf: []const u8, from: u8) -> bool
+    for i in 0..<buf.len
+        if buf[i] != from + u8(i) then return false
+    true
+
+// ---- stream buffers ----
+
+@test("a stream is first in first out round its ring, writing what fits and reading what is there")
+stream_wraps()
+    var r = recorder(1, 0)
+    var s: StreamBuffer[8] = StreamBuffer.new("s", 1)
+    var data: [10]u8 = [0; 10]
+    count_into(data[..], 1)
+    assert_eq(s.try_send(&r, data[..<5]), 5)
+    var got: [8]u8 = [0; 8]
+    assert_eq(s.try_receive(&r, got[..<3]), 3)
+    assert(counts(got[..<3], 1), "1, 2, 3")
+    count_into(data[..], 6)
+    assert_eq(s.try_send(&r, data[..]), 6)
+    assert_eq(s.available(&r), 8)
+    assert_eq(s.space(&r), 0)
+    assert_eq(s.try_send(&r, data[..<1]), 0)
+    assert_eq(s.try_receive(&r, got[..]), 8)
+    assert(counts(got[..], 4), "4 to 11, across the end of the ring")
+    assert_eq(s.try_receive(&r, got[..]), 0)
+    assert_eq(s.capacity(), 8)
+    assert_eq(r.masked, 0)
+
+@test("many rounds through a ring of an odd size keep every byte in order")
+stream_many_wraps()
+    var r = recorder(1, 0)
+    var s: StreamBuffer[7] = StreamBuffer.new("s", 1)
+    var next: u8 = 0
+    var expect: u8 = 0
+    var chunk: [5]u8 = [0; 5]
+    var got: [3]u8 = [0; 3]
+    var ok = true
+    for round in 0..<200
+        count_into(chunk[..], next)
+        val n = s.try_send(&r, chunk[..<1 +round % 5])
+        next += u8(n)
+        val m = s.try_receive(&r, got[..<1 +round % 3])
+        if !counts(got[..<m], expect) then ok = false
+        expect += u8(m)
+    assert(ok, "in order")
+    assert_eq(usize(next - expect), s.available(&r))
+
+@test("zero bytes are sent and received at once, with nothing waiting")
+stream_zero_length()
+    var r = recorder(1, 0)
+    var s: StreamBuffer[4] = StreamBuffer.new("s", 2)
+    val t = stream_task(&r, 0, 2)
+    val _ = stream_task(&r, 1, 1)
+    here(&r).sched.first()
+    var none: [0]u8
+    assert_eq(s.send(&r, none[..], FOREVER), 0)
+    assert_eq(s.receive(&r, none[..], FOREVER), 0)
+    assert(state(&r, t) == Ok(TaskState.Ready), "never blocked")
+    assert_eq(s.w.queue.count, 0)
+
+@test("a reader waits for the trigger level, and is woken by the byte that reaches it")
+stream_trigger()
+    var r = recorder(1, 0)
+    var s: StreamBuffer[8] = StreamBuffer.new("s", 4)
+    val rx = stream_task(&r, 0, 2)
+    val _ = stream_task(&r, 1, 1)
+    here(&r).sched.first()
+    var got: [8]u8 = [0; 8]
+    assert_eq(s.receive(&r, got[..], FOREVER), 0)
+    assert(state(&r, rx) == Ok(TaskState.Blocked), "blocked")
+    pick(&r)
+    val one: [1]u8 = [9]
+    for _ in 0..<3
+        assert_eq(s.try_send(&r, one[..]), 1)
+        assert(record_of(rx).outcome == Outcome.Waiting, "below the level")
+    assert_eq(s.try_send(&r, one[..]), 1)
+    assert(record_of(rx).outcome == Outcome.Woken, "the fourth byte reaches it")
+    assert(state(&r, rx) == Ok(TaskState.Ready), "ready")
+    pick(&r)
+    assert_eq(s.receive(&r, got[..], FOREVER), 4)
+    assert_eq(r.masked, 0)
+
+@test("a try receive reads below the trigger level, and the level answers 1 for 0 and N above N")
+stream_trigger_bounds()
+    var r = recorder(1, 0)
+    var s: StreamBuffer[4] = StreamBuffer.new("s", 3)
+    val one: [1]u8 = [5]
+    var got: [4]u8 = [0; 4]
+    assert_eq(s.try_send(&r, one[..]), 1)
+    assert_eq(s.try_receive(&r, got[..]), 1)
+    assert(!s.set_trigger(&r, 5), "above N")
+    assert_eq(s.level(), 3)
+    assert(s.set_trigger(&r, 0), "0")
+    assert_eq(s.level(), 1)
+    var high: StreamBuffer[4] = StreamBuffer.new("high", 9)
+    assert_eq(high.level(), 4)
+
+@test("lowering the trigger level wakes a reader the bytes there now satisfy")
+stream_set_trigger_wakes()
+    var r = recorder(1, 0)
+    var s: StreamBuffer[8] = StreamBuffer.new("s", 4)
+    val rx = stream_task(&r, 0, 2)
+    val _ = stream_task(&r, 1, 1)
+    here(&r).sched.first()
+    var got: [8]u8 = [0; 8]
+    val _ = s.receive(&r, got[..], FOREVER)
+    pick(&r)
+    val two: [2]u8 = [1, 2]
+    assert_eq(s.try_send(&r, two[..]), 2)
+    assert(record_of(rx).outcome == Outcome.Waiting, "2 of 4")
+    assert(s.set_trigger(&r, 2), "set")
+    assert(record_of(rx).outcome == Outcome.Woken, "2 of 2")
+
+@test("a send writes what fits and waits for room for the rest; a read that frees room wakes it")
+stream_partial_send()
+    var r = recorder(1, 0)
+    var s: StreamBuffer[4] = StreamBuffer.new("s", 1)
+    val tx = stream_task(&r, 0, 2)
+    val _ = stream_task(&r, 1, 1)
+    here(&r).sched.first()
+    var data: [6]u8 = [0; 6]
+    count_into(data[..], 10)
+    assert_eq(s.send(&r, data[..], FOREVER), 4)
+    assert(state(&r, tx) == Ok(TaskState.Blocked), "waits for room")
+    assert_eq(record_of(tx).value, 1)
+    pick(&r)
+    var got: [3]u8 = [0; 3]
+    assert_eq(s.try_receive(&r, got[..<1]), 1)
+    assert(record_of(tx).outcome == Outcome.Woken, "a byte of room")
+    pick(&r)
+    assert_eq(s.send(&r, data[4..], FOREVER), 1)
+    assert(record_of(tx).outcome == Outcome.Waiting, "the second look writes one and waits again for the last byte")
+    assert_eq(s.try_receive(&r, got[..]), 3)
+    assert(counts(got[..], 11), "11, 12, 13")
+    assert(record_of(tx).outcome == Outcome.Woken, "woken again")
+    pick(&r)
+    assert_eq(s.send(&r, data[5..], FOREVER), 1)
+    assert_eq(s.try_receive(&r, got[..]), 2)
+    assert(counts(got[..<2], 14), "14, 15")
+
+@test("a timed receive below the level ends TimedOut, and the bytes stay for the next read")
+stream_receive_times_out()
+    var r = recorder(1, 0)
+    var s: StreamBuffer[8] = StreamBuffer.new("s", 4)
+    val rx = stream_task(&r, 0, 2)
+    val _ = stream_task(&r, 1, 1)
+    here(&r).sched.first()
+    var got: [8]u8 = [0; 8]
+    assert_eq(s.receive(&r, got[..], 2), 0)
+    pick(&r)
+    val two: [2]u8 = [7, 8]
+    val _ = s.try_send(&r, two[..])
+    tick(&r)
+    assert(record_of(rx).outcome == Outcome.Waiting, "1 tick")
+    tick(&r)
+    assert(record_of(rx).outcome == Outcome.TimedOut, "2 ticks")
+    assert_eq(s.w.queue.count, 0)
+    assert_eq(s.try_receive(&r, got[..]), 2)
+
+@test("a timed send to a full stream ends TimedOut and leaves the queue")
+stream_send_times_out()
+    var r = recorder(1, 0)
+    var s: StreamBuffer[2] = StreamBuffer.new("s", 1)
+    val tx = stream_task(&r, 0, 2)
+    val _ = stream_task(&r, 1, 1)
+    here(&r).sched.first()
+    val three: [3]u8 = [1, 2, 3]
+    assert_eq(s.send(&r, three[..], 1), 2)
+    pick(&r)
+    tick(&r)
+    assert(record_of(tx).outcome == Outcome.TimedOut, "timed out")
+    assert_eq(s.w.queue.count, 0)
+    assert_eq(ticks_left(5, ticks()), 0)
+    assert_eq(ticks_left(5, ticks() + 3), 3)
+    assert_eq(ticks_left(FOREVER, 0), FOREVER)
+
+@test("a wake goes to the reader for bytes and the writers for room, each side its own")
+stream_sides()
+    var r = recorder(1, 0)
+    var s: StreamBuffer[2] = StreamBuffer.new("s", 2)
+    val rx = stream_task(&r, 0, 3)
+    val tx = stream_task(&r, 1, 2)
+    val _ = stream_task(&r, 2, 1)
+    here(&r).sched.first()
+    var got: [2]u8 = [0; 2]
+    val _ = s.receive(&r, got[..], FOREVER)
+    pick(&r)
+    assert(current(&r) == tx, "the writer runs")
+    val three: [3]u8 = [1, 2, 3]
+    assert_eq(s.send(&r, three[..], FOREVER), 2)
+    assert(record_of(rx).outcome == Outcome.Woken, "the reader, for the level")
+    assert(record_of(tx).outcome == Outcome.Waiting, "the writer waits for room")
+    pick(&r)
+    assert(current(&r) == rx, "the reader runs")
+    assert_eq(s.receive(&r, got[..], FOREVER), 2)
+    assert(record_of(tx).outcome == Outcome.Woken, "the room wakes the writer")
+
+@test("an empty stream may be reset; one with a waiter may not")
+stream_reset()
+    var r = recorder(1, 0)
+    var s: StreamBuffer[4] = StreamBuffer.new("s", 1)
+    val _ = stream_task(&r, 0, 2)
+    val _ = stream_task(&r, 1, 1)
+    here(&r).sched.first()
+    val two: [2]u8 = [1, 2]
+    val _ = s.try_send(&r, two[..])
+    assert(s.reset(&r), "nobody waits")
+    assert_eq(s.available(&r), 0)
+    var got: [2]u8 = [0; 2]
+    val _ = s.receive(&r, got[..], FOREVER)
+    assert(!s.reset(&r), "a reader waits")
+
+@test("a zeroed stream, as `.shared` holds one before it is filled in, is empty with a level of 1")
+stream_zeroed()
+    var r = recorder(1, 0)
+    var s: StreamBuffer[4]
+    assert_eq(s.level(), 1)
+    val two: [2]u8 = [3, 4]
+    assert_eq(s.try_send(&r, two[..]), 2)
+    var got: [4]u8 = [0; 4]
+    assert_eq(s.try_receive(&r, got[..]), 2)
+    assert(got[0] == 3 && got[1] == 4, "the bytes")
+
+@test("deleting a waiting reader withdraws it")
+stream_delete_withdraws()
+    var r = recorder(1, 0)
+    var s: StreamBuffer[4] = StreamBuffer.new("s", 1)
+    val rx = stream_task(&r, 0, 2)
+    val _ = stream_task(&r, 1, 1)
+    here(&r).sched.first()
+    var got: [2]u8 = [0; 2]
+    val _ = s.receive(&r, got[..], FOREVER)
+    pick(&r)
+    assert(delete(&r, rx).is_ok(), "deleted")
+    assert_eq(s.w.queue.count, 0)
+    val one: [1]u8 = [1]
+    assert_eq(s.try_send(&r, one[..]), 1)
+
+// ---- message buffers ----
+
+@test("messages are whole, in order and of their own lengths, round the ring")
+message_whole()
+    var r = recorder(1, 0)
+    var m: MessageBuffer[16] = MessageBuffer.new("m")
+    var out: [12]u8 = [0; 12]
+    var got: [12]u8 = [0; 12]
+    var ok = true
+    for round in 0usize..<50
+        val n = 1 + round % 7
+        count_into(out[..<n], u8(round))
+        if !m.try_send(&r, out[..<n]) then ok = false
+        if m.next_length(&r) != n then ok = false
+        if m.try_receive(&r, got[..]) != n || !counts(got[..<n], u8(round)) then ok = false
+    assert(ok, "every message whole")
+    assert_eq(m.next_length(&r), 0)
+    assert_eq(m.try_receive(&r, got[..]), 0)
+
+@test("each message takes its prefix: two of 4 fill 16 bytes, and a third is refused")
+message_prefix()
+    var r = recorder(1, 0)
+    var m: MessageBuffer[16] = MessageBuffer.new("m")
+    val four: [4]u8 = [1, 2, 3, 4]
+    assert(m.try_send(&r, four[..]), "first")
+    assert_eq(m.space(&r), 4)
+    assert(m.try_send(&r, four[..]), "second")
+    assert_eq(m.space(&r), 0)
+    val one: [1]u8 = [9]
+    assert(!m.try_send(&r, one[..]), "full")
+    assert_eq(m.s.available(&r), 16)
+
+@test("an empty message and one longer than the buffer could ever hold are refused at once, nothing waiting")
+message_refused()
+    var r = recorder(1, 0)
+    var m: MessageBuffer[16] = MessageBuffer.new("m")
+    val t = stream_task(&r, 0, 2)
+    val _ = stream_task(&r, 1, 1)
+    here(&r).sched.first()
+    var none: [0]u8
+    assert(!m.send(&r, none[..], FOREVER), "empty")
+    var long: [13]u8 = [0; 13]
+    assert(!m.send(&r, long[..], FOREVER), "13 + 4 > 16")
+    assert(m.send(&r, long[..<12], FOREVER), "12 + 4 fits")
+    assert(state(&r, t) == Ok(TaskState.Ready), "never blocked")
+
+@test("a receive into a buffer too short for the message answers 0 and leaves it")
+message_short_buffer()
+    var r = recorder(1, 0)
+    var m: MessageBuffer[16] = MessageBuffer.new("m")
+    val five: [5]u8 = [1, 2, 3, 4, 5]
+    assert(m.try_send(&r, five[..]), "sent")
+    var small: [4]u8 = [0; 4]
+    assert_eq(m.try_receive(&r, small[..]), 0)
+    assert_eq(m.next_length(&r), 5)
+    var big: [8]u8 = [0; 8]
+    assert_eq(m.try_receive(&r, big[..]), 5)
+    assert(counts(big[..<5], 1), "whole")
+
+@test("a message larger than the free room is refused with no timeout, and with one waits until a receive makes the room")
+message_waits_for_room()
+    var r = recorder(1, 0)
+    var m: MessageBuffer[16] = MessageBuffer.new("m")
+    val tx = stream_task(&r, 0, 2)
+    val _ = stream_task(&r, 1, 1)
+    here(&r).sched.first()
+    var six: [6]u8 = [0; 6]
+    count_into(six[..], 1)
+    assert(m.try_send(&r, six[..]), "10 of 16")
+    var eight: [8]u8 = [0; 8]
+    count_into(eight[..], 20)
+    assert(!m.try_send(&r, eight[..]), "12 more do not fit")
+    assert(!m.send(&r, eight[..], FOREVER), "waits")
+    assert(state(&r, tx) == Ok(TaskState.Blocked), "blocked")
+    assert_eq(record_of(tx).value, 12)
+    pick(&r)
+    var got: [8]u8 = [0; 8]
+    assert_eq(m.try_receive(&r, got[..]), 6)
+    assert(record_of(tx).outcome == Outcome.Woken, "room for 12")
+    pick(&r)
+    assert(m.send(&r, eight[..], FOREVER), "the second look sends it")
+    assert_eq(m.try_receive(&r, got[..]), 8)
+    assert(counts(got[..], 20), "whole")
+
+@test("the best writer waits its turn: one needing less room behind it is not woken first")
+message_writer_order()
+    var r = recorder(1, 0)
+    var m: MessageBuffer[16] = MessageBuffer.new("m")
+    val big = stream_task(&r, 0, 3)
+    val small = stream_task(&r, 1, 2)
+    val _ = stream_task(&r, 2, 1)
+    here(&r).sched.first()
+    var data: [12]u8 = [0; 12]
+    assert(m.try_send(&r, data[..<2]), "6 bytes")
+    assert(m.try_send(&r, data[..<2]), "12 bytes")
+    assert(!m.send(&r, data[..<7], FOREVER), "big waits for 11")
+    pick(&r)
+    assert(current(&r) == small, "small runs")
+    assert(!m.send(&r, data[..<1], FOREVER), "small waits for 5")
+    pick(&r)
+    var got: [4]u8 = [0; 4]
+    assert_eq(m.try_receive(&r, got[..]), 2)
+    assert(record_of(big).outcome == Outcome.Waiting, "10 free of 11")
+    assert(record_of(small).outcome == Outcome.Waiting, "behind big")
+    assert_eq(m.try_receive(&r, got[..]), 2)
+    assert(record_of(big).outcome == Outcome.Woken, "16 free")
+    assert(record_of(small).outcome == Outcome.Woken, "5 left over: room for both")
+
+@test("a timed message receive ends TimedOut; a message sent while it waits wakes it")
+message_receive_waits()
+    var r = recorder(1, 0)
+    var m: MessageBuffer[16] = MessageBuffer.new("m")
+    val rx = stream_task(&r, 0, 2)
+    val _ = stream_task(&r, 1, 1)
+    here(&r).sched.first()
+    var got: [8]u8 = [0; 8]
+    assert_eq(m.receive(&r, got[..], 1), 0)
+    pick(&r)
+    tick(&r)
+    assert(record_of(rx).outcome == Outcome.TimedOut, "timed out")
+    assert_eq(m.s.w.queue.count, 0)
+    pick(&r)
+    assert_eq(m.receive(&r, got[..], FOREVER), 0)
+    pick(&r)
+    val three: [3]u8 = [4, 5, 6]
+    assert(m.try_send(&r, three[..]), "sent")
+    assert(record_of(rx).outcome == Outcome.Woken, "woken")
+    pick(&r)
+    assert_eq(m.receive(&r, got[..], FOREVER), 3)
+    assert(counts(got[..<3], 4), "4, 5, 6")
+
+@test("a zeroed message buffer works as a new one")
+message_zeroed()
+    var r = recorder(1, 0)
+    var m: MessageBuffer[8]
+    val two: [2]u8 = [1, 2]
+    assert(m.try_send(&r, two[..]), "sent")
+    var got: [4]u8 = [0; 4]
+    assert_eq(m.try_receive(&r, got[..]), 2)
+    assert(m.reset(&r), "reset")

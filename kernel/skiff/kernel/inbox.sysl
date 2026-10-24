@@ -63,8 +63,13 @@ answer_doorbell[P: Port](p: *P)
     if c.sched.preempted() then p.request_switch()
     p.restore(state)
 
-// Apply message `m` to core `c`, the running core. A handle that no longer names a task is dropped.
+// Apply message `m` to core `c`, the running core. A handle that no longer names a task is dropped. A
+// `Control` names a slot rather than a task: what it applies is what the slot's request holds, for the
+// task its note names now (control.sysl).
 private apply[P: Port](p: *P, c: *Core, m: Message)
+    if m.kind == MessageKind.Control
+        answer_request(p, c, m.task.slot())
+        return
     val i = c.sched.check(m.task) match
         Ok(i) -> i
         Err(_) -> return
@@ -75,13 +80,13 @@ private apply[P: Port](p: *P, c: *Core, m: Message)
         MessageKind.Hand ->
             if wait_ended(c, i)
                 c.sched.tasks[i].held += 1
-                if m.priority > c.sched.tasks[i].priority then c.sched.set_effective(i, m.priority)
+                val e = c.sched.inherit(i, m.priority)
+                if e > c.sched.tasks[i].priority then c.sched.set_effective(i, e)
                 val _ = c.sched.wake(i)
         MessageKind.Boost ->
             val mutex: *Mutex = ptr_cast(at_place(m.mutex))
-            if m.priority > c.sched.tasks[i].priority && mutex.owned_by(p, m.task)
-                reprioritize(p, c, i, m.priority)
-        MessageKind.Empty -> ()
+            if mutex.owned_by(p, m.task) then inherit(p, c, i, m.priority)
+        _ -> ()
 
 // Whether task `i` of core `c` is blocked on a wait that has ended: what a wake or a hand-over finds.
 private wait_ended(c: *Core, i: usize) -> bool = c.sched.tasks[i].state == TaskState.Blocked && waiter(waiter_index(c.id, i)).outcome != Outcome.Waiting

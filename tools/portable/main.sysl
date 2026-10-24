@@ -4,7 +4,7 @@
 
 import sysl.sync.{Atomic, Lock}
 import skiff.kernel
-import skiff.kernel.{Access, Cache, Channel, Doorbell, Grant, Isolation, Pool, Port, Protection, Queue, Region, RegionError, Slot}
+import skiff.kernel.{Access, Cache, Channel, Doorbell, Grant, Isolation, MessageBuffer, Pool, Port, Protection, Queue, Region, RegionError, Slot, StreamBuffer}
 
 struct Nothing
 end Nothing
@@ -54,6 +54,8 @@ private var mail: Queue[u32, 2] = Queue.new("mail")
 private var events = kernel.Flags.new("events", 0)
 private var blocks: Pool[2, 48] = Pool.new("blocks", 1)
 private var carried: Channel[2] = Channel.new("carried")
+private var bytes: StreamBuffer[8] = StreamBuffer.new("bytes", 1)
+private var framed: MessageBuffer[12] = MessageBuffer.new("framed")
 
 // A message wider than a word, so a queue copies a struct in and out.
 struct Reading
@@ -92,7 +94,18 @@ private buffers(m: *Nothing) -> bool
     if carried.waiting(m) != 1 || carried.capacity() != 2 then return false
     val r = carried.receive(m, &blocks, 1)
     if r.is_none() || carried.try_receive(m, &blocks).is_some() then return false
-    blocks.give(m, r.unwrap()).is_ok()
+    blocks.give(m, r.unwrap()).is_ok() && streams(m)
+
+// The stream and message buffers, over the port.
+private streams(m: *Nothing) -> bool
+    val data: [6]u8 = [1, 2, 3, 4, 5, 6]
+    var got: [8]u8 = [0; 8]
+    if bytes.send(m, data[..], 1) != 6 || bytes.try_send(m, data[..]) != 2 || !bytes.set_trigger(m, 4) then return false
+    if bytes.receive(m, got[..], 1) != 8 || bytes.try_receive(m, got[..]) != 0 || !bytes.reset(m) then return false
+    if bytes.available(m) != 0 || bytes.space(m) != bytes.capacity() then return false
+    if !framed.send(m, data[..], 1) || framed.try_send(m, data[..]) || framed.next_length(m) != 6 then return false
+    if framed.space(m) == 0 || framed.receive(m, got[..], 1) != 6 || framed.try_receive(m, got[..]) != 0 then return false
+    framed.reset(m)
 
 private body() -> never
     loop
@@ -116,6 +129,19 @@ private handshake() -> bool
     meeting.answer(PLACED)
     meeting.await_answer() == PLACED
 
+private var beat: kernel.Timer
+
+private beaten(t: *kernel.Timer, due: u32) = ()
+
+// Software timers and their service, over the port.
+private timers(m: *Nothing) -> bool
+    if kernel.create_timer(m, &beat, "beat", 3, true, &beaten).is_err() || beat.core() != Some(0) then return false
+    if beat.start(m, 1).is_err() || beat.reset(m, 0).is_err() || beat.change_period(m, 4, 0).is_err() then return false
+    kernel.timer_turn(m)
+    if beat.is_active(m) != Ok(true) || beat.stop(m, kernel.FOREVER).is_err() then return false
+    if m.cores() > 3 then kernel.serve_timers(m)
+    true
+
 private var user_stack: [64]u32 = [0; 64]
 
 // Unprivileged tasks, their calls, and stopping a task, over the port.
@@ -128,6 +154,11 @@ private protection(m: *Nothing) -> bool
         val _ = kernel.serve_call(m)
         if !kernel.end_call(m) then return false
     kernel.stop_running(m, kernel.Violation.Breach).is_none()
+
+// Task control, here and through another core's inbox.
+private control(m: *Nothing, t: kernel.Task) -> bool
+    if kernel.suspend(m, t).is_ok() || kernel.resume(m, t).is_ok() || kernel.set_priority(m, t, 2).is_ok() then return false
+    kernel.stop(m, t).is_err() && kernel.suspended(m, t).is_err() && kernel.priority(m, t).is_err()
 
 @export("main")
 probe() -> i32
@@ -142,7 +173,8 @@ probe() -> i32
     val here = kernel.here(&m)
     if !kernel.stopped(here.id) || kernel.expired(kernel.ticks(), 0) then return 1
     if t.is_err() || kernel.delete(&m, t.unwrap()).is_ok() then return 1
-    if !protection(&m) || !handshake() then return 1
+    if !control(&m, t.unwrap()) then return 1
+    if !protection(&m) || !timers(&m) || !handshake() then return 1
     if here.sched.started()
         kernel.sleep(&m, 1)
         kernel.sleep_until(&m, 1)

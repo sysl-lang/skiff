@@ -12,6 +12,7 @@ enum MessageKind: u8
     Wake = 1        // a wait of the task has ended: make it ready
     Hand = 2        // a mutex was handed to the task: it holds one more, runs at `priority` at least, and is made ready
     Boost = 3       // a task waiting on `mutex`, which the task holds, outranks it: it runs at `priority` at least
+    Control = 4     // another core asked to suspend, resume, re-prioritize or stop the task in the slot: its request says which
 
 // What one core asks of another through its inbox: a kind, the task it is about, a priority, and for a
 // boost the mutex the waiter waits on, which lies in `.shared` since two cores use it. The mutex is named
@@ -23,10 +24,10 @@ struct Message
     priority: u8
     mutex: usize
 
-// How many messages one inbox ring holds: one wake or hand-over for each task of the receiving core and
-// one boost for each task of the sending core (DESIGN "Inboxes"). One slot more stays empty, so that a
-// full ring and an empty one can be told apart.
-const INBOX_MESSAGES: usize = 2 * option_tasks
+// How many messages one inbox ring holds: one wake or hand-over and one control request for each task of
+// the receiving core, and one boost for each task of the sending core (DESIGN "Inboxes"). One slot more
+// stays empty, so that a full ring and an empty one can be told apart.
+const INBOX_MESSAGES: usize = 3 * option_tasks
 private[kernel] const INBOX_SLOTS: usize = INBOX_MESSAGES + 1
 
 // A single-producer, single-consumer ring of messages: the sending core writes `tail` and the slots, the

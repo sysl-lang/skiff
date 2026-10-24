@@ -69,7 +69,7 @@ private var objects: scenarios.Across
 // The status `boot` answered, which the last task stops the machine with.
 private var status: i32 = 0
 
-private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo)
+private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject)
 
 // Called by the chip's reset handler once there is a stack and `.bss` and `.shared` are zero.
 @export("skiff_main")
@@ -114,6 +114,10 @@ private task_owner() -> never = scenarios.owner_task(&Board())
 private task_worker() -> never = scenarios.worker_task(&Board())
 private task_waiter() -> never = scenarios.waiter_task(&Board())
 private task_echo() -> never = scenarios.echo_task(&Board())
+private task_timers() -> never = kernel.serve_timers(&Board())
+private task_hog() -> never = scenarios.hog_task(&Board())
+private fired(t: *kernel.Timer, due: u32) = scenarios.fired(&Board(), t, due)
+private task_subject() -> never = scenarios.subject_task(&Board())
 
 // Raise timer 0's interrupt from software; the timer itself never runs.
 private raise() = armv7m.pend_irq(mps2.TIMER0_IRQ)
@@ -127,11 +131,13 @@ private task_idle() -> never
     loop
         armv7m.wait_for_interrupt()
 
-// R: the handle checks, then the waits, then the end of the run.
+// R: the handle checks, then the waits, the timers, task control and the protection, then the end of the run.
 private task_r() -> never
     var board = Board()
     scenarios.check_handles(&board, &entries)
     scenarios.await_waits(&board)
+    scenarios.timers(&board, &entries)
+    scenarios.control(&board, &entries)
     scenarios.protection(&board, &entries, CODE, UART)
     armv7m.halt(status)
 

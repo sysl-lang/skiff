@@ -24,9 +24,11 @@ struct Note
     task: Task          // the task it is for, or `NO_TASK` while its slot is free
     value: u32
     pending: bool       // a notification has come since the task last took one
+    request: Request    // what other cores asked of the task (control.sysl), under the same lock
 
 // Make the note of slot `slot` of core `core` the note of `task`, with no value and nothing pending:
-// `NO_TASK` when the slot is freed. Taken under the note's lock, with no other lock held.
+// `NO_TASK` when the slot is freed. What another core asked of the slot's last task is dropped with it.
+// Taken under the note's lock, with no other lock held.
 private[kernel] renew_note[P: Port](p: *P, core: u32, slot: usize, task: Task)
     val n = note_of(core, slot)
     var l = n.w.lock.on(p)
@@ -34,6 +36,7 @@ private[kernel] renew_note[P: Port](p: *P, core: u32, slot: usize, task: Task)
     n.task = task
     n.value = 0
     n.pending = false
+    n.request.drop_asked()
     l.release()
 
 // Send to the task `t` names, changing its value by `action` with `value`, and end its wait for a

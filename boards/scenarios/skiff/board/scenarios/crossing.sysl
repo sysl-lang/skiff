@@ -49,6 +49,7 @@ waits_across[P: Port](p: *P, me: u32)
     else if me == 1
         take_across(p)
     buffers_across(p, me)
+    streams_across(p, me)
     val _ = common.crossed.add(1)
 
 // Core 0's side: lock `turns`, then end each of core 1's waits 2 ticks after it says it is about to wait.

@@ -1,0 +1,220 @@
+module skiff.board.scenarios
+
+import sysl.sync.Atomic
+import skiff.kernel
+import skiff.kernel.{FOREVER, MessageBuffer, Port, StreamBuffer}
+
+// Stream and message buffers, each core with buffers of its own, between the receiver (priority 4), the
+// sender (3) and the raiser (2), from tick 132 of the core's epoch, after the buffers (buffers.sysl):
+//
+//   - Tick 132, the receiver reads `trickle`, a stream of 10 bytes with a trigger level of 4, into 8
+//     bytes of its own, until it has 12. Timer 0's interrupt writes one byte each time it is raised, with
+//     `try_send`: once at tick 85 (waits.sysl), then 11 times from tick 133 by the raiser, which the
+//     receiver outranks. Every read must be of 4 bytes at least, and the bytes 0 to 11 in order, across
+//     the end of the ring.
+//   - Tick 135, the sender writes `PIPED` bytes 7 at a time into `piped`, a stream of 16, blocking for
+//     room; once a write has found no room the receiver reads them, 5 at a time, waiting when the ring
+//     is empty. Every byte must arrive in order, and some read must have been short.
+//   - Tick 138, the sender sends `FRAMED` messages of 1 to 8 bytes into `framed`, a message buffer of 24,
+//     blocking for room; once a send has found the buffer too full the receiver takes them. Each must
+//     arrive whole, of its own length and in order.
+//   - Tick 141, the receiver writes 2 bytes into `sparse`, whose trigger level is 4, and reads it with a
+//     timeout of 3: it must have the 2 bytes when the wait ends, after 3 ticks. Then a timed receive on
+//     the empty message buffer must end after 3 ticks with nothing.
+//
+// On a machine of several cores the hammers go on, after their buffers across cores (buffers.sysl), to
+// pass `ACROSS` bytes and `ACROSS_MESSAGES` messages from core 0 to core 1 through a stream of 64 and a
+// message buffer of 64 in `.shared`, both cores blocking: core 1 checks every byte and every message.
+
+// How many bytes the sender writes through `piped`, and how many messages through `framed`.
+private const PIPED: usize = 40
+private const FRAMED: u32 = 30
+
+// How many bytes the interrupt writes into `trickle`, and its trigger level.
+private const TRICKLED: usize = 12
+private const TRICKLE_LEVEL: usize = 4
+
+// How many bytes and messages core 0 passes to core 1.
+private const ACROSS: usize = 3000
+private const ACROSS_MESSAGES: u32 = 200
+private const ACROSS_LEVEL: usize = 8
+
+// Each core's own buffers, laid into the image as constant data.
+private var trickle: [kernel.CORES]StreamBuffer[10] = [StreamBuffer.new("trickle", TRICKLE_LEVEL); kernel.CORES]
+private var piped: [kernel.CORES]StreamBuffer[16] = [StreamBuffer.new("piped", 1); kernel.CORES]
+private var framed: [kernel.CORES]MessageBuffer[24] = [MessageBuffer.new("framed"); kernel.CORES]
+private var sparse: [kernel.CORES]StreamBuffer[8] = [StreamBuffer.new("sparse", 4); kernel.CORES]
+// How many bytes the interrupt has written into `trickle`; whether a write or a send found no room.
+private var trickled: [kernel.CORES]u8
+private var piped_full: [kernel.CORES]Atomic[u32]
+private var framed_full: [kernel.CORES]Atomic[u32]
+
+// The buffers between the cores: in `.shared`, so filled in by core 0.
+@section(".shared")
+private var poured: StreamBuffer[64]
+@section(".shared")
+private var posted_frames: MessageBuffer[64]
+
+// Fill in the shared objects of the streams. Core 0 calls it before any other core starts.
+fill_shared_streams()
+    poured = StreamBuffer.new("poured", ACROSS_LEVEL)
+    posted_frames = MessageBuffer.new("posted frames")
+
+// What timer 0's interrupt writes: the next byte of `trickle`.
+private[scenarios] trickle_from_interrupt[P: Port](p: *P, me: u32)
+    val b: [1]u8 = [trickled[me]]
+    if trickle[me].try_send(p, b[..]) == 1 then trickled[me] += 1
+
+// The raiser's part: raise timer 0's interrupt 11 more times from tick 133.
+private[scenarios] streams_raiser[P: Port](p: *P, me: u32, e: *Entries)
+    kernel.sleep_until(p, epochs[me] + 133)
+    for _ in 1..<TRICKLED
+        (e.raise)()
+
+// The receiver's side of the streams.
+private[scenarios] streams_receiver[P: Port](p: *P, me: u32)
+    kernel.sleep_until(p, epochs[me] + 132)
+    var got: [8]u8
+    var total: usize = 0
+    var shortest = got.len
+    var in_order = true
+    while total < TRICKLED
+        val n = trickle[me].receive(p, got[..], FOREVER)
+        if n < shortest then shortest = n
+        for i in 0..<n
+            if got[i] != u8(total + i) then in_order = false
+        total += n
+    if in_order && shortest >= TRICKLE_LEVEL
+        say(p, "a stream an interrupt wrote woke its reader only at the trigger level, every byte in order\n")
+    else
+        say(p, "a stream an interrupt wrote woke its reader with ")
+        kernel.write_dec(p, u32(shortest))
+        p.write(" bytes, or out of order\n".bytes)
+
+    await_full(p, &piped_full[me])
+    var five: [5]u8
+    var read: usize = 0
+    var short = false
+    in_order = true
+    while read < PIPED
+        val n = piped[me].receive(p, five[..], FOREVER)
+        if n < five.len then short = true
+        for i in 0..<n
+            if five[i] != u8(read + i) then in_order = false
+        read += n
+    if in_order && short && piped_full[me].load() != 0
+        say(p, "a stream carried 40 bytes in order through a ring of 16, written 7 and read 5 at a time\n")
+    else
+        say(p, "a stream lost its order, or was never full, or never read short\n")
+
+    await_full(p, &framed_full[me])
+    var whole = true
+    for n in 0u32..<FRAMED
+        val length = framed[me].receive(p, got[..], FOREVER)
+        if length != frame_length(n) then whole = false
+        for i in 0..<length
+            if got[i] != u8(n + u32(i)) then whole = false
+    if whole && framed_full[me].load() != 0
+        say(p, "a message buffer carried 30 messages whole and in order through a full buffer\n")
+    else
+        say(p, "a message buffer split, lost or reordered a message, or was never full\n")
+
+    kernel.sleep_until(p, epochs[me] + 141)
+    val two: [2]u8 = [21, 22]
+    val _ = sparse[me].try_send(p, two[..])
+    var start = kernel.ticks()
+    val partial = sparse[me].receive(p, got[..], 3)
+    var waited = kernel.ticks() - start
+    if partial == 2 && got[0] == 21 && got[1] == 22 && waited >= 3
+        say(p, "a timed stream receive took the 2 bytes there after 3 ticks\n")
+    else
+        say(p, "a timed stream receive took ")
+        kernel.write_dec(p, u32(partial))
+        p.write(" bytes after ".bytes)
+        kernel.write_dec(p, waited)
+        p.write(" ticks\n".bytes)
+    start = kernel.ticks()
+    val nothing = framed[me].receive(p, got[..], 3)
+    waited = kernel.ticks() - start
+    if nothing == 0 && waited >= 3
+        say(p, "a timed message receive timed out after 3 ticks\n")
+    else
+        say(p, "a timed message receive ended after ")
+        kernel.write_dec(p, waited)
+        p.write(" ticks\n".bytes)
+
+// The sender's side of the streams.
+private[scenarios] streams_sender[P: Port](p: *P, me: u32)
+    kernel.sleep_until(p, epochs[me] + 135)
+    var seven: [7]u8
+    var written: usize = 0
+    while written < PIPED
+        val n = if PIPED - written < seven.len then PIPED - written else seven.len
+        for i in 0..<n
+            seven[i] = u8(written + i)
+        if piped[me].space(p) < n then piped_full[me].store(1)
+        written += piped[me].send(p, seven[..<n], FOREVER)
+
+    kernel.sleep_until(p, epochs[me] + 138)
+    var frame: [8]u8
+    for n in 0u32..<FRAMED
+        val length = frame_length(n)
+        for i in 0..<length
+            frame[i] = u8(n + u32(i))
+        if framed[me].space(p) < length then framed_full[me].store(1)
+        val _ = framed[me].send(p, frame[..<length], FOREVER)
+
+// Sleep a tick at a time until the sender says it found no room, and so waits for it. Multi-threaded TCG
+// delivers a core's ticks late and in bunches, so a tick later is no promise that the sender ran first.
+private await_full[P: Port](p: *P, full: *Atomic[u32])
+    while full.load() == 0 do kernel.sleep(p, 1)
+
+// The length of message number `n`: 1 to 8.
+private frame_length(n: u32) -> usize = usize(1 + n % 8)
+
+// The hammers' streams between the cores, after their buffers: core 0 writes and sends, core 1 reads
+// and receives, both blocking.
+private[scenarios] streams_across[P: Port](p: *P, me: u32)
+    if me == 0
+        var chunk: [13]u8
+        var written: usize = 0
+        while written < ACROSS
+            val n = if ACROSS - written < chunk.len then ACROSS - written else chunk.len
+            for i in 0..<n
+                chunk[i] = across_byte(written + i)
+            written += poured.send(p, chunk[..<n], FOREVER)
+        var frame: [16]u8
+        for n in 0u32..<ACROSS_MESSAGES
+            val length = usize(1 + n % 16)
+            for i in 0..<length
+                frame[i] = u8((n + u32(i)) & 0xff)
+            val _ = posted_frames.send(p, frame[..<length], FOREVER)
+    else if me == 1
+        var got: [20]u8
+        var read: usize = 0
+        var exact = true
+        while read < ACROSS
+            // The last bytes may be fewer than the trigger level: wait for no more than are left.
+            if ACROSS - read < ACROSS_LEVEL
+                val _ = poured.set_trigger(p, ACROSS - read)
+            val n = poured.receive(p, got[..], FOREVER)
+            for i in 0..<n
+                if got[i] != across_byte(read + i) then exact = false
+            read += n
+        if exact
+            say(p, "read 3000 bytes core 0 wrote into a stream, every byte in order\n")
+        else
+            say(p, "read bytes core 0 wrote into a stream out of order\n")
+        var whole = true
+        for n in 0u32..<ACROSS_MESSAGES
+            val length = posted_frames.receive(p, got[..], FOREVER)
+            if length != usize(1 + n % 16) then whole = false
+            for i in 0..<length
+                if got[i] != u8((n + u32(i)) & 0xff) then whole = false
+        if whole
+            say(p, "received 200 messages core 0 sent, each whole and in order\n")
+        else
+            say(p, "received messages core 0 sent split or out of order\n")
+
+// Byte `i` of the stream between the cores.
+private across_byte(i: usize) -> u8 = u8((i * 7 + i / 256) & 0xff)

@@ -15,7 +15,7 @@ import skiff.kernel.{FOREVER, Mutex, Port, Semaphore}
 //   - Tick 84, the same task takes a semaphore that timer 0's interrupt gives; at tick 85 the raiser
 //     (priority 2) raises the interrupt from software, and the waiting task (3) must have run by the
 //     time the raiser goes on. The interrupt also sends a message, which messages.sysl looks for.
-//   - Tick 140, on a machine of several cores, once the messages (messages.sysl) are done: every core's
+//   - Tick 155, on a machine of several cores, once the messages (messages.sysl) are done: every core's
 //     hammer gives a semaphore in `.shared` twice and takes it once, for `ROUNDS` rounds, all at once
 //     with the others; the count left must be exact, which it is only if the object's lock keeps the
 //     cores out of each other's way. Then core 0 gives `PASSED` units one at a time through a semaphore
@@ -45,6 +45,7 @@ fill_shared_objects()
     fill_shared_messages()
     fill_shared_crossing()
     fill_shared_buffers()
+    fill_shared_streams()
     fill_shared_protection()
 
 // Work for `ticks` ticks of the time base without blocking or yielding.
@@ -112,6 +113,7 @@ raiser_task[P: Port](p: *P, e: *Entries) -> never
         say(p, "an interrupt's give woke a waiting task at once\n")
     else
         say(p, "an interrupt's give did not wake the waiting task at once\n")
+    streams_raiser(p, me, e)
     val _ = waits_done[me].add(1)
     kernel.exit(p)
 
@@ -121,12 +123,13 @@ interrupt[P: Port](p: *P)
     val me = kernel.here_id(p)
     val _ = from_irq[me].give(p)
     val _ = from_interrupt[me].try_send(p, kernel.ticks() - epochs[me])
+    trickle_from_interrupt(p, me)
 
-// A hammer, at tick 90 on every core of several: give twice, take once, `ROUNDS` times, all cores at
+// A hammer, at tick 155 on every core of several: give twice, take once, `ROUNDS` times, all cores at
 // once. Then core 0 passes `PASSED` units to core 1, which takes them without waiting.
 hammer_task[P: Port](p: *P) -> never
     val me = kernel.here_id(p)
-    kernel.sleep_until(p, epochs[me] + 140)
+    kernel.sleep_until(p, epochs[me] + 155)
     val c = common
     val _ = c.arrived_hammers.add(1)
     while c.arrived_hammers.load() < u32(kernel.CORES) do ()
