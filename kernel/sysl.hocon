@@ -12,6 +12,7 @@ options {
   tasks   { type = usize, default = 16, range = [2, 4096], doc = "how many tasks each core's table holds, its idle task among them; a handle's slot has 12 bits" }
   map_regions { type = usize, default = 6, range = [2, 16], doc = "regions in an unprivileged task's map, its stack among them" }
   grants  { type = usize, default = 4, range = [0, 32], doc = "objects one unprivileged task may be granted" }
+  timer_commands { type = usize, default = 8, range = [1, 256], doc = "how many commands each core's timer service queues before a sender must wait" }
   cache_line { type = usize, default = 32, range = [4, 256], doc = "the data cache's line in bytes, a power of two: every pool buffer starts on one and fills whole lines" }
 }
 

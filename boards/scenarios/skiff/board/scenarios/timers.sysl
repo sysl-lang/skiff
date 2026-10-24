@@ -1,0 +1,152 @@
+module skiff.board.scenarios
+
+import sysl.sync.Atomic
+import skiff.kernel
+import skiff.kernel.{Port, Task, Timer, TimerError}
+
+// Software timers, on every core, run by R once the waits have reported, from its tick t. R creates the
+// core's timer service (priority 6, its body `kernel.serve_timers`) and a hog (7), creates five timers
+// and starts them all at t:
+//
+//   - beat, periodic, 3 ticks: called 5 times, due a period apart. The hog spins from t+7 to t+11 above
+//     the service, so the call due at t+9 runs late, and the next is still due at t+12: no drift.
+//   - once, one-shot, 5: called once, and then inactive.
+//   - muted, periodic, 10: stopped at t+1, never called.
+//   - snooze, one-shot, 10: reset at t+2, so due 10 ticks after the reset, not at t+10.
+//   - stretch, periodic, 10: its period changed to 3 at t+1, so due 3 after the change and every 3 after.
+//
+// Every callback checks that it runs on its timer's core, as that core's service task. The checks read
+// the deadlines the callbacks were given, not the clock, so they hold however late QEMU delivers a core's
+// tick. On a machine of several cores, core 0 may not start core 1's beat.
+
+private const SERVICE_PRIORITY: u8 = 6
+private const HOG_PRIORITY: u8 = 7
+private const BEATS: u32 = 5
+private const STRETCHES: u32 = 2
+
+private var beat: [kernel.CORES]Timer
+private var once: [kernel.CORES]Timer
+private var muted: [kernel.CORES]Timer
+private var snooze: [kernel.CORES]Timer
+private var stretch: [kernel.CORES]Timer
+// Each core's service's stack and its hog's.
+private var timer_stacks: [kernel.CORES][2][STACK_WORDS]u32
+private var services: [kernel.CORES]Task
+private var timers_start: [kernel.CORES]u32
+private var beat_dues: [kernel.CORES][BEATS]u32
+private var beat_calls: [kernel.CORES]Atomic[u32]
+private var late_beats: [kernel.CORES]Atomic[u32]
+private var once_calls: [kernel.CORES]Atomic[u32]
+private var muted_calls: [kernel.CORES]Atomic[u32]
+private var snooze_calls: [kernel.CORES]Atomic[u32]
+private var snooze_due: [kernel.CORES]u32
+private var stretch_dues: [kernel.CORES][STRETCHES]u32
+private var stretch_calls: [kernel.CORES]Atomic[u32]
+private var strays: [kernel.CORES]Atomic[u32]
+
+// Whether core 1's beat has been created, for core 0 to try commanding it.
+@section(".shared")
+private var beat_published: Atomic[u32]
+
+// The timers' callback, on whichever timer expired.
+fired[P: Port](p: *P, t: *Timer, due: u32)
+    val me = kernel.here_id(p)
+    if t.core() != Some(me) || kernel.current(p) != services[me] then val _ = strays[me].add(1)
+    if t == &beat[me]
+        val n = beat_calls[me].load()
+        if n < BEATS
+            beat_dues[me][n] = due
+            if kernel.ticks() - due >= 2 then val _ = late_beats[me].add(1)
+            if n + 1 == BEATS then accepted(t.stop(p, 0))
+        val _ = beat_calls[me].add(1)
+    else if t == &once[me]
+        val _ = once_calls[me].add(1)
+    else if t == &muted[me]
+        val _ = muted_calls[me].add(1)
+    else if t == &snooze[me]
+        snooze_due[me] = due
+        val _ = snooze_calls[me].add(1)
+    else if t == &stretch[me]
+        val n = stretch_calls[me].load()
+        if n < STRETCHES
+            stretch_dues[me][n] = due
+            if n + 1 == STRETCHES then accepted(t.stop(p, 0))
+        val _ = stretch_calls[me].add(1)
+
+// The hog: above the service from t+7 to t+11, so a call due then waits.
+hog_task[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    kernel.sleep_until(p, timers_start[me] + 7)
+    while kernel.ticks() - timers_start[me] < 11 do ()
+    kernel.exit(p)
+
+// R's software timers, on the running core.
+timers[P: Port](p: *P, e: *Entries)
+    val me = kernel.here_id(p)
+    services[me] = created(kernel.create(p, me, timer_stacks[me][0], e.timers, SERVICE_PRIORITY))
+    accepted(kernel.create_timer(p, &beat[me], "beat", 3, true, e.fired))
+    accepted(kernel.create_timer(p, &once[me], "once", 5, false, e.fired))
+    accepted(kernel.create_timer(p, &muted[me], "muted", 10, true, e.fired))
+    accepted(kernel.create_timer(p, &snooze[me], "snooze", 10, false, e.fired))
+    accepted(kernel.create_timer(p, &stretch[me], "stretch", 10, true, e.fired))
+    if me == 1 then beat_published.store(1)
+    val t = kernel.ticks()
+    timers_start[me] = t
+    val _ = created(kernel.create(p, me, timer_stacks[me][1], e.hog, HOG_PRIORITY))
+    for x in [&beat[me], &once[me], &muted[me], &snooze[me], &stretch[me]]
+        accepted(x.start(p, 0))
+    kernel.sleep_until(p, t + 1)
+    accepted(muted[me].stop(p, 0))
+    accepted(stretch[me].change_period(p, 3, 0))
+    kernel.sleep_until(p, t + 2)
+    accepted(snooze[me].reset(p, 0))
+    var waited: u32 = 0
+    while !all_called(me) && waited < 60
+        kernel.sleep(p, 1)
+        waited += 1
+    report_timers(p, me, t)
+    if kernel.CORES > 1 && me == 0
+        waited = 0
+        while beat_published.load() == 0 && waited < 200
+            kernel.sleep(p, 1)
+            waited += 1
+        if beat[1].start(p, 0) == Err(TimerError.Remote) && beat[1].stop(p, 0) == Err(TimerError.Remote)
+            say(p, "may not command a timer of core 1\n")
+        else
+            say(p, "commanded a timer of core 1\n")
+
+// Whether every timer that should be called has been, as often as it should.
+private all_called(me: u32) -> bool = beat_calls[me].load() >= BEATS && once_calls[me].load() >= 1 && snooze_calls[me].load() >= 1 && stretch_calls[me].load() >= STRETCHES
+
+// The verdicts, one line each.
+private report_timers[P: Port](p: *P, me: u32, t: u32)
+    var apart = beat_calls[me].load() == BEATS && beat_dues[me][0] - t >= 3 && beat_dues[me][0] - t <= 4
+    for n in 1..<BEATS
+        if beat_dues[me][n] != beat_dues[me][0] + 3 * n then apart = false
+    if apart && late_beats[me].load() >= 1
+        say(p, "a periodic timer was called 5 times a period apart, once late behind a busier task, with no drift\n")
+    else
+        say(p, "a periodic timer drifted, or was not called 5 times\n")
+    if once_calls[me].load() == 1 && once[me].is_active(p) == Ok(false)
+        say(p, "a one-shot timer was called once and went inactive\n")
+    else
+        say(p, "a one-shot timer was not called exactly once\n")
+    if muted_calls[me].load() == 0 && muted[me].is_active(p) == Ok(false)
+        say(p, "a timer stopped before it expired was never called\n")
+    else
+        say(p, "a stopped timer was called\n")
+    val reset_counted = snooze_calls[me].load() == 1 && snooze_due[me] - t >= 12
+    val first = stretch_dues[me][0] - t
+    val changed_counted = first >= 4 && first < 10 && stretch_dues[me][1] - stretch_dues[me][0] == 3
+    if reset_counted && changed_counted
+        say(p, "a reset timer and one whose period changed each counted from its command\n")
+    else
+        say(p, "a reset or a changed period did not count from its command\n")
+    if strays[me].load() == 0
+        say(p, "every timer callback ran in its own core's timer service\n")
+    else
+        say(p, "a timer callback ran outside its core's timer service\n")
+
+// A timer call the scenario cannot go on without.
+private accepted(result: Result[unit, TimerError])
+    if result.is_err() then panic("skiff: a scenario timer call was refused")

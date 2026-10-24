@@ -1,0 +1,70 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+import skiff.kernel.{Timer, TimerError}
+
+// Software timers on the host machine of three cores (machine.sysl): a timer is the core's that created
+// it, every other core is refused its commands, and only its own core's service calls it.
+
+private var playing: *Machine = null
+private var timers: [2]Timer
+private var cores_called: [4]u32
+private var dues_called: [4]u32
+private var calls: usize = 0
+
+// A callback recording the core it runs on and the tick it was due on.
+private fired(t: *Timer, due: u32)
+    cores_called[calls] = playing.me
+    dues_called[calls] = due
+    calls += 1
+
+@test("a timer is its creating core's: other cores are refused its commands, and only its own core's service calls it")
+timers_belong_to_their_core()
+    var m = machine()
+    begin(&m)
+    playing = &m
+    on(&m, 1)
+    val one = &timers[0]
+    assert(kernel.create_timer(&m, one, "one", 2, true, &fired).is_ok(), "created on core 1")
+    assert(one.core() == Some(1), "core 1's")
+    for other in [0u32, 2]
+        on(&m, other)
+        assert(one.start(&m, 0) == Err(TimerError.Remote), "start")
+        assert(one.stop(&m, 0) == Err(TimerError.Remote), "stop")
+        assert(one.reset(&m, 0) == Err(TimerError.Remote), "reset")
+        assert(one.change_period(&m, 3, 0) == Err(TimerError.Remote), "change")
+        assert(one.is_active(&m) == Err(TimerError.Remote), "is_active")
+    on(&m, 0)
+    val zero = &timers[1]
+    assert(kernel.create_timer(&m, zero, "zero", 3, false, &fired).is_ok(), "created on core 0")
+    assert(zero.start(&m, 0).is_ok(), "core 0 starts its own")
+    on(&m, 1)
+    assert(zero.stop(&m, 0) == Err(TimerError.Remote), "core 1 may not stop core 0's")
+    assert(one.start(&m, 0).is_ok(), "core 1 starts its own")
+    kernel.timer_turn(&m)
+    on(&m, 0)
+    kernel.timer_turn(&m)
+    kernel.tick(&m)
+    kernel.tick(&m)
+    kernel.timer_turn(&m)
+    on(&m, 2)
+    kernel.timer_turn(&m)
+    assert_eq(calls, 0)
+    on(&m, 1)
+    kernel.timer_turn(&m)
+    assert_eq(calls, 1)
+    assert_eq(cores_called[0], 1)
+    assert_eq(dues_called[0], 2)
+    on(&m, 0)
+    kernel.tick(&m)
+    on(&m, 1)
+    kernel.timer_turn(&m)
+    assert_eq(calls, 1)
+    on(&m, 0)
+    kernel.timer_turn(&m)
+    assert_eq(calls, 2)
+    assert_eq(cores_called[1], 0)
+    assert_eq(dues_called[1], 3)
+    assert(one.is_active(&m) == Err(TimerError.Remote), "core 0 still may not ask after core 1's")
+    assert(zero.is_active(&m) == Ok(false), "core 0's one-shot has expired")
