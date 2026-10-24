@@ -65,7 +65,7 @@ enum TaskState
     Ready           // in its priority's FIFO; the running task is ready too
     Sleeping        // in the timeout list, or asleep for good
     Blocked         // waiting on an object (waits.sysl), and in the timeout list if the wait has one
-    Stopped         // stopped for good by a fault its protection raised (protection.sysl), until deleted
+    Stopped         // stopped for good, by `stop` (control.sysl) or by a fault its protection raised (protection.sysl), until deleted or its slot is reused
 
 // One slot of a core's table: private to the core, and never pointed at from `.shared`.
 struct Tcb
@@ -82,9 +82,11 @@ struct Tcb
     on: Option[*Waitable]   // what its last wait was on
     stack: usize        // where its stack starts, and how many bytes it has: what the guard protects
     stack_bytes: usize
+    suspended: bool     // kept out of its FIFO whatever its state, until resumed
+    boost: u8           // the highest priority it inherited while it holds a mutex, or 0
 
 // An empty slot, in its first generation.
-private[kernel] val FREE_TCB: Tcb = Tcb(0, 0, TaskState.Free, 1, NONE, NONE, 0, NONE, 0, 0, None, 0, 0)
+private[kernel] val FREE_TCB: Tcb = Tcb(0, 0, TaskState.Free, 1, NONE, NONE, 0, NONE, 0, 0, None, 0, 0, false, 0)
 
 // One core's table and the choices made over it. It holds no hardware state, so the host tests drive
 // one directly; each core's is in its `Core`.
@@ -104,12 +106,16 @@ impl Scheduler
     // Whether the core runs its tasks.
     started(*self) -> bool = self.running != NONE
 
-    // The first free slot other than the running task's, or None when there is none. The running
-    // task's slot is free only between its exit and the switch away from it, which still saves its
-    // stack pointer there, so it is never given out.
+    // The first free slot other than the running task's, else the first slot of a stopped task other
+    // than the running task's, or None when there is neither. The running task's slot is free or stopped
+    // only between its exit or stop and the switch away from it, which still saves its stack pointer
+    // there, so it is never given out. A stopped task's slot is taken only when no slot is free, so its
+    // handle answers `Stopped` for as long as it can.
     free_slot(*self) -> Option[usize]
         for i in 0..<option_tasks
             if self.tasks[i].state == TaskState.Free && i != usize(self.running) then return Some(i)
+        for i in 0..<option_tasks
+            if self.tasks[i].state == TaskState.Stopped && i != usize(self.running) then return Some(i)
         None
 
     // Put a ready task in free slot `i`, on `stack`, its saved stack pointer `sp`.
@@ -118,12 +124,16 @@ impl Scheduler
         self.tasks[i].stack_bytes = stack.len * 4
         self.add_at(i, sp, priority)
 
-    // Put a ready task in free slot `i`, its saved stack pointer `sp`.
+    // Put a ready task in free slot `i`, its saved stack pointer `sp`. A stopped task's slot is freed
+    // first, so its handle goes stale.
     add_at(*self, i: usize, sp: usize, priority: u8)
+        if self.tasks[i].state == TaskState.Stopped then self.tasks[i].generation = next_generation(self.tasks[i].generation)
         self.tasks[i].sp = sp
         self.tasks[i].priority = priority
         self.tasks[i].base = priority
         self.tasks[i].held = 0
+        self.tasks[i].boost = 0
+        self.tasks[i].suspended = false
         self.tasks[i].state = TaskState.Ready
         self.push(i)
 
@@ -143,7 +153,7 @@ impl Scheduler
     delete(*self, t: Task) -> Result[bool, TaskError]
         val i = self.check(t)?
         if self.tasks[i].priority == IDLE_PRIORITY then return Err(TaskError.Idle)
-        if self.tasks[i].state == TaskState.Ready
+        if self.queued(i)
             self.unlink(i)
         else
             self.remove_timeout(i)
@@ -189,13 +199,47 @@ impl Scheduler
         self.tasks[i].state = TaskState.Sleeping
         self.tasks[i].later = NONE
 
-    // The running task stops for good: it waits in no list and is never made ready again, but keeps its
-    // slot, so its handle still names it.
-    stop(*self)
-        val i = usize(self.running)
-        self.unlink(i)
+    // The running task stops for good (`stop_at`).
+    stop(*self) = self.stop_at(usize(self.running))
+
+    // Task `i` stops for good: it leaves its FIFO and the timeout list and is never made ready again, but
+    // keeps its slot, so its handle still names it until the slot is reused. Its wait, if it waits, is the
+    // kernel's to withdraw first.
+    stop_at(*self, i: usize)
+        if self.queued(i) then self.unlink(i)
+        self.remove_timeout(i)
         self.tasks[i].state = TaskState.Stopped
-        self.tasks[i].later = NONE
+        self.tasks[i].suspended = false
+
+    // Whether task `i` is in its priority's FIFO: ready and not suspended.
+    queued(*self, i: usize) -> bool = self.tasks[i].state == TaskState.Ready && !self.tasks[i].suspended
+
+    // Suspend task `i`: it leaves its FIFO and is kept out of it until resumed. A wait it is in carries
+    // on, and a sleep or a wait that ends makes it ready but not runnable. Answers whether it is the
+    // running task, which the caller then switches away from.
+    suspend(*self, i: usize) -> bool
+        if !self.tasks[i].suspended
+            if self.queued(i) then self.unlink(i)
+            self.tasks[i].suspended = true
+        i == usize(self.running)
+
+    // Resume task `i`: a ready task goes back to the back of its FIFO; a sleeping or blocked one keeps
+    // waiting. Answers whether it is now ready and outranks the running task.
+    resume(*self, i: usize) -> bool
+        if !self.tasks[i].suspended then return false
+        self.tasks[i].suspended = false
+        if !self.queued(i) then return false
+        self.push(i)
+        self.outranks_running(i)
+
+    // Task `i` inherits `priority` while it holds a mutex: the boost it keeps is the highest it was lent.
+    // Answers the effective priority it should now run at, the higher of its base and its boost.
+    inherit(*self, i: usize, priority: u8) -> u8
+        if priority > self.tasks[i].boost then self.tasks[i].boost = priority
+        self.effective(i)
+
+    // The priority task `i` should run at: the higher of its base and what it inherited.
+    effective(*self, i: usize) -> u8 = if self.tasks[i].boost > self.tasks[i].base then self.tasks[i].boost else self.tasks[i].base
 
     // One of the owner's ticks, at time `now`: wake every sleeper whose deadline has come, then end the
     // running task's turn if another of its priority is ready. Answers whether to switch.
@@ -243,7 +287,7 @@ impl Scheduler
     // Make `priority` task `i`'s effective priority. A ready task moves to the back of its new
     // priority's FIFO; a blocked one's place among an object's waiters is the kernel's to change.
     set_effective(*self, i: usize, priority: u8)
-        if self.tasks[i].state == TaskState.Ready
+        if self.queued(i)
             self.unlink(i)
             self.tasks[i].priority = priority
             self.push(i)
@@ -255,9 +299,11 @@ impl Scheduler
         val h = self.highest()
         h != NONE && self.outranks_running(usize(h))
 
-    // Make task `i` ready. Answers whether it outranks the running task.
+    // Make task `i` ready. A suspended task is ready but stays out of its FIFO until resumed. Answers
+    // whether it is runnable and outranks the running task.
     make_ready(*self, i: usize) -> bool
         self.tasks[i].state = TaskState.Ready
+        if self.tasks[i].suspended then return false
         self.push(i)
         self.outranks_running(i)
 
@@ -266,7 +312,7 @@ impl Scheduler
     rotate(*self) -> bool
         if !self.started() then return false
         val r = usize(self.running)
-        if self.tasks[r].state != TaskState.Ready then return false
+        if !self.queued(r) then return false
         val p = usize(self.tasks[r].priority)
         if self.heads[p] == self.tails[p] then return false
         self.unlink(r)
@@ -374,8 +420,9 @@ delete[P: Port](p: *P, t: Task) -> Result[unit, TaskError]
     p.restore(state)
     result
 
-// The state of the task `t` names: `Ready`, which the running task is too, or `Sleeping`. Only the
-// owner asks.
+// The state of the task `t` names: `Ready`, which the running task is too, `Sleeping`, `Blocked` or
+// `Stopped`. A suspended task answers the state it would have unsuspended (`suspended` says whether it
+// is). Only the owner asks.
 state[P: Port](p: *P, t: Task) -> Result[TaskState, TaskError]
     owned(p, t)?
     val c = here(p)
@@ -387,7 +434,7 @@ state[P: Port](p: *P, t: Task) -> Result[TaskState, TaskError]
     result
 
 // Whether `t` names a core the running core may act for: one that exists, and is the running core.
-private owned[P: Port](p: *P, t: Task) -> Result[unit, TaskError]
+private[kernel] owned[P: Port](p: *P, t: Task) -> Result[unit, TaskError]
     if usize(t.core()) >= option_cores then return Err(TaskError.Stale)
     if t.core() != here_id(p) then return Err(TaskError.Remote)
     Ok(())

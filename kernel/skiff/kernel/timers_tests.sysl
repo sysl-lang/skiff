@@ -1,0 +1,249 @@
+module skiff.kernel
+@tests
+
+import sysl.sync.Ordering
+
+// Software timers on the host, over the recording port (kernel_tests.sysl). A test plays the service a
+// turn at a time (`timer_turn`) at the ticks it chooses, with the time base moved by core 0's tick, and
+// every callback records which timer it was called for and the tick it was due on.
+
+private var timers: [8]Timer
+private var called_timers: [16]*Timer
+private var called_dues: [16]u32
+private var calls: usize = 0
+
+private record(t: *Timer, due: u32)
+    called_timers[calls] = t
+    called_dues[calls] = due
+    calls += 1
+
+// Timer `i`, created on the running core with `period`, calling `record`.
+private make(r: *Recorder, i: usize, period: u32, periodic: bool) -> *Timer
+    assert(create_timer(r, &timers[i], "t", period, periodic, &record).is_ok(), "created")
+    &timers[i]
+
+// Tick core 0 until the time base reads `at`.
+private advance_to(r: *Recorder, at: u32)
+    while ticks() != at do tick(r)
+
+// A turn of the service at tick `at`.
+private turn_at(r: *Recorder, at: u32)
+    advance_to(r, at)
+    timer_turn(r)
+
+// Whether the calls so far were for `called`, due on `dues`, in that order.
+private were(called: []const *Timer, dues: []const u32) -> bool
+    if calls != called.len then return false
+    for i in 0..<calls
+        if called_timers[i] != called[i] || called_dues[i] != dues[i] then return false
+    true
+
+private serving() -> never
+    loop
+        ()
+
+private var serving_stacks: [2][64]u32
+
+@test("a one-shot timer expires once, a period after its start, and is then inactive")
+one_shot()
+    var r = recorder(1, 0)
+    val t = make(&r, 0, 3, false)
+    assert(t.is_active(&r) == Ok(false), "inactive when created")
+    assert(t.core() == Some(0), "core 0's")
+    assert(t.start(&r, 0).is_ok(), "started")
+    assert(t.is_active(&r) == Ok(false), "a command waiting for the service has changed nothing yet")
+    turn_at(&r, 0)
+    assert(t.is_active(&r) == Ok(true), "active once the service took the command")
+    turn_at(&r, 2)
+    assert_eq(calls, 0)
+    turn_at(&r, 3)
+    assert(were([t], [3]), "called once, for tick 3")
+    assert(t.is_active(&r) == Ok(false), "inactive once expired")
+    turn_at(&r, 10)
+    assert_eq(calls, 1)
+    assert_eq(r.masked, 0)
+
+@test("a periodic timer's next expiry is the last plus its period, so a late turn calls every missed one and it never drifts")
+periodic_no_drift()
+    var r = recorder(1, 0)
+    val t = make(&r, 0, 3, true)
+    assert(t.start(&r, 0).is_ok(), "started")
+    turn_at(&r, 0)
+    turn_at(&r, 4)
+    assert(were([t], [3]), "on time, a tick late")
+    turn_at(&r, 11)
+    assert(were([t, t, t], [3, 6, 9]), "the two it missed, late, in order")
+    assert_eq(t.expiry, 12)
+    turn_at(&r, 12)
+    turn_at(&r, 14)
+    turn_at(&r, 15)
+    assert(were([t, t, t, t, t], [3, 6, 9, 12, 15]), "back on its ticks")
+    assert(t.is_active(&r) == Ok(true), "still active")
+
+@test("a timer stopped before it expires is never called, and stopping an inactive one does nothing")
+stop_before_expiry()
+    var r = recorder(1, 0)
+    val t = make(&r, 0, 2, true)
+    assert(t.start(&r, 0).is_ok(), "started")
+    turn_at(&r, 0)
+    advance_to(&r, 1)
+    assert(t.stop(&r, 0).is_ok(), "stopped")
+    turn_at(&r, 1)
+    assert(t.is_active(&r) == Ok(false), "inactive")
+    turn_at(&r, 10)
+    assert_eq(calls, 0)
+    assert(t.stop(&r, 0).is_ok(), "stopped again")
+    assert(t.start(&r, 0).is_ok(), "a start and a stop queued together")
+    assert(t.stop(&r, 0).is_ok(), "the stop last")
+    turn_at(&r, 10)
+    turn_at(&r, 20)
+    assert_eq(calls, 0)
+    assert(timers_here(&r).head == null, "no active timer")
+
+@test("a reset starts the timer again from the tick of the reset")
+reset_restarts()
+    var r = recorder(1, 0)
+    val t = make(&r, 0, 4, false)
+    assert(t.start(&r, 0).is_ok(), "started")
+    turn_at(&r, 0)
+    advance_to(&r, 2)
+    assert(t.reset(&r, 0).is_ok(), "reset")
+    turn_at(&r, 4)
+    turn_at(&r, 5)
+    assert_eq(calls, 0)
+    turn_at(&r, 6)
+    assert(were([t], [6]), "a period after the reset")
+    assert(t.reset(&r, 0).is_ok(), "a reset of an inactive timer starts it")
+    turn_at(&r, 7)
+    turn_at(&r, 10)
+    assert(were([t, t], [6, 10]), "a period after the reset at 6")
+
+@test("a changed period counts from the change, starts an inactive timer, and must be above 0 and below 2^31")
+change_period_restarts()
+    var r = recorder(1, 0)
+    val t = make(&r, 0, 2, true)
+    assert(t.start(&r, 0).is_ok(), "started")
+    turn_at(&r, 0)
+    advance_to(&r, 1)
+    assert(t.change_period(&r, 5, 0).is_ok(), "changed")
+    turn_at(&r, 2)
+    assert_eq(calls, 0)
+    turn_at(&r, 6)
+    turn_at(&r, 11)
+    assert(were([t, t], [6, 11]), "every 5 from tick 1")
+    assert(t.change_period(&r, 0, 0) == Err(TimerError.Period), "0")
+    assert(t.change_period(&r, 0x8000_0000, 0) == Err(TimerError.Period), "2^31")
+    val u = make(&r, 1, 9, false)
+    assert(u.change_period(&r, 1, 0).is_ok(), "an inactive timer")
+    turn_at(&r, 11)
+    turn_at(&r, 12)
+    assert(were([t, t, u], [6, 11, 12]), "started by the change")
+
+@test("timers expiring on one tick are called in deadline order, equal deadlines in the order they were started")
+deadline_order()
+    var r = recorder(1, 0)
+    val a = make(&r, 0, 5, false)
+    val b = make(&r, 1, 2, false)
+    val c = make(&r, 2, 4, false)
+    val d = make(&r, 3, 4, false)
+    for t in [a, b, c, d]
+        assert(t.start(&r, 0).is_ok(), "started")
+    turn_at(&r, 0)
+    turn_at(&r, 10)
+    assert(were([b, c, d, a], [2, 4, 4, 5]), "soonest first")
+
+@test("a late turn interleaves a periodic timer's missed expiries with the other timers' by deadline")
+late_turn_interleaves()
+    var r = recorder(1, 0)
+    val p = make(&r, 0, 3, true)
+    val q = make(&r, 1, 7, false)
+    assert(q.start(&r, 0).is_ok(), "q")
+    assert(p.start(&r, 0).is_ok(), "p")
+    turn_at(&r, 0)
+    turn_at(&r, 10)
+    assert(were([p, p, q, p], [3, 6, 7, 9]), "by deadline")
+
+@test("expiries compare across the time base's wrap, in order and only once they have come")
+across_the_wrap()
+    var r = recorder(1, 0)
+    time_base().store(0xffff_fffe, Ordering.Relaxed)
+    val y = make(&r, 0, 3, true)
+    val x = make(&r, 1, 1, false)
+    assert(y.start(&r, 0).is_ok(), "y, due on 1 after the wrap")
+    assert(x.start(&r, 0).is_ok(), "x, due on the last tick before it")
+    timer_turn(&r)
+    assert_eq(calls, 0)
+    assert_eq(timers_here(&r).wait_from(ticks()), 1)
+    tick(&r)
+    timer_turn(&r)
+    assert(were([x], [0xffff_ffff]), "x")
+    assert_eq(timers_here(&r).wait_from(ticks()), 2)
+    turn_at(&r, 0)
+    assert_eq(calls, 1)
+    turn_at(&r, 1)
+    turn_at(&r, 4)
+    assert(were([x, y, y], [0xffff_ffff, 1, 4]), "y after the wrap, a period apart")
+
+@test("a command counts from the tick it was sent on, not the tick the service took it")
+counts_from_sending()
+    var r = recorder(1, 0)
+    val t = make(&r, 0, 3, false)
+    assert(t.start(&r, 0).is_ok(), "sent on 0")
+    turn_at(&r, 2)
+    assert_eq(calls, 0)
+    turn_at(&r, 3)
+    assert(were([t], [3]), "due on 3")
+    advance_to(&r, 5)
+    assert(t.start(&r, 0).is_ok(), "sent on 5")
+    turn_at(&r, 9)
+    assert(were([t, t], [3, 8]), "taken after its expiry, called at once for 8")
+
+@test("a full command queue refuses a command that may not wait, and takes one again once the service has turned")
+full_command_queue()
+    var r = recorder(1, 0)
+    val t = make(&r, 0, 3, false)
+    for _ in 0..<option_timer_commands
+        assert(t.start(&r, 0).is_ok(), "room")
+    assert(t.start(&r, 0) == Err(TimerError.Busy), "full")
+    assert(t.stop(&r, 0) == Err(TimerError.Busy), "full for a stop too")
+    timer_turn(&r)
+    assert(t.is_active(&r) == Ok(true), "the last start stood")
+    assert(t.stop(&r, 0).is_ok(), "room again")
+
+@test("a timer is refused a period of 0 or of 2^31, a second creation, and every command before it is created")
+refusals()
+    var r = recorder(1, 0)
+    assert(create_timer(&r, &timers[0], "t", 0, false, &record) == Err(TimerError.Period), "0")
+    assert(create_timer(&r, &timers[0], "t", 0x8000_0000, true, &record) == Err(TimerError.Period), "2^31")
+    assert(timers[0].core() == None, "not created by a refusal")
+    assert(timers[0].start(&r, 0) == Err(TimerError.NotCreated), "start")
+    assert(timers[0].stop(&r, 0) == Err(TimerError.NotCreated), "stop")
+    assert(timers[0].change_period(&r, 2, 0) == Err(TimerError.NotCreated), "change")
+    assert(timers[0].is_active(&r) == Err(TimerError.NotCreated), "active")
+    val t = make(&r, 0, 0x7fff_ffff, false)
+    assert(create_timer(&r, t, "t", 1, false, &record) == Err(TimerError.Created), "created once")
+    assert_eq(t.period, 0x7fff_ffff)
+    assert_eq(r.masked, 0)
+
+@test("the service waits on its commands through their wait queue until the soonest expiry, and forever with none")
+service_waits()
+    var r = recorder(1, 0)
+    val service = create(&r, 0, serving_stacks[0], &serving, 3).unwrap()
+    val _ = create(&r, 0, serving_stacks[1], &serving, 1).unwrap()
+    here(&r).sched.first()
+    val s = timers_here(&r)
+    assert_eq(s.wait_from(ticks()), FOREVER)
+    val t = make(&r, 0, 3, false)
+    assert(t.start(&r, 0).is_ok(), "started")
+    serve_once(&r)
+    assert(state(&r, service) == Ok(TaskState.Blocked), "waiting")
+    assert_eq(s.commands.w.queue.count, 1)
+    val _ = switch_context(&r, 0)
+    tick(&r)
+    tick(&r)
+    assert(state(&r, service) == Ok(TaskState.Blocked), "still waiting at 2")
+    tick(&r)
+    assert(state(&r, service) == Ok(TaskState.Ready), "woken at 3")
+    assert(waiter(waiter_index(0, service.slot())).outcome == Outcome.TimedOut, "by its timeout")
+    timer_turn(&r)
+    assert(were([t], [3]), "and the turn calls the timer")

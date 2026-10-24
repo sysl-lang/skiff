@@ -1,0 +1,168 @@
+module skiff.kernel
+
+import sysl.sync.Lock
+
+// Task control: suspending and resuming a task, changing its priority, and stopping it.
+//
+//   - A suspended task leaves its priority's FIFO and stays out of it until resumed, whatever else
+//     happens to it. A sleep or a wait it is in carries on: an object may still wake it or hand itself
+//     over, and its timeout still comes, which makes it ready but not runnable. Resumed, it runs as the
+//     wait ended. Resuming a task that sleeps or waits leaves it sleeping or waiting; resuming one that
+//     was never suspended does nothing.
+//   - A task's priority is its base, given at creation and changed by `set_priority`, and what it
+//     inherited from waiters on a mutex it holds, kept apart as its boost: it runs at the higher of the
+//     two, so a change of base never takes a boost away, and the boost goes when it holds no mutex. A
+//     waiting task whose priority changes moves in its object's queue. A raised waiter does not raise
+//     the owner of the mutex it waits on: inheritance is passed when the wait begins.
+//   - A stopped task never runs again. Its wait, if it waits, is withdrawn: it leaves the object's queue,
+//     so nothing is handed to it. It keeps what it holds: a mutex it owns stays owned, and its waiters
+//     wait until their timeouts. Its slot stays in use, so its handle answers `Stopped`, until a task is
+//     created with no free slot left, which takes the slot and changes its generation.
+//   - The idle task is none of these calls' to change (`Err(Idle)`).
+//
+// A task of the running core is acted on at once, and so is one of a core that has not started. A task
+// of another core that runs is asked for through that core's inbox: the request is recorded in the
+// task's note in `.shared`, under the note's lock, where the handle is checked against the task the note
+// is for, and a `Control` message tells the core to apply it. Requests made before the core answers
+// combine: the last of a suspend and a resume, the last priority, and a stop. The call answers once the
+// request is recorded; the owner applies it when its doorbell is answered. One message per slot is in
+// flight at a time, which is what bounds the inbox (DESIGN "Inboxes").
+
+// What a request asks of suspension: nothing, or the last of a suspend and a resume.
+private const ASK_NOTHING: u8 = 0
+private const ASK_SUSPEND: u8 = 1
+private const ASK_RESUME: u8 = 2
+
+// What other cores asked of one task, kept in its note. A request of zeros asks nothing.
+struct Request
+    suspend: u8         // nothing, suspend or resume: the last of the two asked
+    priority: u8        // the base priority last asked, or 0 for none
+    stop: bool
+    posted: bool        // a `Control` message for the slot is in its core's inbox, not yet answered
+
+impl Request
+    // Forget what was asked. A message in flight stays posted, and finds nothing to do.
+    drop_asked(*self)
+        self.suspend = ASK_NOTHING
+        self.priority = IDLE_PRIORITY
+        self.stop = false
+
+// What a control call does.
+private enum Order: u8
+    Suspend
+    Resume
+    Priority
+    Stop
+
+// Suspend the task `t` names until it is resumed. A task suspending itself is switched away from at once.
+suspend[P: Port](p: *P, t: Task) -> Result[unit, TaskError] = control(p, t, Order.Suspend, IDLE_PRIORITY)
+
+// Resume the task `t` names: a ready task runs again, at once if it outranks the running one.
+resume[P: Port](p: *P, t: Task) -> Result[unit, TaskError] = control(p, t, Order.Resume, IDLE_PRIORITY)
+
+// Make `priority` (1 to 31) the base priority of the task `t` names. It runs at the higher of that and
+// what it inherits; a switch is asked when afterwards a ready task outranks the running one.
+set_priority[P: Port](p: *P, t: Task, priority: u8) -> Result[unit, TaskError]
+    if priority == IDLE_PRIORITY || usize(priority) >= PRIORITIES then return Err(TaskError.Priority)
+    control(p, t, Order.Priority, priority)
+
+// Stop the task `t` names for good. A task stopping itself is switched away from at once.
+stop[P: Port](p: *P, t: Task) -> Result[unit, TaskError] = control(p, t, Order.Stop, IDLE_PRIORITY)
+
+// Whether the task `t` names is suspended. Only the owner asks.
+suspended[P: Port](p: *P, t: Task) -> Result[bool, TaskError]
+    owned(p, t)?
+    val c = here(p)
+    val mask = p.mask()
+    val result = c.sched.check(t) match
+        Ok(i) -> Ok(c.sched.tasks[i].suspended)
+        Err(e) -> Err(e)
+    p.restore(mask)
+    result
+
+// The priority the task `t` names runs at: its base, or higher while it inherits. Only the owner asks.
+priority[P: Port](p: *P, t: Task) -> Result[u8, TaskError]
+    owned(p, t)?
+    val c = here(p)
+    val mask = p.mask()
+    val result = c.sched.check(t) match
+        Ok(i) -> Ok(c.sched.tasks[i].priority)
+        Err(e) -> Err(e)
+    p.restore(mask)
+    result
+
+// Carry out `order` on the task `t` names: here, on a core not yet started, or by asking its core.
+private control[P: Port](p: *P, t: Task, order: Order, priority: u8) -> Result[unit, TaskError]
+    val core = t.core()
+    if usize(core) >= option_cores then return Err(TaskError.Stale)
+    if core == here_id(p) then return obey(p, here(p), t, order, priority, true)
+    if core_state(core) == CORE_OFFLINE then return obey(p, core_at(core), t, order, priority, false)
+    ask(p, t, order, priority)
+
+// Carry out `order` on the task `t` names in core `c`'s table: the running core's (`mine`), whose switch
+// it may ask for, or one not yet started.
+private obey[P: Port](p: *P, c: *Core, t: Task, order: Order, priority: u8, mine: bool) -> Result[unit, TaskError]
+    val outer = p.mask()
+    val found = c.sched.check(t)
+    p.restore(outer)
+    val i = found?
+    if c.sched.tasks[i].base == IDLE_PRIORITY then return Err(TaskError.Idle)
+    val stopped = c.sched.tasks[i].state == TaskState.Stopped
+    // A stopped task's wait was withdrawn when it stopped; withdrawn now, nothing can hand it anything.
+    if order == Order.Stop && !stopped then withdraw(p, c, i)
+    val state = p.mask()
+    order match
+        Order.Suspend -> if !stopped && c.sched.suspend(i) && mine then p.request_switch()
+        Order.Resume -> if c.sched.resume(i) && mine then p.request_switch()
+        Order.Priority ->
+            c.sched.tasks[i].base = priority
+            val e = c.sched.effective(i)
+            if e != c.sched.tasks[i].priority then reprioritize(p, c, i, e)
+            if mine && c.sched.preempted() then p.request_switch()
+        Order.Stop ->
+            if !stopped
+                c.sched.stop_at(i)
+                c.maps[i].calling = false
+                if mine && i == usize(c.sched.running) then p.request_switch()
+    p.restore(state)
+    Ok(())
+
+// Ask the core of the task `t` names, which runs, to carry out `order`: record it in the task's note,
+// and post a `Control` message unless one is already on its way. A handle the note is not for is stale.
+private ask[P: Port](p: *P, t: Task, order: Order, priority: u8) -> Result[unit, TaskError]
+    if t == NO_TASK || t.slot() >= option_tasks then return Err(TaskError.Stale)
+    val n = note_of(t.core(), t.slot())
+    var l = n.w.lock.on(p)
+    l.acquire()
+    if n.task != t
+        l.release()
+        return Err(TaskError.Stale)
+    order match
+        Order.Suspend -> n.request.suspend = ASK_SUSPEND
+        Order.Resume -> n.request.suspend = ASK_RESUME
+        Order.Priority -> n.request.priority = priority
+        Order.Stop -> n.request.stop = true
+    if !n.request.posted
+        n.request.posted = true
+        post(p, MessageKind.Control, t, IDLE_PRIORITY, null)
+    l.release()
+    Ok(())
+
+// A `Control` message for slot `slot` of core `c`, the running core: take what the slot's note holds and
+// carry it out on the task the note is for now, the priority first, then a suspend or a resume, then a
+// stop. A slot freed since holds nothing, and a task gone since is refused as stale and left alone.
+private[kernel] answer_request[P: Port](p: *P, c: *Core, slot: usize)
+    val n = note_of(c.id, slot)
+    var l = n.w.lock.on(p)
+    l.acquire()
+    val t = n.task
+    val r = n.request
+    n.request.drop_asked()
+    n.request.posted = false
+    l.release()
+    if r.priority != IDLE_PRIORITY then val _ = obey(p, c, t, Order.Priority, r.priority, true)
+    if r.suspend == ASK_SUSPEND
+        val _ = obey(p, c, t, Order.Suspend, IDLE_PRIORITY, true)
+    else if r.suspend == ASK_RESUME
+        val _ = obey(p, c, t, Order.Resume, IDLE_PRIORITY, true)
+    if r.stop then val _ = obey(p, c, t, Order.Stop, IDLE_PRIORITY, true)
