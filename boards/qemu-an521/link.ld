@@ -20,7 +20,8 @@ SECTIONS {
   __code_end = .;
   .data    : { *(.data*) } > CODE
 
-  /* The reset handler zeroes everything between these two symbols. */
+  /* Core 0's reset zeroes everything between these two symbols; core 1's, between the second pair, which
+   * is empty in one image. */
   .bss     : {
     __bss_start = .;
     *(.bss*)
@@ -28,6 +29,8 @@ SECTIONS {
     . = ALIGN(4);
     __bss_end = .;
   } > CODE
+  __core1_zero_start = __bss_end;
+  __core1_zero_end = __bss_end;
 
   /* Everything another core can reach (the kernel's DESIGN.md, "The rule everything follows"). Core 0
    * zeroes it with `.bss`, before it releases core 1. */

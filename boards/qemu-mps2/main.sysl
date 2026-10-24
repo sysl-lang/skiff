@@ -66,6 +66,11 @@ impl RunCounter for Board
 private val CODE: Region = Region(0, 0x4_0000, Access.Execute)
 private val UART: Region = Region(mps2.UART0, 0x1000, Access.Device)
 
+// What the scenarios share between cores: with one core, nobody else, but it lies in `.shared` as on a
+// machine of several.
+@section(".shared")
+private var objects: scenarios.Across
+
 // The status `boot` answered, which the last task stops the machine with.
 private var status: i32 = 0
 
@@ -81,6 +86,7 @@ skiff_main() -> never
     if kernel.shared_within(usize(&__shared_start), usize(&__shared_end))
         board.write("skiff: .shared holds the shared state\n".bytes)
     kernel.shared_bounds(usize(&__shared_start), usize(&__shared_end))
+    scenarios.share(&objects, false)
     armv7m.set_irq_priority(mps2.TIMER0_IRQ, armv7m.KERNEL_IRQ_PRIORITY)
     armv7m.enable_irq(mps2.TIMER0_IRQ)
     scenarios.create_tasks(&board, 0, &entries)

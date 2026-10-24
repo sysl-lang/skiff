@@ -481,6 +481,48 @@ A software timer calls a function once a period has passed (one-shot), or every 
 - A `Queue[T, N]`'s items cross cores by value. A `T` that holds a pointer into one core's private memory
   is the application's mistake, and in a two-image build an impossible one to make work.
 
+## Two images
+
+One image is the default; two are an option, one board program built once per core (ROADMAP "One
+image, everywhere by default"). On the AN521: `--features core0` and `--features core1`, each turning on
+`split` and laying its image out by its own link script (`core0.ld`, `core1.ld`, a `features` block in
+the board's manifest). Core 1's image may be built for its FPU (`thumb-freestanding`) where the one
+image may not. The kernel's code is the same in both: what changes is the board's start-up.
+
+- **`.shared` is at one address in both images**, so an address in it means one thing to either. Neither
+  image's load segment covers it (`PT_NULL`): QEMU refuses two images loading one range, and core 0's
+  reset zeroes it anyway. Core 1's reset zeroes its own image's `.bss` and never `.shared`.
+- **The system description** is one module of the board program, so both images import it (the AN521's
+  `boards/qemu-an521/system/system.sysl`). It holds where `.shared` and core 1's image lie (each image
+  checks its link script agrees at boot), the one `System` structure placed first in `.shared` (section
+  `.shared.system`, then the kernel's `.shared`), and which core owns each peripheral and interrupt
+  (`OWNERS`). **A resource owned by two cores is a build error** (`@assert` over `OWNERS`); in two images
+  each core takes what it owns and nothing else (its UART, its timers, its NVIC's doorbell: core 0 timer 0
+  and timer 1, its run-time counter; core 1 the dual timer, its counter and the interrupt its scenarios
+  raise; core 0 the security controller that releases core 1).
+- **What two cores share is one structure, not loose objects.** The linker orders loose objects as it
+  pleases and drops what an image does not use, so two images could place them differently with every
+  type alike; a structure's layout is the compiler's alone. The scenarios' objects, counters and
+  published handles are one `scenarios.Across`, a field of `System`; each image hands it over with
+  `scenarios.share`.
+- **The layout fingerprint** (`kernel.fingerprint[T]()`, layout.sysl) hashes, while compiling, the size
+  of `T` and the offset and layout of every field, recursing into fields and array elements through
+  `T::Fields`. `kernel.LAYOUT` is the kernel's `Shared`'s; a board combines it with its own `System`'s.
+- **The handshake** (`kernel.Handshake`, first in `System`, so at `.shared`'s start whatever the rest is):
+  core 0 fills `.shared`, creates its tasks, `offer`s its fingerprint and releases core 1, then
+  `await_answer`s. Core 1 `await_offer`s, compares, says on its console whether the two agree, and
+  `answer`s with its own. Disagreeing images stop there: core 1 stops itself, core 0 says so and stops
+  the machine (status 3). No task has run on either.
+- **Nothing in `.shared` holds a pointer**, checked at build: `kernel.holds_pointer[T]()` walks the same
+  fields (a pointer, reference, string, slice, function or data-carrying enum anywhere is one), and the
+  kernel asserts it of `Shared`, the board of `System`. So an object's name is kept in its lock
+  (`KernelLock.name`, its first `NAME_BYTES` bytes), and a boost names its mutex by its **place** in
+  `.shared` (`place_of`, an offset from `__shared_start`), not by address.
+- **In two images a core creates only its own tasks.** Creating a task on another core edits that
+  core's private state, which in two images is another image's memory: core 0's `create` on core 1
+  before core 1 starts would fill core 0's own copy of core 1's `Core`, which nothing runs. The kernel
+  cannot tell one image from two, so this is the board's rule.
+
 ## One core
 
 With `option_cores == 1`: `here()` is a constant, `KernelLock` is the mask alone, the inbox array is empty,

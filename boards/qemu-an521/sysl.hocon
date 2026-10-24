@@ -21,3 +21,28 @@ targets {
     entry         = "_start"
   }
 }
+
+// Two images, the option (system.sysl): `--features core0` builds core 0's image, for no floating-point
+// registers as before, and `--features core1` core 1's, which may use its FPU (`thumb-freestanding`).
+// Each turns on `split` and lays its image out by a script of its own, with `.shared` at one address
+// in both. No feature at all is the one image both cores run.
+features {
+  split { doc = "the board as two images, one for each core" }
+  core0 {
+    doc     = "core 0's image of two"
+    enables = [split]
+    targets.thumb-freestanding-soft.linker_script = "core0.ld"
+  }
+  core1 {
+    doc     = "core 1's image of two"
+    enables = [split]
+    targets.thumb-freestanding {
+      linker_script = "core1.ld"
+      entry         = "_start"
+    }
+  }
+  skewed {
+    doc     = "an image whose .shared has one more field: the boot test's proof that images that disagree stop at the handshake"
+    enables = [split]
+  }
+}
