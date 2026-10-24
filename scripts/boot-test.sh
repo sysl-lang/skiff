@@ -57,6 +57,19 @@ skiff: core $1 a flags wait timed out after 4 ticks
 skiff: core $1 a notification sent before the wait was kept, and one sent during it woke the task
 skiff: core $1 a buffer went to another task and back 8 times in place, and every buffer is back in the pool"
 }
+# Task control, every core (boards/scenarios, control.sysl): a suspended task held back until resumed;
+# suspended waits that time out and are given, run only once resumed; a waiter resumed while it waits
+# waiting on; a waiter raised by set_priority given first; a mutex holder's inherited priority kept
+# through changes of its base; a stopped waiter out of its queue; a stale handle refused.
+control_expected() {
+    echo "skiff: core $1 a suspended task did not run until it was resumed
+skiff: core $1 a suspended task's waits timed out and were given, and it ran only once resumed
+skiff: core $1 a task resumed while it waited went on waiting until it was given
+skiff: core $1 a waiter raised by set_priority was given before one queued ahead of it
+skiff: core $1 a mutex holder kept the priority it inherited through two changes of its own, and gave it up with the mutex
+skiff: core $1 a stopped waiter left its queue, and the unit given after it stayed
+skiff: core $1 task control refuses a stale handle"
+}
 # Protection, every core (boards/scenarios, protection.sysl): a map the MPU cannot hold refused at
 # creation; an unprivileged task's round trips with a privileged one; a task reading kernel memory, a
 # stack overflow and a null load each stopped alone and reported; calls with buffers, grants or handles
@@ -85,6 +98,7 @@ skiff: core 0 time base agrees
 $(tasks_expected 0 "f32 registers survived the switches")
 $(waits_expected 0)
 $(messages_expected 0)
+$(control_expected 0)
 $(protection_expected 0)"
 
 # The AN521's two cores run one image, each greeting and ticking on the UART of its own number, then
@@ -100,7 +114,9 @@ $(protection_expected 0)"
 # finds in place and as written, and gives back to the pool, from which core 0 takes every one again;
 # and a task on core 0 waits on a mutex a task
 # of core 1 holds while a task of middling priority works on core 1, and must have it within a bound
-# through the boost core 1's inbox carries, which the owner gives up with the mutex. Core 1 then faults
+# through the boost core 1's inbox carries, which the owner gives up with the mutex. Core 0 suspends,
+# resumes, re-prioritizes and stops a task of core 1 through core 1's inbox, and core 1 checks each step.
+# Core 1 then faults
 # on purpose: it
 # reports the fault on its own console and stops. Core 0 sees it stopped, takes more ticks, finds that
 # the time base counted its own ticks and none of core 1's, and stops the machine with status 0.
@@ -118,6 +134,8 @@ skiff: core 0 two cores passed event flags back and forth 1000 times
 skiff: core 0 two cores woke each other through semaphores 1000 times
 skiff: core 0 had every buffer it sent core 1 back in the pool
 skiff: core 0 the high task had the mutex a task on core 1 held within 10 ticks
+$(control_expected 0)
+skiff: core 0 asked core 1 to suspend, resume, re-prioritize and stop a task of its own, and core 1 did
 $(protection_expected 0)
 skiff: core 0 an unprivileged task on core 1 took a unit core 0 gave and set flags core 0 waited on, through its grants
 skiff: core 0 sees core 1 stopped
@@ -140,6 +158,8 @@ skiff: core 1 woke on an event flag core 0 set while it waited
 skiff: core 1 woke on a notification core 0 sent while it waited
 skiff: core 1 received 100 buffers core 0 filled, in place and every byte as written
 skiff: core 1 the low task gave up the priority core 0's task lent it with the mutex
+$(control_expected 1)
+skiff: core 1 core 0 suspended, resumed, re-prioritized and stopped a task of core 1 through its inbox
 $(protection_expected 1)
 skiff: core 1 an unprivileged task took a unit core 0 gave, through its grant
 skiff: core 1 fault BusFault"

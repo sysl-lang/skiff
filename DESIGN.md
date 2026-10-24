@@ -57,14 +57,14 @@ Core (private, one per core)          .shared
 - **Every operation that takes a handle checks it**: the core exists, the slot is in use, the generation
   matches. A stale handle is refused (`Err(Stale)`), never acted on: it named a task that is gone, and
   the slot may hold another. The other refusals are `Full`, `Priority` (outside 1 to 31), `NoCore`,
-  `Idle` (the idle task is never deleted) and `Remote`.
+  `Idle` (the idle task is never deleted, suspended, re-prioritized or stopped) and `Remote`.
 - **Tasks are created on a named core.** A core creates on itself at any time; on another core only
   before that core starts (`core_state` still offline), which is how core 0 gives every core its first
   tasks at boot. Once the target runs, creating or deleting there is `Err(Remote)`: it would edit that
   core's private state, and becomes a message (milestone 4).
 - A task ends by `exit`, which deletes it. The running task's freed slot is not handed out again until
   the switch away from it, which still saves its stack pointer there.
-- A `Tcb` is private: saved stack pointer, base and effective priority, state, suspended, the stack's
+- A `Tcb` is private: saved stack pointer, base, inherited and effective priority, state, suspended, the stack's
   bounds, statistics, the MPU map. Nothing in `.shared` points at one.
 
 ## Scheduling
@@ -199,11 +199,12 @@ wake can find it.
   needs a compare-and-swap, so the same code runs on an M0+.
 - On the sending core, a task and an interrupt handler may both post to one ring; posting masks that
   core's kernel interrupts, which makes them one producer.
-- **A ring holds `2 * option_tasks` messages** (one slot more stays empty, so full and empty differ):
+- **A ring holds `3 * option_tasks` messages** (one slot more stays empty, so full and empty differ):
   one wake or hand-over for each task of the receiving core, of which there is at most one in flight
   per task (a task is woken once per wait, and waits again only after the message has made it ready),
-  and one boost for each task of the sending core, which posts one each time it blocks on a mutex whose
-  owner is on the receiving core.
+  one control request for each task of the receiving core, of which there is at most one in flight per
+  slot whichever core asks (see "Task control"), and one boost for each task of the sending core, which
+  posts one each time it blocks on a mutex whose owner is on the receiving core.
 - **A full ring stops the kernel; it never drops or overwrites a message.** A boost is bounded only
   between two drains: a sending task that times out and waits again posts another. So a ring fills
   only when the receiving core goes without taking its doorbell interrupt while the sender's tasks time
@@ -217,8 +218,7 @@ wake can find it.
   and applies it to its own scheduler, then asks for one switch if anything now outranks the running
   task. The chip clears the doorbell before the drain, so a message posted while it drains rings again.
   The poster makes its writes visible before it rings (a `dsb` before the AN521's MHU write).
-- Messages: `Wake(task)`, `Hand(task, priority)`, `Boost(task, priority, mutex)`. Suspending, resuming
-  and stopping another core's task will be messages of their own, each bounded the same way.
+- Messages: `Wake(task)`, `Hand(task, priority)`, `Boost(task, priority, mutex)`, `Control(slot)`.
 
 ## Mutexes across cores
 
@@ -237,6 +237,56 @@ wake can find it.
   best of those still waiting. A new owner on another core is told by `Hand(task, priority)`: its core
   counts the mutex in `Tcb.held`, raises the task to `priority` if that is higher, and makes it ready.
   The unlocking core never touches the new owner's `Tcb`.
+- **What a task inherits is kept apart from its base**, as its boost: the highest priority a waiter lent
+  it while it holds a mutex, recorded whether or not it raises the task (a waiter below a high base
+  still lends). The task runs at the higher of base and boost; the boost goes when it holds no mutex.
+
+## Task control
+
+`suspend(p, t)`, `resume(p, t)`, `set_priority(p, t, priority)` and `stop(p, t)`, each answering
+`Result[unit, TaskError]`; `suspended(p, t)` and `priority(p, t)` (effective) ask the owner, as
+`state` does. Every one checks its handle (`Stale`), and refuses the idle task (`Idle`) and a priority
+outside 1 to 31 (`Priority`).
+
+- **Suspending** takes a task out of its priority's FIFO and keeps it out (`Tcb.suspended`, apart from
+  its state) until it is resumed; a task suspending itself is switched away from at once. **A suspended
+  task's sleep or wait carries on**: an object may still wake it or hand itself over, and its timeout
+  still comes, which makes it `Ready` but not runnable; resumed, it runs and answers as its wait ended.
+  This is skiff-old's choice, kept against FreeRTOS's (which drops the wait), because the outcome rule
+  makes it safe: the wait's one transition out of `Waiting` happens under the object's lock whether or
+  not the task is suspended, and a wake from another core arrives as an ordinary `Wake` or `Hand`.
+- **Resuming** a ready task puts it at the back of its FIFO and asks for a switch if it outranks the
+  running one. Resuming a task that sleeps or waits leaves it sleeping or waiting: only the end of the
+  wait makes it ready. Resuming a task that was never suspended does nothing.
+- **`set_priority` changes the base**; the task runs at the higher of base and boost ("Mutexes across
+  cores"), so a change of base never takes away a boost in force, and a boost lent under a higher base
+  shows once the base drops below it. A waiting task whose priority changes is re-inserted in its
+  object's queue (`reprioritize`). A raised waiter does not raise the owner of the mutex it waits on:
+  inheritance passes when the wait begins, one level deep. A switch is asked when afterwards a ready
+  task outranks the running one, so a lowered running task gives way at once.
+- **Stopping** marks a task `Stopped`: it leaves its FIFO and the timeout list and never runs again.
+  **Its wait is withdrawn first**, under the object's lock: it leaves the queue (outcome `Idle`), so no
+  wake or hand-over finds it. A wait another core had already ended stays ended; the message on its
+  way finds the task not blocked and is dropped. **It keeps what it holds**: a mutex it owns stays owned
+  (the kernel counts mutexes held, not which), and its waiters wait until their timeouts, as after a
+  fault (skiff-old and FreeRTOS agree). **Its slot stays in use**, so its handle answers `Stopped`,
+  until it is deleted or a task is created when no slot is free: then the first stopped slot is taken
+  and its generation changes, so the old handle is stale. A running task stopping itself keeps its
+  slot until the switch away from it.
+- **Another core's task**: while that core is offline, the call acts on its table at once, as `create`
+  does. Once it runs, the call is **a request through its inbox**, never `Remote`: the asking core takes
+  the task's note's lock (`notes[core][slot]`, in `.shared`), checks the handle against the task the
+  note is for (stale, deleted and never-created slots refused, and the idle task's note is for no task,
+  so it is refused as `Stale` from another core), records the request in the note (`Request`: the last
+  of a suspend and a resume, the last priority, a stop) and posts `Control(slot)` unless one is already
+  on its way (`posted`). The owner's doorbell takes the request under the note's lock and applies it to
+  the task the note is for **now**: priority, then suspend or resume, then stop. So requests made before
+  the owner answers combine; a request whose task was deleted is dropped with its note; and a new task
+  in the slot is asked only what was asked of it. One `Control` per slot is in flight at a time, which
+  is the ring bound's third term. The call answers once the request is recorded, before it is applied.
+- **Privileged only.** None of these is a kernel call (`calls.sysl`): an unprivileged task cannot
+  suspend, re-prioritize or stop another task. Granting it would need a task grant, which the grant list
+  does not have.
 
 ## Channels and the buffer pool
 
@@ -370,7 +420,8 @@ in `.shared`, and no core ever programs another's MPU.
 - **What a fault stops**: a fault taken in thread mode on a task's stack that the protection raised (a
   MemManage, or an Armv8-M stack-limit UsageFault), or any MemManage, BusFault or UsageFault an
   unprivileged task takes outside a call, stops **that task alone**: `kernel.stop_running` marks it
-  `Stopped` (its slot stays in use, so its handle answers `Stopped` until it is deleted), reports
+  `Stopped` (its slot stays in use, so its handle answers `Stopped` until it is deleted or its slot is
+  reused, as for `stop`, "Task control"), reports
   `skiff: core <n> stopped a task that <overflowed its stack | broke its memory protection | made a
   trap the kernel does not take>`, and asks for a switch. Every other fault stops the core, as before.
   A stopped task keeps what it held: a mutex it owned stays owned.
@@ -465,8 +516,6 @@ them. `grants` (usize, default 4, [0, 32]): objects one task may be granted.
 
 - **32 priorities, settled with no option.** The bitmap is one `u32` and the FIFOs cost two `u16` a
   priority, so an `option_priorities` would save at most 120 bytes a core.
-- **A suspended task's wait.** skiff-old let it carry on (unlike FreeRTOS, which drops it); this design
-  keeps that, since the outcome rule makes it safe.
 - **A pool's records and its buffers in one structure.** A pool's lock, generations and free stack are
   control data that must not be cached where two cores use them; its buffers may be. With `.shared`
   uncached they share it; a board that caches the buffers will need the pool's storage in a region of

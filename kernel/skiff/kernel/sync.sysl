@@ -65,7 +65,8 @@ impl Semaphore
 
 // A mutex with priority inheritance, owned by a task handle. While a task waits on it, the owner runs at
 // the waiter's priority at least, so a task of middling priority cannot keep the owner, and with it the
-// waiter, from running. The owner keeps the raised priority until it holds no mutex. Inheritance goes
+// waiter, from running. The owner keeps the raised priority until it holds no mutex, as a boost apart
+// from its base priority, so a change of its base (`set_priority`) never takes the boost away. Inheritance goes
 // one level: an owner itself waiting on another object moves up that object's queue, but its owner is
 // not raised in turn.
 //
@@ -109,8 +110,8 @@ impl Mutex
         // between. An owner of another core is asked whatever its priority, which only its core knows.
         if another_core(owner.core(), c.id)
             post(p, MessageKind.Boost, owner, mine, self)
-        else if c.sched.check(owner).is_ok() && mine > c.sched.tasks[owner.slot()].priority
-            reprioritize(p, c, owner.slot(), mine)
+        else if c.sched.check(owner).is_ok()
+            inherit(p, c, owner.slot(), mine)
         p.restore(outer)
         wait_outcome(c) == Outcome.Given
 
@@ -138,10 +139,11 @@ impl Mutex
                 heir = u16(t.slot())
                 c.sched.tasks[t.slot()].held += 1
         l.release()
-        if heir != NONE && inherited > c.sched.tasks[usize(heir)].priority
-            reprioritize(p, c, usize(heir), inherited)
-        if c.sched.tasks[i].held == 0 && c.sched.tasks[i].priority != c.sched.tasks[i].base
-            c.sched.set_effective(i, c.sched.tasks[i].base)
+        if heir != NONE && inherited != IDLE_PRIORITY
+            inherit(p, c, usize(heir), inherited)
+        if c.sched.tasks[i].held == 0
+            c.sched.tasks[i].boost = IDLE_PRIORITY
+            if c.sched.tasks[i].priority != c.sched.tasks[i].base then c.sched.set_effective(i, c.sched.tasks[i].base)
         if c.sched.preempted() then p.request_switch()
         p.restore(outer)
 

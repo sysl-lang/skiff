@@ -111,6 +111,11 @@ private protection(m: *Nothing) -> bool
         if !kernel.end_call(m) then return false
     kernel.stop_running(m, kernel.Violation.Breach).is_none()
 
+// Task control, here and through another core's inbox.
+private control(m: *Nothing, t: kernel.Task) -> bool
+    if kernel.suspend(m, t).is_ok() || kernel.resume(m, t).is_ok() || kernel.set_priority(m, t, 2).is_ok() then return false
+    kernel.stop(m, t).is_err() && kernel.suspended(m, t).is_err() && kernel.priority(m, t).is_err()
+
 @export("main")
 probe() -> i32
     var m = Nothing()
@@ -124,6 +129,7 @@ probe() -> i32
     val here = kernel.here(&m)
     if !kernel.stopped(here.id) || kernel.expired(kernel.ticks(), 0) then return 1
     if t.is_err() || kernel.delete(&m, t.unwrap()).is_ok() then return 1
+    if !control(&m, t.unwrap()) then return 1
     if !protection(&m) then return 1
     if here.sched.started()
         kernel.sleep(&m, 1)

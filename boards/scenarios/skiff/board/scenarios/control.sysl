@@ -1,0 +1,279 @@
+module skiff.board.scenarios
+
+import sysl.sync.Atomic
+import skiff.kernel
+import skiff.kernel.{FOREVER, Mutex, Port, Semaphore, Task, TaskError, TaskState}
+
+// Task control, on every core, once its waits have reported and before protection. R (priority 4)
+// creates each subject in turn and drives it; every subject runs `subject_task`, which looks up its role
+// by its slot.
+//
+//   - A ticker counts once a tick. Suspended, its count stands still for 5 ticks; resumed, it counts on.
+//   - Three tasks wait on semaphores of their own and are suspended while they wait: one wait times out,
+//     one is given, and the third is resumed while it still waits. None runs while suspended, the third
+//     goes on waiting once resumed, and each answers as its wait ended once it runs.
+//   - Two tasks wait on one semaphore, the one of priority 2 queued first; `set_priority` raises the
+//     other to 3, and the give goes to it.
+//   - A holder (1) locks a mutex that a contender (3) then waits on, lending the holder 3. The holder's
+//     base goes to 2 and then 1 while it holds the mutex, and it runs at 3 throughout; it unlocks at 1.
+//   - A waiter stopped leaves its semaphore's queue: a unit given after stays with the semaphore. Deleted,
+//     its handle is refused by every control call.
+//   - With several cores, core 0 suspends, resumes, re-prioritizes and stops a ticker of core 1 through
+//     core 1's inbox, a step at a time; core 1 checks each step on its own task and reports.
+
+// The roles a subject plays.
+private const TICKER: u8 = 1
+private const TIMED: u8 = 2
+private const GIVEN: u8 = 3
+private const KEPT: u8 = 4
+private const SORT_LOW: u8 = 5
+private const SORT_HIGH: u8 = 6
+private const HOLDER: u8 = 7
+private const CONTENDER: u8 = 8
+private const STOPPEE: u8 = 9
+private const FAR: u8 = 10
+private const ROLES: usize = 11
+
+private var roles: [kernel.CORES][kernel.TASKS]u8
+private var subject_stacks: [kernel.CORES][ROLES][STACK_WORDS]u32
+
+// Each core's subjects' objects and results.
+private var counts: [kernel.CORES]Atomic[u32]
+private var answered: [kernel.CORES]Atomic[u32]     // a bit per role once its wait has returned
+private var got: [kernel.CORES]Atomic[u32]          // a bit per role whose wait was given
+private var first_taker: [kernel.CORES]Atomic[u32]
+private var release: [kernel.CORES]Atomic[u32]
+private var unlocked_at: [kernel.CORES]Atomic[u32]  // the holder's priority once it let the mutex go, plus one
+private var timed_on = [Semaphore.new("timed on", 0, 1); kernel.CORES]
+private var given_on = [Semaphore.new("given on", 0, 1); kernel.CORES]
+private var kept_on = [Semaphore.new("kept on", 0, 1); kernel.CORES]
+private var sorted = [Semaphore.new("sorted", 0, 2); kernel.CORES]
+private var stopped_on = [Semaphore.new("stopped on", 0, 1); kernel.CORES]
+private var held = [Mutex.new("held"); kernel.CORES]
+
+// Core 0's requests of core 1's ticker, a step at a time: core 1 publishes the handle, and each core
+// moves `stage` on once its part of a step is done.
+private var far_task: Atomic[u32]
+private var far_count: Atomic[u32]
+private var stage: Atomic[u32]
+private var far_verdict: Atomic[u32]
+
+// How long a core waits for the other's step: the cores reach these scenarios at different times, and
+// multi-threaded TCG delivers a core's ticks late and in bunches.
+private const STEP_TICKS: u32 = 500
+
+// R's part, on the running core.
+control[P: Port](p: *P, e: *Entries)
+    val me = kernel.here_id(p)
+    suspend_and_resume(p, e, me)
+    suspended_waits(p, e, me)
+    priority_resorts(p, e, me)
+    boost_kept(p, e, me)
+    stop_waiter(p, e, me)
+    if kernel.CORES > 1 && me == 0
+        ask_core_1(p)
+    else if kernel.CORES > 1 && me == 1
+        answer_core_0(p, e)
+
+// Create the subject of role `role` at `priority` on the running core.
+private spawn[P: Port](p: *P, e: *Entries, me: u32, role: u8, priority: u8) -> Task
+    // The role is recorded before the task can run: R outranks every subject.
+    val t = created(kernel.create(p, me, subject_stacks[me][usize(role)], e.subject, priority))
+    roles[me][t.slot()] = role
+    t
+
+private bit(role: u8) -> u32 = 1 << u32(role)
+
+private ran(me: u32, role: u8) -> bool = (answered[me].load() & bit(role)) != 0
+
+// How long R gives a subject to do what it was let do: a core's ticks may come late under QEMU's
+// multi-threaded TCG, and wake several tasks at once.
+private const SUBJECT_TICKS: u32 = 50
+
+// Sleep a tick at a time, up to `SUBJECT_TICKS`, until `done` holds; answer whether it did.
+private within[P: Port](p: *P, done: -> bool) -> bool = holds_within(p, SUBJECT_TICKS, done)
+
+// Sleep a tick at a time, up to `ticks`, until `done` holds; answer whether it did.
+private holds_within[P: Port](p: *P, ticks: u32, done: -> bool) -> bool
+    for _ in 0..<ticks
+        if done then return true
+        kernel.sleep(p, 1)
+    done
+
+private suspend_and_resume[P: Port](p: *P, e: *Entries, me: u32)
+    val ticker = spawn(p, e, me, TICKER, 2)
+    kernel.sleep(p, 3)
+    var right = kernel.suspend(p, ticker).is_ok() && kernel.suspended(p, ticker) == Ok(true)
+    val before = counts[me].load()
+    kernel.sleep(p, 5)
+    right = right && counts[me].load() == before
+    right = right && kernel.resume(p, ticker).is_ok() && within(p,counts[me].load() > before)
+    val _ = kernel.delete(p, ticker)
+    if right
+        say(p, "a suspended task did not run until it was resumed\n")
+    else
+        say(p, "a suspended task ran, or a resumed one did not\n")
+
+private suspended_waits[P: Port](p: *P, e: *Entries, me: u32)
+    val timed = spawn(p, e, me, TIMED, 3)
+    val given = spawn(p, e, me, GIVEN, 3)
+    val kept = spawn(p, e, me, KEPT, 3)
+    kernel.sleep(p, 1)
+    var waiting = is_in(p, timed, TaskState.Blocked) && is_in(p, given, TaskState.Blocked) && is_in(p, kept, TaskState.Blocked)
+    for t in [timed, given, kept]
+        waiting = waiting && kernel.suspend(p, t).is_ok()
+    val _ = given_on[me].give(p)
+    kernel.sleep(p, 6)
+    // The timed wait has timed out and the given one was given: both ready, neither run.
+    var held_back = is_in(p, timed, TaskState.Ready) && is_in(p, given, TaskState.Ready) && !ran(me, TIMED) && !ran(me, GIVEN)
+    // Resumed while it waits, the third waits on.
+    val _ = kernel.resume(p, kept)
+    kernel.sleep(p, 2)
+    var waits_on = is_in(p, kept, TaskState.Blocked) && !ran(me, KEPT)
+    val _ = kernel.resume(p, timed)
+    val _ = kernel.resume(p, given)
+    held_back = held_back && within(p,ran(me, TIMED) && ran(me, GIVEN))
+    held_back = held_back && (got[me].load() & bit(TIMED)) == 0 && (got[me].load() & bit(GIVEN)) != 0
+    val _ = kept_on[me].give(p)
+    waits_on = waits_on && within(p,ran(me, KEPT)) && (got[me].load() & bit(KEPT)) != 0
+    if waiting && held_back
+        say(p, "a suspended task's waits timed out and were given, and it ran only once resumed\n")
+    else
+        say(p, "a suspended task's wait went wrong\n")
+    if waits_on
+        say(p, "a task resumed while it waited went on waiting until it was given\n")
+    else
+        say(p, "a task resumed while it waited stopped waiting\n")
+
+private priority_resorts[P: Port](p: *P, e: *Entries, me: u32)
+    val high = spawn(p, e, me, SORT_HIGH, 2)
+    kernel.sleep(p, 1)
+    val low = spawn(p, e, me, SORT_LOW, 1)
+    kernel.sleep(p, 2)
+    var right = is_in(p, high, TaskState.Blocked) && is_in(p, low, TaskState.Blocked)
+    right = right && kernel.set_priority(p, low, 3).is_ok()
+    val _ = sorted[me].give(p)
+    right = right && within(p,first_taker[me].load() != 0) && first_taker[me].load() == u32(SORT_LOW)
+    val _ = sorted[me].give(p)
+    right = right && within(p,ran(me, SORT_HIGH))
+    if right
+        say(p, "a waiter raised by set_priority was given before one queued ahead of it\n")
+    else
+        say(p, "a waiter raised by set_priority kept its place\n")
+
+private boost_kept[P: Port](p: *P, e: *Entries, me: u32)
+    val holder = spawn(p, e, me, HOLDER, 1)
+    var right = within(p,held[me].holder() == holder)
+    val _ = spawn(p, e, me, CONTENDER, 3)
+    kernel.sleep(p, 1)
+    right = right && kernel.priority(p, holder) == Ok(3)
+    right = right && kernel.set_priority(p, holder, 2).is_ok() && kernel.priority(p, holder) == Ok(3)
+    right = right && kernel.set_priority(p, holder, 1).is_ok() && kernel.priority(p, holder) == Ok(3)
+    release[me].store(1)
+    right = right && within(p,ran(me, CONTENDER) && unlocked_at[me].load() != 0)
+    right = right && unlocked_at[me].load() == 2
+    if right
+        say(p, "a mutex holder kept the priority it inherited through two changes of its own, and gave it up with the mutex\n")
+    else
+        say(p, "a mutex holder lost its inherited priority to a change of its own\n")
+
+private stop_waiter[P: Port](p: *P, e: *Entries, me: u32)
+    val stoppee = spawn(p, e, me, STOPPEE, 3)
+    kernel.sleep(p, 1)
+    var right = is_in(p, stoppee, TaskState.Blocked)
+    right = right && kernel.stop(p, stoppee).is_ok() && is_in(p, stoppee, TaskState.Stopped)
+    val _ = stopped_on[me].give(p)
+    kernel.sleep(p, 2)
+    right = right && stopped_on[me].available(p) == 1 && !ran(me, STOPPEE)
+    if right
+        say(p, "a stopped waiter left its queue, and the unit given after it stayed\n")
+    else
+        say(p, "a stopped waiter was handed a unit\n")
+    var refused = kernel.delete(p, stoppee).is_ok()
+    refused = refused && kernel.suspend(p, stoppee) == Err(TaskError.Stale) && kernel.resume(p, stoppee) == Err(TaskError.Stale)
+    refused = refused && kernel.set_priority(p, stoppee, 2) == Err(TaskError.Stale) && kernel.stop(p, stoppee) == Err(TaskError.Stale)
+    if refused
+        say(p, "task control refuses a stale handle\n")
+    else
+        say(p, "task control acted on a stale handle\n")
+
+// Sleep until `stage` reaches `n`, or `STEP_TICKS` ticks have gone by; answer whether it did.
+private reached[P: Port](p: *P, n: u32) -> bool = holds_within(p, STEP_TICKS, stage.load() >= n)
+
+// Core 0: ask core 1, through its inbox, to suspend its ticker, resume it at priority 3, and stop it.
+private ask_core_1[P: Port](p: *P)
+    var right = holds_within(p, STEP_TICKS, far_task.load() != 0)
+    val far = Task(far_task.load())
+    right = right && kernel.suspend(p, far).is_ok()
+    stage.store(1)
+    right = right && reached(p, 2)
+    right = right && kernel.resume(p, far).is_ok() && kernel.set_priority(p, far, 3).is_ok()
+    stage.store(3)
+    right = right && reached(p, 4)
+    right = right && kernel.stop(p, far).is_ok()
+    stage.store(5)
+    right = right && reached(p, 6) && far_verdict.load() == 1
+    if right
+        say(p, "asked core 1 to suspend, resume, re-prioritize and stop a task of its own, and core 1 did\n")
+    else
+        say(p, "core 1 did not carry out what core 0 asked of its task\n")
+
+// Core 1: publish a ticker for core 0 to control, and check each step on it.
+private answer_core_0[P: Port](p: *P, e: *Entries)
+    val far = spawn(p, e, 1, FAR, 2)
+    far_task.store(far.bits)
+    var right = reached(p, 1) && within(p,kernel.suspended(p, far) == Ok(true))
+    val before = far_count.load()
+    kernel.sleep(p, 5)
+    right = right && far_count.load() == before
+    stage.store(2)
+    right = right && reached(p, 3) && within(p,kernel.suspended(p, far) == Ok(false) && kernel.priority(p, far) == Ok(3))
+    right = right && within(p,far_count.load() > before)
+    stage.store(4)
+    right = right && reached(p, 5) && within(p,is_in(p, far, TaskState.Stopped))
+    val _ = kernel.delete(p, far)
+    far_verdict.store(if right then 1 else 2)
+    stage.store(6)
+    if right
+        say(p, "core 0 suspended, resumed, re-prioritized and stopped a task of core 1 through its inbox\n")
+    else
+        say(p, "core 0's requests of a task of core 1 went wrong\n")
+
+private is_in[P: Port](p: *P, t: Task, s: TaskState) -> bool = kernel.state(p, t) == Ok(s)
+
+// Every subject: what it does is its role's.
+subject_task[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    val role = roles[me][kernel.current(p).slot()]
+    if role == TICKER || role == FAR
+        val count = if role == TICKER then &counts[me] else &far_count
+        loop
+            val _ = count.add(1)
+            kernel.sleep(p, 1)
+    var given = false
+    if role == TIMED
+        given = timed_on[me].take(p, 3)
+    elif role == GIVEN
+        given = given_on[me].take(p, FOREVER)
+    elif role == KEPT
+        given = kept_on[me].take(p, FOREVER)
+    elif role == SORT_LOW || role == SORT_HIGH
+        given = sorted[me].take(p, FOREVER)
+        if first_taker[me].load() == 0 then first_taker[me].store(u32(role))
+    elif role == HOLDER
+        given = held[me].lock(p, FOREVER)
+        while release[me].load() == 0 do kernel.sleep(p, 1)
+        held[me].unlock(p)
+        kernel.priority(p, kernel.current(p)) match
+            Ok(n) -> unlocked_at[me].store(u32(n) + 1)
+            Err(_) -> ()
+    elif role == CONTENDER
+        given = held[me].lock(p, FOREVER)
+        held[me].unlock(p)
+    elif role == STOPPEE
+        given = stopped_on[me].take(p, FOREVER)
+    else
+        panic("skiff: a subject with no role")
+    if given then val _ = got[me].add(bit(role))
+    val _ = answered[me].add(bit(role))
+    kernel.exit(p)

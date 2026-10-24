@@ -179,6 +179,13 @@ private[kernel] withdraw[P: Port](p: *P, c: *Core, i: usize)
             l.release()
         None -> ()
 
+// Task `i` of core `c` inherits `priority` from a waiter on a mutex it holds: it keeps the boost, and
+// runs at it, re-queued among its own object's waiters if it waits, while the boost is above its base.
+// The caller holds no object's lock.
+private[kernel] inherit[P: Port](p: *P, c: *Core, i: usize, priority: u8)
+    val e = c.sched.inherit(i, priority)
+    if e > c.sched.tasks[i].priority then reprioritize(p, c, i, e)
+
 // Make `priority` the effective priority of task `i` of the running core, re-queueing it among its
 // object's waiters, under that object's lock, if it is waiting. The caller holds no object's lock.
 private[kernel] reprioritize[P: Port](p: *P, c: *Core, i: usize, priority: u8)
