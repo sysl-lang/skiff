@@ -1,0 +1,27 @@
+module skiff.chip.mps2
+
+// CMSDK APB timer 1, at 0x4000_1000, as a free-running counter for the kernel's run-time statistics (QEMU
+// models no DWT, so there is no cycle counter). It counts down from 2^32 - 1 on the 25 MHz clock with its
+// interrupt off and reloads at zero, so the counts since it started are its value's complement, wrapping
+// at 2^32: about every 172 seconds, far slower than a tick.
+
+private struct CounterTimer
+    ctrl: volatile u32          // 0x00 bit 0 enable, bit 3 interrupt enable
+    value: volatile u32         // 0x04
+    reload: volatile u32        // 0x08
+
+private const TIMER1: usize = 0x4000_1000
+private const ENABLE: u32 = 1
+
+private timer1() -> *CounterTimer = ptr_cast(TIMER1)
+
+// Start timer 1 counting from 0, its interrupt off.
+counter_start()
+    val t = timer1()
+    t.ctrl = 0
+    t.reload = 0xffff_ffff
+    t.value = 0xffff_ffff
+    t.ctrl = ENABLE
+
+// Clock cycles counted since `counter_start`, modulo 2^32.
+counter_now() -> u32 = ~timer1().value

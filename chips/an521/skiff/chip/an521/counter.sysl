@@ -1,0 +1,48 @@
+module skiff.chip.an521
+
+// A free-running counter for each core, for the kernel's run-time statistics (QEMU models no DWT, so
+// there is no cycle counter). Each core has one of its own, as each core of a chip with a DWT has its own
+// cycle counter: core 0 the SSE-200's CMSDK timer 1 (Secure alias 0x5000_1000), core 1 the first counter of
+// its dual timer (0x5000_2000). Both count down on the 20 MHz clock with their interrupts off and go from
+// zero back to 2^32 - 1, so the counts since one started are its value's complement, wrapping at 2^32:
+// about every 215 seconds, far slower than a tick.
+
+private struct ApbTimer
+    ctrl: volatile u32          // 0x00 bit 0 enable, bit 3 interrupt enable
+    value: volatile u32         // 0x04
+    reload: volatile u32        // 0x08
+
+private struct DualTimer
+    load: volatile u32          // 0x00 Timer1Load: writing it sets the value
+    value: volatile u32         // 0x04 Timer1Value
+    control: volatile u32       // 0x08 Timer1Control
+
+@assert(offsetof(DualTimer, control) == 0x08, "Timer1Control is at 0x08")
+
+private const TIMER1: usize = 0x5000_1000
+private const DUALTIMER: usize = 0x5000_2000
+private const APB_ENABLE: u32 = 1
+
+// Timer1Control: enabled (bit 7), 32 bits wide (bit 1), free-running (bit 6 clear), interrupt off (bit 5
+// clear), no prescale, wrapping rather than one-shot (bit 0 clear).
+private const DUAL_FREE_RUNNING: u32 = (1 << 7) | (1 << 1)
+
+private timer1() -> *ApbTimer = ptr_cast(TIMER1)
+private dual() -> *DualTimer = ptr_cast(DUALTIMER)
+
+// Start the running core's counter counting from 0.
+counter_start()
+    if core_id() == 0
+        val t = timer1()
+        t.ctrl = 0
+        t.reload = 0xffff_ffff
+        t.value = 0xffff_ffff
+        t.ctrl = APB_ENABLE
+    else
+        val d = dual()
+        d.control = 0
+        d.load = 0xffff_ffff
+        d.control = DUAL_FREE_RUNNING
+
+// Clock cycles the running core's counter has counted since `counter_start`, modulo 2^32.
+counter_now() -> u32 = if core_id() == 0 then ~timer1().value else ~dual().value

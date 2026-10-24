@@ -8,7 +8,7 @@ import skiff.arch.armv7m
 import skiff.board.scenarios
 import skiff.chip.mps2
 import skiff.kernel
-import skiff.kernel.{Access, Cache, Doorbell, Isolation, Port, Protection, Region, RegionError, Slot}
+import skiff.kernel.{Access, Cache, Doorbell, Isolation, Port, Protection, Region, RegionError, RunCounter, Slot}
 
 // The bounds of `.shared`, from the link script.
 extern __shared_start: u8
@@ -56,6 +56,10 @@ impl Isolation for Board
     load(*self, map: []const Slot) = armv7m.load_v7(map)
     privilege(*self, unprivileged: bool) = armv7m.set_thread_privilege(unprivileged)
 
+// QEMU models no DWT: the run-time counter is the chip's timer 1, free-running.
+impl RunCounter for Board
+    run_count(*self) -> u32 = mps2.counter_now()
+
 // What every unprivileged task runs: the code and its constants, below 0x4_0000 (link.ld). The console's
 // UART, which the scenario that writes on it is granted.
 private val CODE: Region = Region(0, 0x4_0000, Access.Execute)
@@ -64,7 +68,7 @@ private val UART: Region = Region(mps2.UART0, 0x1000, Access.Device)
 // The status `boot` answered, which the last task stops the machine with.
 private var status: i32 = 0
 
-private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject)
+private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject, &task_measured)
 
 // Called by the chip's reset handler once there is a stack and `.bss` and `.shared` are zero.
 @export("skiff_main")
@@ -80,6 +84,7 @@ skiff_main() -> never
     armv7m.enable_irq(mps2.TIMER0_IRQ)
     scenarios.create_tasks(&board, 0, &entries)
     armv7m.enable_protection_v7()
+    mps2.counter_start()
     kernel.start(&board)
     for _ in 0..<3
         val n = kernel.await_tick(&board)
@@ -112,6 +117,7 @@ private task_timers() -> never = kernel.serve_timers(&Board())
 private task_hog() -> never = scenarios.hog_task(&Board())
 private fired(t: *kernel.Timer, due: u32) = scenarios.fired(&Board(), t, due)
 private task_subject() -> never = scenarios.subject_task(&Board())
+private task_measured() -> never = scenarios.measured_task(&Board())
 
 // Raise timer 0's interrupt from software; the timer itself never runs.
 private raise() = armv7m.pend_irq(mps2.TIMER0_IRQ)
@@ -125,13 +131,15 @@ private task_idle() -> never
     loop
         armv7m.wait_for_interrupt()
 
-// R: the handle checks, then the waits, the timers, task control and the protection, then the end of the run.
+// R: the handle checks, then the waits, the timers, task control, the statistics and the protection, then
+// the end of the run.
 private task_r() -> never
     var board = Board()
     scenarios.check_handles(&board, &entries)
     scenarios.await_waits(&board)
     scenarios.timers(&board, &entries)
     scenarios.control(&board, &entries)
+    scenarios.stats(&board, &entries)
     scenarios.protection(&board, &entries, CODE, UART)
     armv7m.halt(status)
 

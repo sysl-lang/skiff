@@ -21,8 +21,8 @@ import skiff.kernel.{Port, Task, TaskError, TaskState}
 //     exited, and still refused once a new task has A's slot. Core 0 of several may not create a task
 //     on core 1, which runs. Then it waits for the waits (waits.sysl), the messages (messages.sysl) and,
 //     on several cores, the waits across cores (crossing.sysl). Then it runs the software timers
-//     (timers.sysl), task control (control.sysl) and the protection scenarios (protection.sysl), and
-//     the board ends the run.
+//     (timers.sysl), task control (control.sysl), the statistics (stats.sysl) and the protection
+//     scenarios (protection.sysl), and the board ends the run.
 
 // How many words each task's stack holds: 2 KiB, enough for a kernel call at -O0.
 const STACK_WORDS: usize = 512
@@ -63,6 +63,7 @@ struct Entries
     hog: *extern() -> never
     fired: kernel.TimerCallback
     subject: *extern() -> never     // every task control's scenarios create (control.sysl)
+    measured: *extern() -> never    // every task the statistics' scenarios create (stats.sysl)
 
 private var stacks: [kernel.CORES][STACKS][STACK_WORDS]u32
 

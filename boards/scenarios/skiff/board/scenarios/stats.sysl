@@ -1,0 +1,162 @@
+module skiff.board.scenarios
+
+import sysl.sync.Atomic
+import skiff.kernel
+import skiff.kernel.{FOREVER, Port, Task, TaskError}
+
+// Run-time statistics and stack high-water marks, on every core, once task control is done and before
+// protection. R (priority 4) creates each task in turn; every one runs `measured_task`, which looks up its
+// role by its slot. Every check is a relation between two measurements, never a count of a tick's
+// length: multi-threaded TCG delivers a core's ticks late and in bunches.
+//
+//   - A burner (2) spins while a sleeper (3) wakes once a tick and sleeps again, for 20 ticks from a
+//     reset of the core's statistics. The burner has run more than half of them and more than the
+//     sleeper, which has run too; the idle task has run less than in the 10 ticks after, when neither
+//     runs.
+//   - A deep task recurses 8 frames of 16 words each while a shallow one does nothing. The deep task's
+//     high-water mark is lower than the shallow one's by its frames' words at least, and the shallow
+//     one's is below its stack's size. Deleted, both handles are refused.
+//   - With several cores, core 0 is refused core 1's task's statistics and high-water mark.
+
+// The roles a measured task plays.
+private const BURNER: u8 = 1
+private const SLEEPER: u8 = 2
+private const DEEP: u8 = 3
+private const SHALLOW: u8 = 4
+private const MEASURED_ROLES: usize = 5
+
+// 4 KiB each: the deep task's frames take some 2 KiB at -O0.
+private const MEASURED_WORDS: usize = 1024
+
+private var measured_roles: [kernel.CORES][kernel.TASKS]u8
+private var measured_stacks: [kernel.CORES][MEASURED_ROLES][MEASURED_WORDS]u32
+private var burning: [kernel.CORES]Atomic[u32]      // 1 while the burner and the sleeper are to go on
+private var measured_done: [kernel.CORES]Atomic[u32] // a bit per role once its task has done its part
+private var dived: [kernel.CORES]Atomic[u32]        // what the deep task's frames added up to
+
+private const BURN_TICKS: u32 = 20
+private const REST_TICKS: u32 = 10
+private const DIVE_DEPTH: u32 = 8
+private const DIVE_WORDS: usize = 16
+
+// How long R gives a measured task to do its part.
+private const MEASURED_TICKS: u32 = 50
+
+// R's part, on the running core.
+stats[P: Port](p: *P, e: *Entries)
+    val me = kernel.here_id(p)
+    shares(p, e, me)
+    high_water(p, e, me)
+    if kernel.CORES > 1 && me == 0 then refused_remote(p)
+
+// Create the task of role `role` at `priority` on the running core. Its role is recorded before it can
+// run: R outranks it.
+private spawn_measured[P: Port](p: *P, e: *Entries, me: u32, role: u8, priority: u8) -> Task
+    val t = created(kernel.create(p, me, measured_stacks[me][usize(role)], e.measured, priority))
+    measured_roles[me][t.slot()] = role
+    t
+
+private role_bit(role: u8) -> u32 = 1 << u32(role)
+
+// Sleep a tick at a time, up to `MEASURED_TICKS`, until every role of `roles` has done its part.
+private measured_within[P: Port](p: *P, me: u32, roles: u32) -> bool
+    for _ in 0..<MEASURED_TICKS
+        if measured_done[me].load() & roles == roles then return true
+        kernel.sleep(p, 1)
+    measured_done[me].load() & roles == roles
+
+private shares[P: Port](p: *P, e: *Entries, me: u32)
+    burning[me].store(1)
+    kernel.reset_stats(p)
+    val burner = spawn_measured(p, e, me, BURNER, 2)
+    val sleeper = spawn_measured(p, e, me, SLEEPER, 3)
+    kernel.sleep(p, BURN_TICKS)
+    // Taken while the burner still burns: the idle task has had no turn since the reset.
+    val burned = kernel.task_stats(p, burner)
+    val slept = kernel.task_stats(p, sleeper)
+    val busy = kernel.core_stats(p)
+    burning[me].store(0)
+    var right = measured_within(p, me, role_bit(BURNER) | role_bit(SLEEPER))
+    val before_rest = kernel.core_stats(p)
+    kernel.sleep(p, REST_TICKS)
+    val rested = kernel.core_stats(p)
+    right = right && kernel.delete(p, burner).is_ok() && kernel.delete(p, sleeper).is_ok()
+    (burned, slept) match
+        (Ok(b), Ok(s)) ->
+            right = right && s.run_time > 0 && b.run_time > s.run_time && b.run_time * 2 > busy.elapsed
+            right = right && busy.elapsed >= b.run_time + s.run_time + busy.idle
+            right = right && rested.idle - before_rest.idle > busy.idle && rested.elapsed > busy.elapsed
+            if right
+                say(p, "a busy task ran more than a sleeping one, and the idle task ran most once neither did\n")
+            else
+                say(p, "statistics: burner ")
+                write_dec64(p, b.run_time)
+                p.write(" sleeper ".bytes)
+                write_dec64(p, s.run_time)
+                p.write(" elapsed ".bytes)
+                write_dec64(p, busy.elapsed)
+                p.write(" idle while busy ".bytes)
+                write_dec64(p, busy.idle)
+                p.write(" idle at rest ".bytes)
+                write_dec64(p, rested.idle - before_rest.idle)
+                p.write("\n".bytes)
+        _ -> say(p, "refused the statistics of its own tasks\n")
+
+private high_water[P: Port](p: *P, e: *Entries, me: u32)
+    val deep = spawn_measured(p, e, me, DEEP, 3)
+    val shallow = spawn_measured(p, e, me, SHALLOW, 3)
+    var right = measured_within(p, me, role_bit(DEEP) | role_bit(SHALLOW))
+    val deep_free = kernel.stack_high_water(p, deep)
+    val shallow_free = kernel.stack_high_water(p, shallow)
+    right = right && kernel.delete(p, deep).is_ok() && kernel.delete(p, shallow).is_ok()
+    right = right && kernel.stack_high_water(p, deep) == Err(TaskError.Stale) && kernel.task_stats(p, shallow) == Err(TaskError.Stale)
+    (deep_free, shallow_free) match
+        (Ok(d), Ok(s)) ->
+            if right && d + usize(DIVE_DEPTH) * DIVE_WORDS * 4 <= s && s < MEASURED_WORDS * 4
+                say(p, "a task recursing 8 deep left less of its stack untouched than a shallow one, and both handles went stale\n")
+            else
+                say(p, "high-water marks: deep ")
+                kernel.write_dec(p, u32(d))
+                p.write(" shallow ".bytes)
+                kernel.write_dec(p, u32(s))
+                p.write("\n".bytes)
+        _ -> say(p, "refused the high-water marks of its own tasks\n")
+
+// Core 0 asks for statistics of a task of core 1, R in its slot: the owner alone answers.
+private refused_remote[P: Port](p: *P)
+    val far = kernel.task_handle(1, 1, 1)
+    if kernel.stack_high_water(p, far) == Err(TaskError.Remote) && kernel.task_stats(p, far) == Err(TaskError.Remote)
+        say(p, "is refused another core's task statistics and high-water marks\n")
+    else
+        say(p, "was answered another core's task statistics\n")
+
+// `n` in decimal.
+private write_dec64[P: Port](p: *P, n: u64)
+    if n >= 10 then write_dec64(p, n / 10)
+    val digit: [1]u8 = [u8('0') + u8(n % 10)]
+    p.write(digit[..])
+
+// Recurse `depth` more frames, each with `DIVE_WORDS` words of its own that the next frame reads, so
+// every frame's words stay on the stack until the frames below it return.
+private dive(depth: u32, above: []const u32) -> u32
+    var here: [DIVE_WORDS]u32 = [0; DIVE_WORDS]
+    for k in 0..<DIVE_WORDS
+        here[k] = above[k] + depth + u32(k)
+    if depth == 0 then return here[3]
+    dive(depth - 1, here[..]) + here[usize(depth) % DIVE_WORDS]
+
+// Every task the statistics' scenarios create: its role is looked up by its slot. Once it has done its
+// part it sleeps for good, until R deletes it.
+measured_task[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    val role = measured_roles[me][kernel.current(p).slot()]
+    if role == BURNER
+        while burning[me].load() == 1 do ()
+    else if role == SLEEPER
+        while burning[me].load() == 1 do kernel.sleep(p, 1)
+    else if role == DEEP
+        val seed: [DIVE_WORDS]u32 = [1; DIVE_WORDS]
+        dived[me].store(dive(DIVE_DEPTH - 1, seed[..]))
+    val _ = measured_done[me].add(role_bit(role))
+    loop
+        kernel.sleep(p, FOREVER)
