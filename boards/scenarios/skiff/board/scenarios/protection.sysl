@@ -43,13 +43,14 @@ struct Exchange
     forger_got: u32
     masked_ticks: u32       // masker's
     basepri_seen: u32
-    finished: u32           // a bit for each of worker, forger and masker once it has its result
+    finished: u32           // a bit for each of worker, forger, masker and speaker once it is done
     unused: [54]u32
 
 // The bits of `finished`.
 private const WORKER_DONE: u32 = 1
 private const FORGER_DONE: u32 = 2
 private const MASKER_DONE: u32 = 4
+private const SPOKEN: u32 = 8
 
 @assert(sizeof(Exchange) == EXCHANGE_BYTES, "the exchange fills one 256-byte region")
 
@@ -295,21 +296,31 @@ private speaker_task() -> never
     val x = mine()
     user.sleep_until(x.start + 8)
     write_uart(x, "an unprivileged task granted the UART wrote this line itself\n")
+    x.finished |= SPOKEN
     rest()
 
 private mute_task() -> never
     val x = mine()
     user.sleep_until(x.start + 9)
+    await_spoken(x)
     write_uart(x, "an unprivileged task wrote on a UART it was not granted\n")
     rest()
 
 // Trapper: an SVC the kernel does not take.
 private trapper_task() -> never
-    user.sleep_until(mine().start + 10)
+    val x = mine()
+    user.sleep_until(x.start + 10)
+    await_spoken(x)
     asm
         [thumb] "svc 7"
         [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the scenario is Arm M-profile assembly"
     rest()
+
+// Mute's and trapper's stops are reported on the console speaker writes on, so each waits until speaker
+// has written its whole line: ticks that come late come in bunches, and the round robin among the
+// scenarios' tasks would otherwise break into it.
+private await_spoken(x: *Exchange)
+    while (x.finished & SPOKEN) == 0 do user.sleep(1)
 
 // Masker: try to mask, then watch the ticks go by.
 private masker_task() -> never
@@ -351,6 +362,9 @@ private unmask_all()
 // Crosser, on core 1: take the unit core 0 gives, set the flag core 0 waits for, and say so.
 private crosser_task() -> never
     user.sleep_until(mine().start + 17)
-    if user.take(0, FOREVER) == Ok(true) && user.set(1, 1).is_ok()
+    // The line comes before the flags: core 1's R, waiting on them, outranks crosser and ends core 1's
+    // run 2 ticks after it wakes, which late ticks can make too soon for a line written after.
+    if user.take(0, FOREVER) == Ok(true)
         val _ = user.write("skiff: core 1 an unprivileged task took a unit core 0 gave, through its grant\n".bytes)
+        val _ = user.set(1, 1)
     rest()
