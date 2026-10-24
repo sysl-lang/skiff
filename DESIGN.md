@@ -497,8 +497,9 @@ image may not. The kernel's code is the same in both: what changes is the board'
   checks its link script agrees at boot), the one `System` structure placed first in `.shared` (section
   `.shared.system`, then the kernel's `.shared`), and which core owns each peripheral and interrupt
   (`OWNERS`). **A resource owned by two cores is a build error** (`@assert` over `OWNERS`); in two images
-  each core takes what it owns and nothing else (its UART, its timer interrupt, its NVIC's doorbell; core
-  0 the security controller that releases core 1).
+  each core takes what it owns and nothing else (its UART, its timers, its NVIC's doorbell: core 0 timer 0
+  and timer 1, its run-time counter; core 1 the dual timer, its counter and the interrupt its scenarios
+  raise; core 0 the security controller that releases core 1).
 - **What two cores share is one structure, not loose objects.** The linker orders loose objects as it
   pleases and drops what an image does not use, so two images could place them differently with every
   type alike; a structure's layout is the compiler's alone. The scenarios' objects, counters and
