@@ -1,0 +1,70 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+import skiff.kernel.{FOREVER, MessageBuffer, StreamBuffer, Task, TaskState}
+
+// Stream and message buffers between cores, on the host machine of three cores (machine.sysl): a wake
+// for a task of another core goes to that core's inbox, and the task is ready once its core answers.
+
+// `t`'s state, asked on its own core.
+private stream_state(m: *Machine, t: Task) -> TaskState
+    on(m, t.core())
+    kernel.state(m, t).unwrap()
+
+@test("bytes written on one core that reach the trigger level wake a reader waiting on another, through its inbox")
+stream_wake_across()
+    var m = machine()
+    val rx = task_on(&m, 1, 0, 2)
+    val _ = task_on(&m, 1, 1, 1)
+    val _ = task_on(&m, 0, 2, 1)
+    begin(&m)
+    var s: StreamBuffer[8] = StreamBuffer.new("s", 3)
+    var got: [8]u8 = [0; 8]
+    on(&m, 1)
+    assert_eq(s.receive(&m, got[..], FOREVER), 0)
+    switch_now(&m)
+    on(&m, 0)
+    val two: [2]u8 = [1, 2]
+    assert_eq(s.try_send(&m, two[..]), 2)
+    assert_eq(m.rung[1], 0)
+    assert_eq(s.try_send(&m, two[..]), 2)
+    assert_eq(m.rung[1], 1)
+    assert_eq(m.rung[0], 0)
+    assert_eq(m.rung[2], 0)
+    assert(stream_state(&m, rx) == TaskState.Blocked, "blocked until its own core answers")
+    kernel.answer_doorbell(&m)
+    assert(stream_state(&m, rx) == TaskState.Ready, "ready")
+    switch_now(&m)
+    assert(kernel.current(&m) == rx, "the reader runs")
+    assert_eq(s.receive(&m, got[..], FOREVER), 4)
+    assert(got[0] == 1 && got[1] == 2 && got[2] == 1 && got[3] == 2, "the bytes")
+    assert_eq(m.masked, 0)
+
+@test("a receive on one core that frees the room a message needs wakes its sender on another")
+message_wake_across()
+    var m = machine()
+    val tx = task_on(&m, 2, 0, 2)
+    val _ = task_on(&m, 2, 1, 1)
+    val _ = task_on(&m, 0, 2, 1)
+    begin(&m)
+    var b: MessageBuffer[16] = MessageBuffer.new("b")
+    val six: [6]u8 = [1, 2, 3, 4, 5, 6]
+    on(&m, 0)
+    assert(b.try_send(&m, six[..]), "10 of 16")
+    on(&m, 2)
+    assert(!b.send(&m, six[..], FOREVER), "waits for room")
+    switch_now(&m)
+    on(&m, 0)
+    var got: [8]u8 = [0; 8]
+    assert_eq(b.try_receive(&m, got[..]), 6)
+    assert_eq(m.rung[2], 1)
+    assert_eq(m.rung[1], 0)
+    assert(stream_state(&m, tx) == TaskState.Blocked, "blocked until its own core answers")
+    kernel.answer_doorbell(&m)
+    assert(stream_state(&m, tx) == TaskState.Ready, "ready")
+    switch_now(&m)
+    assert(b.send(&m, six[..], FOREVER), "the second look sends it")
+    on(&m, 0)
+    assert_eq(b.try_receive(&m, got[..]), 6)
+    assert(got[5] == 6, "whole")

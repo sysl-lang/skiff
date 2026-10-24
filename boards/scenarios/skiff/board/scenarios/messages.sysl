@@ -19,6 +19,7 @@ import skiff.kernel.{Action, FOREVER, Flags, Port, Queue, Task}
 //   - Tick 120, the sender notifies the receiver before it waits, and at tick 124 while it waits: the
 //     first must be answered at once, the second must wake it.
 //   - Tick 130, a buffer goes back and forth between them (buffers.sysl).
+//   - Tick 132, bytes and messages pass between them through stream and message buffers (streams.sysl).
 //
 // On a machine of several cores the hammers (waits.sysl) go on to pass messages, notifications and
 // event flags from core 0 to core 1 through objects in `.shared`, with neither core waiting: core 0
@@ -95,6 +96,7 @@ receiver_task[P: Port](p: *P) -> never
     else
         say(p, "a notification was lost\n")
     buffers_receiver(p, me)
+    streams_receiver(p, me)
     val _ = waits_done[me].add(1)
     kernel.exit(p)
 
@@ -115,6 +117,7 @@ sender_task[P: Port](p: *P) -> never
     kernel.sleep_until(p, epochs[me] + 124)
     val _ = kernel.notify(p, receivers[me], 5, Action.SetBits)
     buffers_sender(p, me)
+    streams_sender(p, me)
     val _ = waits_done[me].add(1)
     kernel.exit(p)
 

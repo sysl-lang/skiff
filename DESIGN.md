@@ -144,6 +144,17 @@ the object hands itself over, as a semaphore or a mutex does), and releases the 
   renewed when a task is created in its slot (before the task can run) and cleared when the task is
   deleted (before it goes), and a send whose handle does not match it is refused as stale. Only the
   task waits on its own note; a send wakes it with `Woken`, and it takes the value when it runs.
+- **Stream and message buffers** (`StreamBuffer[N]`, `MessageBuffer[N]`, a byte ring of their own, so
+  either in `.shared` carries bytes between cores; a zeroed one is empty with a trigger level of 1):
+  readers and writers share the one `WaitQueue`, marked by mode as a queue's are, and a writer's
+  `value` is the room it needs (1 for a stream, the message and its 4-byte length prefix for a
+  message). Nothing is kept: a change of bytes wakes the best reader with `Woken` once the trigger
+  level is met, and the best writers in order while the room each needs is there (one needing more
+  than there is holds back those behind it, so a long message is not starved); a woken task takes the
+  lock again and looks, and waits again for what its deadline leaves if another got there first. A
+  stream send writes what fits and waits for room for the rest; a receive whose timeout comes first
+  takes whatever is there. A message goes in whole or not at all, and one longer than `N - 4`, or
+  empty, is refused at once.
 
 ### Timeouts race with wakes, and the outcome decides
 

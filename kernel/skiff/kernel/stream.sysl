@@ -1,0 +1,307 @@
+module skiff.kernel
+
+import sysl.sync.Lock
+
+// Stream buffers and message buffers: bytes passed from writers to readers through a ring that is the
+// object's own storage, so one in `.shared` carries bytes between cores with no pointer in it.
+//
+// A `StreamBuffer[N]` carries up to `N` bytes with no boundaries in them. A reader waits until at least
+// the trigger level of bytes is there, so a reader of four-byte records is woken once a record, not
+// once a byte; a send writes what fits and waits for room for the rest. A `MessageBuffer[N]` is built on
+// one and carries whole messages: each lies behind a `MESSAGE_PREFIX` of its length, and is sent and
+// received whole or not at all.
+//
+// Like a queue, each is a plain struct the application declares: laid into the image as constant data
+// by `new`, or zeroed in `.shared` and filled in at run time. A zeroed one is empty with a trigger level
+// of 1.
+//
+// Every wait takes a timeout in ticks: `FOREVER`, or 0 for "only what can be done now", which is what
+// the `try_` forms are and what an interrupt handler may call. A reader whose timeout comes before the
+// trigger level takes whatever is there.
+//
+// Readers and writers wait in the one queue of waiters, each marked with its side; a writer's record
+// holds the room it needs. Bytes are not kept for a woken task, as a queue keeps a message: a woken
+// task takes the lock again and looks, and waits again for what its deadline leaves if another took
+// the bytes or the room first. A change of bytes wakes the best reader if the trigger level is met, and
+// the best writers, in order, while the room each needs is there; a writer behind one that needs more
+// room than there is waits its turn, so a long message is not starved by short ones.
+
+// The side a waiter of a stream is on: its record's mode.
+private const READING: u8 = 0
+private const WRITING: u8 = 1
+
+// The bytes in front of every message in a message buffer: its length, least significant byte first.
+const MESSAGE_PREFIX: usize = 4
+
+// The ticks a wait of `timeout` with `deadline` has left: `FOREVER` for ever, else 0 once it is past.
+private[kernel] ticks_left(timeout: u32, deadline: u32) -> u32
+    if timeout == FOREVER then return FOREVER
+    val now = ticks()
+    if expired(deadline, now) then 0 else deadline - now
+
+// A ring of up to `N` bytes. `N` is at least 1.
+struct StreamBuffer[const N: usize]
+    w: Waitable
+    bytes: [N]u8
+    head: usize         // the oldest byte's index
+    len: usize          // the bytes there
+    trigger: usize      // the bytes a waiting reader needs; 0 reads as 1
+
+impl[const N: usize] StreamBuffer[N]
+    // An empty stream called `name`, whose readers wait for `trigger` bytes (0 means 1, and a level
+    // above `N` means `N`).
+    const new(name: string, trigger: usize) -> StreamBuffer[N]
+        var bytes: [N]u8
+        StreamBuffer(Waitable.new(name), bytes, 0, 0, trigger)
+
+    // Write as much of `data` as fits, waiting up to `timeout` ticks for room for the rest. Answers how
+    // many bytes were written, from 0 to all of them. Only a task may wait; with a timeout of 0 nothing
+    // waits.
+    send[P: Port](*self, p: *P, data: []const u8, timeout: u32) -> usize
+        val deadline = ticks() + timeout
+        var sent: usize = 0
+        var last = false
+        loop
+            var l = self.w.lock.on(p)
+            l.acquire()
+            sent += self.fill(p, data[sent..])
+            val left = ticks_left(timeout, deadline)
+            if sent == data.len || last || left == 0
+                l.release()
+                return sent
+            val c = running_core(p)
+            enqueue_running(c, &self.w, left, WRITING, 1)
+            p.request_switch()
+            l.release()
+            wait_outcome(c) match
+                Outcome.Woken -> ()
+                Outcome.TimedOut -> last = true
+                _ -> return sent
+
+    // Write as much of `data` as fits, without waiting. An interrupt handler may call it.
+    try_send[P: Port](*self, p: *P, data: []const u8) -> usize = self.send(p, data, 0)
+
+    // Read up to `buf.len` bytes into `buf`, waiting up to `timeout` ticks for the trigger level. Answers
+    // how many were read: once the level is reached, as many as are there and fit; if the timeout comes
+    // first, whatever is there, which may be none. Only a task may wait; with a timeout of 0 nothing
+    // waits, and whatever is there is read whatever the level.
+    receive[P: Port](*self, p: *P, buf: []u8, timeout: u32) -> usize
+        if buf.len == 0 then return 0
+        val deadline = ticks() + timeout
+        var last = false
+        loop
+            var l = self.w.lock.on(p)
+            l.acquire()
+            val left = ticks_left(timeout, deadline)
+            if self.len >= self.level() || last || left == 0
+                val n = self.drain(p, buf)
+                l.release()
+                return n
+            val c = running_core(p)
+            enqueue_running(c, &self.w, left, READING, 0)
+            p.request_switch()
+            l.release()
+            wait_outcome(c) match
+                Outcome.Woken -> ()
+                Outcome.TimedOut -> last = true
+                _ -> return 0
+
+    // Read whatever is there and fits in `buf`, without waiting. An interrupt handler may call it.
+    try_receive[P: Port](*self, p: *P, buf: []u8) -> usize = self.receive(p, buf, 0)
+
+    // Set the trigger level (0 means 1). Answers false, changing nothing, for a level above `N`. A
+    // reader already waiting is woken if the new level is met.
+    set_trigger[P: Port](*self, p: *P, level: usize) -> bool
+        if level > N then return false
+        var l = self.w.lock.on(p)
+        l.acquire()
+        self.trigger = level
+        self.wake_reader(p)
+        l.release()
+        true
+
+    // Empty the ring. Answers false, changing nothing, while a task waits to read or write.
+    reset[P: Port](*self, p: *P) -> bool
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val idle = self.w.queue.count == 0
+        if idle
+            self.head = 0
+            self.len = 0
+        l.release()
+        idle
+
+    // The bytes there to read.
+    available[P: Port](*self, p: *P) -> usize
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val n = self.len
+        l.release()
+        n
+
+    // The bytes there is room for.
+    space[P: Port](*self, p: *P) -> usize = N - self.available(p)
+
+    // How many bytes it holds at most.
+    capacity(*self) -> usize = N
+
+    // The bytes a waiting reader needs.
+    private[kernel] level(*self) -> usize = if self.trigger == 0 then 1 else if self.trigger > N then N else self.trigger
+
+    // Index `i` of the ring, for `i` below 2N.
+    private at(*self, i: usize) -> usize = if i >= N then i - N else i
+
+    // Under the lock: copy what fits of `data` behind the newest byte, and wake the reader if the
+    // trigger level is met. Answers how many bytes. `data` is never the ring's own storage.
+    @disjoint(data)
+    private[kernel] fill[P: Port](*self, p: *P, data: []const u8) -> usize
+        val room = N - self.len
+        val n = if data.len < room then data.len else room
+        for i in 0..<n
+            self.bytes[self.at(self.head + self.len + i)] = data[i]
+        self.len += n
+        if n > 0 then self.wake_reader(p)
+        n
+
+    // Under the lock: move what fits of the oldest bytes into `buf`, and wake the writers the freed room
+    // is enough for. Answers how many bytes. `buf` is never the ring's own storage.
+    @disjoint(buf)
+    private[kernel] drain[P: Port](*self, p: *P, buf: []u8) -> usize
+        val n = if buf.len < self.len then buf.len else self.len
+        for i in 0..<n
+            buf[i] = self.bytes[self.at(self.head + i)]
+        self.skip(p, n)
+        n
+
+    // Under the lock: drop the oldest `count` bytes, which are there, and wake the writers the freed
+    // room is enough for.
+    private[kernel] skip[P: Port](*self, p: *P, count: usize)
+        self.head = self.at(self.head + count)
+        self.len -= count
+        if count > 0 then self.wake_writers(p)
+
+    // Byte `k` from the oldest, which is there.
+    private[kernel] peek(*self, k: usize) -> u8 = self.bytes[self.at(self.head + k)]
+
+    // Under the lock: wake the best reader if the trigger level is met.
+    private wake_reader[P: Port](*self, p: *P)
+        val r = self.w.queue.first_of(READING)
+        if r != NONE && self.len >= self.level()
+            val _ = wake_at(p, &self.w, r, Outcome.Woken)
+
+    // Under the lock: wake the best writers, in order, while the room each needs is there.
+    private wake_writers[P: Port](*self, p: *P)
+        var room = N - self.len
+        loop
+            val s = self.w.queue.first_of(WRITING)
+            if s == NONE || usize(waiter(s).value) > room then return
+            room -= usize(waiter(s).value)
+            val _ = wake_at(p, &self.w, s, Outcome.Woken)
+
+// Whole messages through a stream of `N` bytes. Each takes `MESSAGE_PREFIX` bytes more than its own
+// length, so the longest that can ever be sent is `N - MESSAGE_PREFIX`. A message is never empty: a
+// receive's 0 means there was none.
+struct MessageBuffer[const N: usize]
+    s: StreamBuffer[N]
+
+impl[const N: usize] MessageBuffer[N]
+    // An empty message buffer called `name`.
+    const new(name: string) -> MessageBuffer[N] = MessageBuffer(StreamBuffer.new(name, 1))
+
+    // Send `message` whole, waiting up to `timeout` ticks for room for all of it. Answers whether it was
+    // sent; an empty message, or one longer than the buffer could ever hold, is refused at once. Only a
+    // task may wait; with a timeout of 0 nothing waits.
+    send[P: Port](*self, p: *P, message: []const u8, timeout: u32) -> bool
+        val need = message.len + MESSAGE_PREFIX
+        if message.len == 0 || need > N then return false
+        val deadline = ticks() + timeout
+        var last = false
+        loop
+            var l = self.s.w.lock.on(p)
+            l.acquire()
+            if N - self.s.len >= need
+                self.put(p, message)
+                l.release()
+                return true
+            val left = ticks_left(timeout, deadline)
+            if last || left == 0
+                l.release()
+                return false
+            val c = running_core(p)
+            enqueue_running(c, &self.s.w, left, WRITING, u32(need))
+            p.request_switch()
+            l.release()
+            wait_outcome(c) match
+                Outcome.Woken -> ()
+                Outcome.TimedOut -> last = true
+                _ -> return false
+
+    // Send `message` whole if there is room now, without waiting. An interrupt handler may call it.
+    try_send[P: Port](*self, p: *P, message: []const u8) -> bool = self.send(p, message, 0)
+
+    // Receive the oldest message into `buf`, waiting up to `timeout` ticks for one. Answers its length,
+    // or 0 if the timeout came first or `buf` is too short for it, which leaves it to be received. Only
+    // a task may wait; with a timeout of 0 nothing waits.
+    receive[P: Port](*self, p: *P, buf: []u8, timeout: u32) -> usize
+        val deadline = ticks() + timeout
+        var last = false
+        loop
+            var l = self.s.w.lock.on(p)
+            l.acquire()
+            val left = ticks_left(timeout, deadline)
+            if self.s.len > 0 || last || left == 0
+                val n = self.take(p, buf)
+                l.release()
+                return n
+            val c = running_core(p)
+            enqueue_running(c, &self.s.w, left, READING, 0)
+            p.request_switch()
+            l.release()
+            wait_outcome(c) match
+                Outcome.Woken -> ()
+                Outcome.TimedOut -> last = true
+                _ -> return 0
+
+    // Receive the oldest message into `buf` if there is one, without waiting. An interrupt handler may
+    // call it.
+    try_receive[P: Port](*self, p: *P, buf: []u8) -> usize = self.receive(p, buf, 0)
+
+    // The oldest message's length, 0 if there is none.
+    next_length[P: Port](*self, p: *P) -> usize
+        var l = self.s.w.lock.on(p)
+        l.acquire()
+        val n = self.length()
+        l.release()
+        n
+
+    // The longest message there is room for now.
+    space[P: Port](*self, p: *P) -> usize
+        val free = self.s.space(p)
+        if free > MESSAGE_PREFIX then free - MESSAGE_PREFIX else 0
+
+    // Empty the buffer. Answers false, changing nothing, while a task waits to send or receive.
+    reset[P: Port](*self, p: *P) -> bool = self.s.reset(p)
+
+    // Under the lock: write `message` behind its length, the room checked, and wake the reader.
+    private put[P: Port](*self, p: *P, message: []const u8)
+        val n = message.len
+        val prefix: [MESSAGE_PREFIX]u8 = [u8(n & 0xff), u8((n >> 8) & 0xff), u8((n >> 16) & 0xff), u8((n >> 24) & 0xff)]
+        val _ = self.s.fill(p, prefix[..])
+        val _ = self.s.fill(p, message)
+
+    // Under the lock: the oldest message's length, from its prefix; 0 if there is none.
+    private length(*self) -> usize
+        if self.s.len == 0 then return 0
+        var n: usize = 0
+        for k in 0..<MESSAGE_PREFIX
+            n = n | (usize(self.s.peek(k)) << (8 * k))
+        n
+
+    // Under the lock: move the oldest message into `buf` if it fits, waking the writers its room is
+    // enough for. Answers its length, or 0 if there is none or it does not fit.
+    private take[P: Port](*self, p: *P, buf: []u8) -> usize
+        val n = self.length()
+        if n == 0 || n > buf.len then return 0
+        self.s.head = self.s.at(self.s.head + MESSAGE_PREFIX)
+        self.s.len -= MESSAGE_PREFIX
+        self.s.drain(p, buf[..<n])
