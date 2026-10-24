@@ -240,7 +240,7 @@ The same body in a function that is not `const` builds and prints `1`, and a `co
 place of `elif const` builds too. skiff met it writing `kernel.fingerprint` (layout.sysl), which returns from each arm instead, the
 shape `holds_pointer` has anyway.
 
-Status: open.
+Status: fixed in sysl 0.5.3.
 
 ## FINDINGS 12 — one store word per image
 
