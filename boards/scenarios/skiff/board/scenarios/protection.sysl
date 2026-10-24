@@ -6,28 +6,28 @@ import skiff.kernel.user
 import skiff.kernel.user.Refusal
 
 // Protection, on every core, once its waits have reported (kernel DESIGN "Protection"). R creates the
-// tasks, and from its tick `t` on:
+// tasks, and from its tick `t` on runs the scenarios one after another. Each after the round trips waits
+// for its own step of the exchange's `stage`, which R moves on once the one before has ended (a task
+// stopped, a result in): a core's ticks come late and in bunches under a loaded host, so scenarios due
+// on fixed ticks met, and their lines came out of order or ran into each other.
 //
 //   - First a task whose map has a region the MPU cannot hold exactly is refused at creation.
 //   - At t, worker (unprivileged) makes 5 round trips with echo (privileged): it gives `ping`, the one
 //     object it was granted, and waits for echo's notification, which carries the round's number into a
-//     word of its own exchange. Once R has its verdict, it sets `second`, the tick the rest count from:
-//     the round trips take a few ticks, and fewer or more under a loaded host, so a stop due at a fixed
-//     tick could report before the verdict. Below, t+3 is `second`, t+4 the tick after, and so on.
-//   - At t+3, snoop (unprivileged) reads the time base straight from the kernel's memory, at t+4 deep
-//     (privileged) pushes until its stack overflows, and at t+5 null (privileged) loads from address 0:
-//     each is stopped alone, and the kernel reports it.
-//   - At t+6, forger (unprivileged) hands the kernel what it may not: a privileged task's bytes, its
-//     read-only notice to write into, a buffer straddling the end of its exchange, a grant past its list
-//     and one of another kind, and a task that does not exist. Every call must be refused and touch
-//     nothing: `vault` keeps its bytes, and the notification R sent before is still there for its last,
-//     good wait.
-//   - At t+8, speaker, granted the UART's registers, writes a line on it itself. At t+9, mute, granted
-//     nothing of the kind, tries the same and is stopped. At t+10, trapper makes an SVC the kernel does
-//     not take and is stopped.
-//   - At t+11, masker writes BASEPRI and PRIMASK, which an unprivileged task cannot, and watches the time
-//     base through its calls: it must see three ticks go by.
-//   - At t+16, R checks that the five tasks stopped are stopped and the other four ran on.
+//     word of its own exchange.
+//   - Snoop (unprivileged) reads the time base straight from the kernel's memory, then deep (privileged)
+//     pushes until its stack overflows, then null (privileged) loads from address 0: each is stopped
+//     alone, and the kernel reports it.
+//   - Forger (unprivileged) hands the kernel what it may not: a privileged task's bytes, its read-only
+//     notice to write into, a buffer straddling the end of its exchange, a grant past its list and one
+//     of another kind, and a task that does not exist. Every call must be refused and touch nothing:
+//     `vault` keeps its bytes, and the notification R sent before is still there for its last, good wait.
+//   - Speaker, granted the UART's registers, writes a line on it itself. Then mute, granted nothing of
+//     the kind, tries the same and is stopped, and trapper makes an SVC the kernel does not take and is
+//     stopped.
+//   - Masker writes BASEPRI and PRIMASK, which an unprivileged task cannot, and watches the time base
+//     through its calls: it must see three ticks go by.
+//   - R checks that the five tasks stopped are stopped and the other four ran on.
 //   - With several cores, core 1's crosser (unprivileged) takes a unit of `across`, in `.shared`, which
 //     core 0 gives, and sets a bit of `crossed`, in `.shared`, which core 0 waits for: each core reaches
 //     the objects through its own grant list, and neither is in the task's map. It says so itself, through
@@ -46,7 +46,7 @@ struct Exchange
     masked_ticks: u32       // masker's
     basepri_seen: u32
     finished: u32           // a bit for each of worker, forger, masker and speaker once it is done
-    second: u32             // the tick the scenarios after the round trips count from, once R sets it
+    stage: u32              // the step of the scenarios R has let begin (`STEP_*`)
     unused: [53]u32
 
 // The bits of `finished`.
@@ -54,6 +54,17 @@ private const WORKER_DONE: u32 = 1
 private const FORGER_DONE: u32 = 2
 private const MASKER_DONE: u32 = 4
 private const SPOKEN: u32 = 8
+
+// The steps of `stage`, one for each task that runs after the round trips, in order.
+private const STEP_SNOOP: u32 = 1
+private const STEP_DEEP: u32 = 2
+private const STEP_NULL: u32 = 3
+private const STEP_FORGER: u32 = 4
+private const STEP_SPEAKER: u32 = 5
+private const STEP_MUTE: u32 = 6
+private const STEP_TRAPPER: u32 = 7
+private const STEP_MASKER: u32 = 8
+private const STEP_CROSSER: u32 = 9
 
 @assert(sizeof(Exchange) == EXCHANGE_BYTES, "the exchange fills one 256-byte region")
 
@@ -127,11 +138,13 @@ protection[P: Port](p: *P, e: *Entries, code: Region, uart: Region)
         say(p, "an unprivileged task made 5 round trips with a privileged task through a semaphore and notifications\n")
     else
         say(p, "the unprivileged task's round trips went wrong\n")
-    val u = kernel.ticks() + 1
-    x.second = u
+    step(p, x, STEP_SNOOP, snoop)
+    step(p, x, STEP_DEEP, deep)
+    step(p, x, STEP_NULL, nil)
     // A notification waiting for forger, which its refused calls must leave alone.
     val _ = kernel.notify(p, forger, 0x77, Action.Overwrite)
-    await_finished(p, x, FORGER_DONE, u + 4)
+    x.stage = STEP_FORGER
+    await_finished(p, x, FORGER_DONE, kernel.ticks())
     var untouched = true
     for b in vaults[me]
         if b != 0x5a then untouched = false
@@ -139,13 +152,18 @@ protection[P: Port](p: *P, e: *Entries, code: Region, uart: Region)
         say(p, "kernel calls with buffers, grants or handles outside the caller's were refused, and touched nothing\n")
     else
         say(p, "a kernel call with a buffer, grant or handle outside the caller's was not refused\n")
-    await_finished(p, x, MASKER_DONE, u + 12)
+    x.stage = STEP_SPEAKER
+    await_finished(p, x, SPOKEN, kernel.ticks())
+    step(p, x, STEP_MUTE, mute)
+    step(p, x, STEP_TRAPPER, trapper)
+    x.stage = STEP_MASKER
+    await_finished(p, x, MASKER_DONE, kernel.ticks())
     if x.masked_ticks >= 3 && x.basepri_seen == 0
         say(p, "an unprivileged task's writes to BASEPRI and PRIMASK held off nothing\n")
     else
         say(p, "an unprivileged task masked interrupts\n")
     // A core's late tick may wake several tasks at once, and R first: it gives the rest their turn.
-    kernel.sleep_until(p, u + 13)
+    kernel.sleep(p, 1)
     var judged = false
     for _ in 0..<WAIT_TICKS
         val stopped = is(p, snoop, TaskState.Stopped) && is(p, deep, TaskState.Stopped) && is(p, nil, TaskState.Stopped) && is(p, mute, TaskState.Stopped) && is(p, trapper, TaskState.Stopped)
@@ -157,6 +175,7 @@ protection[P: Port](p: *P, e: *Entries, code: Region, uart: Region)
         say(p, "the tasks their protection stopped are stopped, and the rest ran on\n")
     else
         say(p, "a task that broke its protection ran on, or one that did not was stopped\n")
+    x.stage = STEP_CROSSER
     if kernel.CORES > 1 && me == 0
         val _ = common.across.give(p)
         if common.crossed_bits.wait(p, 1, false, false, 300).is_some()
@@ -179,6 +198,13 @@ private is[P: Port](p: *P, t: Task, s: TaskState) -> bool = kernel.state(p, t) =
 // How long R gives a scenario past its tick before judging it: a core's ticks may come late under
 // QEMU's multi-threaded TCG, and wake several tasks at once.
 private const WAIT_TICKS: u32 = 50
+
+// Let step `n` begin, which `t` runs, then sleep until `t` is stopped, or `WAIT_TICKS` ticks have gone by.
+private step[P: Port](p: *P, x: *Exchange, n: u32, t: Task)
+    x.stage = n
+    for _ in 0..<WAIT_TICKS
+        if is(p, t, TaskState.Stopped) then return
+        kernel.sleep(p, 1)
 
 // Sleep until tick `tick`, then until `x.finished` has `bit`, or `WAIT_TICKS` more ticks have gone by.
 private await_finished[P: Port](p: *P, x: *Exchange, bit: u32, tick: u32)
@@ -220,13 +246,13 @@ echo_task[P: Port](p: *P) -> never
 // Snoop: read the kernel's own data.
 private snoop_task() -> never
     val x = mine()
-    after_trips(x, 0)
+    await_step(x, STEP_SNOOP)
     x.unused[0] = kernel.ticks()        // the load faults; the store is never reached
     rest()
 
 // Deep, privileged: push until the stack runs out.
 private deep_task() -> never
-    sleep_privileged(1)
+    sleep_privileged(STEP_DEEP)
     asm
         [thumb]
             "1:"
@@ -238,7 +264,7 @@ private deep_task() -> never
 
 // Null, privileged: load from address 0.
 private null_task() -> never
-    sleep_privileged(2)
+    sleep_privileged(STEP_NULL)
     var seen: u32 = 0
     val zero: u32 = 0
     asm
@@ -253,18 +279,17 @@ private null_task() -> never
 
 // A privileged task with no port sleeps through the trap, as an unprivileged one does, until tick
 // `offset` of its core's scenarios.
-private sleep_privileged(offset: u32) = after_trips(&exchanges[user.current().core()], offset)
+private sleep_privileged(n: u32) = await_step(&exchanges[user.current().core()], n)
 
-// Sleep until R has set `x.second`, then until `offset` ticks after it.
-private after_trips(x: *Exchange, offset: u32)
-    while x.second == 0 do user.sleep(1)
-    user.sleep_until(x.second + offset)
+// Sleep until R lets step `n` begin.
+private await_step(x: *Exchange, n: u32)
+    while x.stage < n do user.sleep(1)
 
 // Forger: buffers, grants and handles that are not its own.
 private forger_task() -> never
     val x = mine()
     val me = user.current().core()
-    after_trips(x, 3)
+    await_step(x, STEP_FORGER)
     val theirs = vaults[me][0..<16]
     val straddling: *u8 = ptr_cast(usize(x) + EXCHANGE_BYTES - 8)
     val read_only: *u32 = ptr_cast(usize(&notices[me][0]))
@@ -303,38 +328,30 @@ private put_uart(u: *Uart, text: string)
 
 private speaker_task() -> never
     val x = mine()
-    after_trips(x, 5)
+    await_step(x, STEP_SPEAKER)
     write_uart(x, "an unprivileged task granted the UART wrote this line itself\n")
     x.finished |= SPOKEN
     rest()
 
 private mute_task() -> never
     val x = mine()
-    after_trips(x, 6)
-    await_spoken(x)
+    await_step(x, STEP_MUTE)
     write_uart(x, "an unprivileged task wrote on a UART it was not granted\n")
     rest()
 
 // Trapper: an SVC the kernel does not take.
 private trapper_task() -> never
     val x = mine()
-    after_trips(x, 7)
-    await_spoken(x)
+    await_step(x, STEP_TRAPPER)
     asm
         [thumb] "svc 7"
         [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "the scenario is Arm M-profile assembly"
     rest()
 
-// Mute's and trapper's stops are reported on the console speaker writes on, so each waits until speaker
-// has written its whole line: ticks that come late come in bunches, and the round robin among the
-// scenarios' tasks would otherwise break into it.
-private await_spoken(x: *Exchange)
-    while (x.finished & SPOKEN) == 0 do user.sleep(1)
-
 // Masker: try to mask, then watch the ticks go by.
 private masker_task() -> never
     val x = mine()
-    after_trips(x, 8)
+    await_step(x, STEP_MASKER)
     val seen = mask_all()
     val first = user.ticks()
     while user.ticks() - first < 3 do ()
@@ -370,7 +387,7 @@ private unmask_all()
 
 // Crosser, on core 1: take the unit core 0 gives, set the flag core 0 waits for, and say so.
 private crosser_task() -> never
-    after_trips(mine(), 14)
+    await_step(mine(), STEP_CROSSER)
     // The line comes before the flags: core 1's R, waiting on them, outranks crosser and ends core 1's
     // run 2 ticks after it wakes, which late ticks can make too soon for a line written after.
     if user.take(0, FOREVER) == Ok(true)
