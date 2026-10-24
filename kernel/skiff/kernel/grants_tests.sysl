@@ -85,6 +85,7 @@ queue_refusals()
     assert_eq(make(&r, CALL_SEND, 2, at(desk), 4, 0), REFUSED_HANDLE)
     assert_eq(make(&r, CALL_SEND, option_grants + 3, at(desk), 4, 0), REFUSED_HANDLE)
     assert_eq(make(&r, CALL_SEND, 0, at(desk), 2, 0), REFUSED_ARGUMENT)
+    assert_eq(make(&r, CALL_SEND, 0, at(desk), 8, 0), REFUSED_ARGUMENT)
     assert_eq(make(&r, CALL_SEND, 0, at(theirs), 4, 0), REFUSED_BUFFER)
     assert_eq(make(&r, CALL_SEND, 0, at(desk) + 62, 4, 0), REFUSED_BUFFER)
     desk[2] = 2
