@@ -1,0 +1,209 @@
+module skiff.kernel
+
+// Software timers: a function called once a given number of ticks have passed, once (a one-shot timer)
+// or every period from then on (a periodic timer).
+//
+// A `Timer` is a plain struct the application declares, whose zero is a timer not yet created, and it
+// belongs to the core whose task creates it (`create_timer`). Its callback runs on that core, in the
+// core's timer service: a task the board creates at a priority it chooses, whose body is
+// `serve_timers`. So a callback may do what a task may do except wait for long, since while one runs no
+// other timer of its core is called; and nothing but the service touches the core's list of active
+// timers, which is private to the core.
+//
+// Starting, stopping, resetting and changing the period are commands, sent to the service through a
+// `Queue` of `timer_commands`, and each takes effect when the service takes it. A command carries the tick
+// it was sent on, and a timer it starts expires a period after that tick however long the command waited.
+// A periodic timer's next expiry is the one before plus its period, so it never drifts from the ticks it
+// was due on: if the service fell behind, each missed expiry is still called, late, in order. The service
+// waits on its queue, through the queue's one `WaitQueue`, for as long as the soonest active timer
+// leaves it.
+//
+// Only the timer's own core may command it: the list and the queue are that core's private state, and a
+// command from another core is refused as `Remote` (DESIGN "Software timers"). An interrupt handler of
+// the owner core commands with a timeout of 0.
+
+// What a timer calls when it expires: a function given the timer and the tick it was due on.
+type TimerCallback = *extern(*Timer, u32) -> unit
+
+struct Timer
+    name: string
+    callback: TimerCallback
+    period: u32         // ticks from a start to the expiry, and between the expiries of a periodic timer
+    periodic: bool      // whether it starts again by itself at each expiry
+    owner: u32          // one more than the core that created it: 0 until it is created
+    active: bool        // whether it will expire: started, and since then neither stopped nor, if a one-shot, expired
+    expiry: u32         // the tick an active timer next expires on
+    next: *Timer        // the active timer of its core that expires after it, or null
+
+impl Timer
+    // The core the timer belongs to, or None before it is created.
+    core(*self) -> Option[u32] = if self.owner == 0 then None else Some(self.owner - 1)
+
+    // Start the timer: it expires its period after the tick of this call. Starting an active timer starts
+    // it again from now. Waits up to `timeout` ticks for room among the service's commands.
+    start[P: Port](*self, p: *P, timeout: u32) -> Result[unit, TimerError] = command(p, self, START, 0, timeout)
+
+    // Stop the timer, so that it does not expire. Stopping a timer that is not active does nothing.
+    stop[P: Port](*self, p: *P, timeout: u32) -> Result[unit, TimerError] = command(p, self, STOP, 0, timeout)
+
+    // Start the timer again from now, active or not: what `start` does.
+    reset[P: Port](*self, p: *P, timeout: u32) -> Result[unit, TimerError] = self.start(p, timeout)
+
+    // Give the timer a new period and start it from now with it, active or not.
+    change_period[P: Port](*self, p: *P, period: u32, timeout: u32) -> Result[unit, TimerError]
+        if !holdable(period) then return Err(TimerError.Period)
+        command(p, self, PERIOD, period, timeout)
+
+    // Whether the timer will expire. A command still waiting for the service has not changed it yet.
+    is_active[P: Port](*self, p: *P) -> Result[bool, TimerError]
+        val _ = owned_timers(p, self)?
+        Ok(self.active)
+
+// Why a timer call was refused.
+enum TimerError
+    NotCreated      // the timer has not been created
+    Created         // the timer has been created already: a timer is created once
+    Remote          // the timer is another core's: only the owner commands it
+    Period          // a period of 0, or of 2^31 ticks or more
+    Busy            // the service's commands stayed full for the whole timeout
+
+// What a command asks of the service: its `op`. 0 is no command, what an empty slot of the queue holds.
+private const START: u8 = 1
+private const STOP: u8 = 2
+private const PERIOD: u8 = 3
+
+// A command to a core's timer service: what to do to `timer`, sent on tick `sent`, with the new period
+// for `PERIOD`.
+struct TimerCommand
+    op: u8
+    timer: *Timer
+    sent: u32
+    period: u32
+
+// A core's timer service: its active timers, soonest first, and its commands. Private to the core: its
+// service task alone touches the list, and its tasks and interrupt handlers reach only `commands`.
+struct TimerService
+    head: *Timer
+    commands: Queue[TimerCommand, option_timer_commands]
+
+private var timer_services: [option_cores]TimerService = [TimerService(null, Queue.new("timer commands")); option_cores]
+
+// The running core's timer service.
+private[kernel] timers_here[P: Port](p: *P) -> *TimerService = &timer_services[here_id(p)]
+
+// Whether a timer may have `period`: above 0, and below 2^31 ticks, so that its expiry compares across
+// the time base's wrap.
+private holdable(period: u32) -> bool = period > 0 && period < 0x8000_0000
+
+// Create timer `t` on the running core, inactive, calling `callback` every `period` ticks once started
+// if `periodic`, else once a start.
+create_timer[P: Port](p: *P, t: *Timer, name: string, period: u32, periodic: bool, callback: TimerCallback) -> Result[unit, TimerError]
+    if !holdable(period) then return Err(TimerError.Period)
+    val state = p.mask()
+    if t.owner != 0
+        p.restore(state)
+        return Err(TimerError.Created)
+    *t = Timer(name, callback, period, periodic, here_id(p) + 1, false, 0, null)
+    p.restore(state)
+    Ok(())
+
+// The timer service of `t`'s core, which must be the running core.
+private owned_timers[P: Port](p: *P, t: *Timer) -> Result[*TimerService, TimerError]
+    if t.owner == 0 then return Err(TimerError.NotCreated)
+    if t.owner - 1 != here_id(p) then return Err(TimerError.Remote)
+    Ok(timers_here(p))
+
+// Send command `op` for `t` to its service, stamped with the tick it is sent on.
+private command[P: Port](p: *P, t: *Timer, op: u8, period: u32, timeout: u32) -> Result[unit, TimerError]
+    val s = owned_timers(p, t)?
+    if s.commands.send(p, TimerCommand(op, t, ticks(), period), timeout) then Ok(()) else Err(TimerError.Busy)
+
+// The body of the running core's timer service: carry out the commands, call the timers whose expiry
+// has come, and wait on the commands until the next expiry. The board's service task calls it.
+serve_timers[P: Port](p: *P) -> never
+    loop
+        serve_once(p)
+
+// One round of the service: a turn, then a wait for a command, as long as the soonest active timer
+// leaves, carrying it out if one came.
+private[kernel] serve_once[P: Port](p: *P)
+    timer_turn(p)
+    val s = timers_here(p)
+    s.commands.receive(p, s.wait_from(ticks())) match
+        Some(c) -> s.apply(c)
+        None -> ()
+
+// A turn of the running core's service with no wait: carry out every command waiting, then call every
+// timer whose expiry has come, soonest first.
+timer_turn[P: Port](p: *P)
+    val s = timers_here(p)
+    loop
+        s.commands.try_receive(p) match
+            Some(c) -> s.apply(c)
+            None -> break
+    s.expire(ticks())
+
+impl TimerService
+    // Add active timer `t`, whose `expiry` is set, as at tick `now`: behind every timer due no later.
+    // An expiry before `now` is overdue and comes before any that is not.
+    private insert(*self, t: *Timer, now: u32)
+        val due_in = i32(t.expiry - now)
+        var before: *Timer = null
+        var at = self.head
+        while at != null && i32(at.expiry - now) <= due_in
+            before = at
+            at = at.next
+        t.next = at
+        if before == null then self.head = t else before.next = t
+
+    // Take `t` out of the list, if it is in it.
+    private remove(*self, t: *Timer)
+        var before: *Timer = null
+        var at = self.head
+        while at != null && at != t
+            before = at
+            at = at.next
+        if at == null then return
+        if before == null then self.head = t.next else before.next = t.next
+        t.next = null
+
+    // Take out and answer the first timer whose expiry has come at `now`, or null.
+    private take_due(*self, now: u32) -> *Timer
+        val t = self.head
+        if t == null || !expired(t.expiry, now) then return null
+        self.head = t.next
+        t.next = null
+        t
+
+    // The ticks from `now` to the first expiry: 0 if it has come, `FOREVER` with no active timer.
+    private[kernel] wait_from(*self, now: u32) -> u32
+        if self.head == null then return FOREVER
+        val e = self.head.expiry
+        if expired(e, now) then 0 else e - now
+
+    // Call every timer whose expiry has come at `now`, soonest first. A periodic timer is put back a
+    // period after the expiry it is called for, and called again in the same turn if that has come too;
+    // a one-shot is no longer active. Each is settled before its callback runs.
+    private expire(*self, now: u32)
+        loop
+            val t = self.take_due(now)
+            if t == null then return
+            val due = t.expiry
+            if t.periodic
+                t.expiry = due + t.period
+                self.insert(t, now)
+            else
+                t.active = false
+            t.callback(t, due)
+
+    // Carry out command `c`.
+    private[kernel] apply(*self, c: TimerCommand)
+        val t = c.timer
+        if t.active then self.remove(t)
+        if c.op == STOP
+            t.active = false
+            return
+        if c.op == PERIOD then t.period = c.period
+        t.expiry = c.sent + t.period
+        t.active = true
+        self.insert(t, c.sent)

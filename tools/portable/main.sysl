@@ -98,6 +98,19 @@ private body() -> never
     loop
         ()
 
+private var beat: kernel.Timer
+
+private beaten(t: *kernel.Timer, due: u32) = ()
+
+// Software timers and their service, over the port.
+private timers(m: *Nothing) -> bool
+    if kernel.create_timer(m, &beat, "beat", 3, true, &beaten).is_err() || beat.core() != Some(0) then return false
+    if beat.start(m, 1).is_err() || beat.reset(m, 0).is_err() || beat.change_period(m, 4, 0).is_err() then return false
+    kernel.timer_turn(m)
+    if beat.is_active(m) != Ok(true) || beat.stop(m, kernel.FOREVER).is_err() then return false
+    if m.cores() > 3 then kernel.serve_timers(m)
+    true
+
 private var user_stack: [64]u32 = [0; 64]
 
 // Unprivileged tasks, their calls, and stopping a task, over the port.
@@ -130,7 +143,7 @@ probe() -> i32
     if !kernel.stopped(here.id) || kernel.expired(kernel.ticks(), 0) then return 1
     if t.is_err() || kernel.delete(&m, t.unwrap()).is_ok() then return 1
     if !control(&m, t.unwrap()) then return 1
-    if !protection(&m) then return 1
+    if !protection(&m) || !timers(&m) then return 1
     if here.sched.started()
         kernel.sleep(&m, 1)
         kernel.sleep_until(&m, 1)

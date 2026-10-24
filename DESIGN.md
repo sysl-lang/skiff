@@ -374,6 +374,42 @@ handing over a buffer, never by copying it. A **pool** holds the buffers; a **ch
 - Tickless idle (milestone 10) replaces the periodic tick with a one-shot wake at the next deadline; the
   counter then comes from a hardware timer every core can read.
 
+## Software timers
+
+A software timer calls a function once a period has passed (one-shot), or every period (periodic).
+
+- **A `Timer` is a plain struct the application declares**, as every other object is; its zero is a timer
+  not yet created. `create_timer(p, &t, name, period, periodic, callback)` creates it **on the running
+  core, which owns it from then on**; a second creation is refused (`Created`). A period is 1 to
+  2^31 - 1 ticks (`Period`), so an expiry always compares across the time base's wrap. A timer is never
+  deleted.
+- **Each core has a timer service**: its list of active timers (sorted by `i32(expiry - now)`, equal
+  expiries in the order they were started) and a `Queue[TimerCommand, timer_commands]` (option, default
+  8), both private to the core. The board creates the service task on each core that uses timers, at a
+  priority it chooses, with the body `kernel.serve_timers(p)`. **Callbacks run in that task**, one after
+  another: never in the tick, and never on another core. A callback is `*extern(*Timer, u32)`: the
+  timer and the tick it was due on.
+- **Start, stop, reset and change of period are commands**, sent through the queue with a timeout for
+  room (0 from an interrupt handler, which never waits; a full queue then answers `Busy`). The service
+  alone touches the list. A command carries the tick it was **sent** on, and a start expires a period
+  after that tick however long the command waited. `is_active` answers what the service has done so far.
+- **A periodic timer's next expiry is its last plus its period, never now plus its period**, so it does
+  not drift: when the service falls behind (a busier task, a long callback), each missed expiry is still
+  called, late and in deadline order among every timer due, in the same turn. A one-shot is inactive
+  before its callback runs, and a periodic timer is already back in the list, so a callback may command
+  its own timer.
+- **The service waits through the one `WaitQueue`**: it receives on its command queue with a timeout of
+  the ticks to the soonest expiry (`FOREVER` with none active), so a command wakes it as any send wakes
+  a receiver, and the expiry is the wait's timeout ending on the owner's tick. A turn is: carry out every
+  command waiting, then call every timer due at `ticks()`.
+- **Only the owner commands a timer; another core is refused (`Remote`)**, touching nothing. The list,
+  the queue and the timer itself are the owner's private state, so a command from another core would
+  have to be a message, and the inbox carries only wakes and boosts (its rings are sized for those, two
+  per task). A task on another core that needs a timer started asks a task of the owner, by notification
+  or queue, which is the same hop an inbox message would make. Reading `owner` from another core is a
+  read of the owner's memory, written once at creation; on a core whose cache could hold a stale zero
+  the answer is `NotCreated` instead of `Remote`, never an action.
+
 ## Placement, checked
 
 - Kernel objects are declared by the application. **In a build with more than one core, an object used
