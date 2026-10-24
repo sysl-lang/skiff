@@ -14,13 +14,14 @@ enum MessageKind: u8
     Boost = 3       // a task waiting on `mutex`, which the task holds, outranks it: it runs at `priority` at least
 
 // What one core asks of another through its inbox: a kind, the task it is about, a priority, and for a
-// boost the mutex the waiter waits on, which lies in `.shared` since two cores use it. Only a boost
-// reads `mutex`; the other kinds leave it null, a raw pointer's zero, as a zeroed slot has it.
+// boost the mutex the waiter waits on, which lies in `.shared` since two cores use it. The mutex is named
+// by its place in `.shared` (`place_of`), not by a pointer: nothing in `.shared` holds a pointer
+// (layout.sysl). Only a boost reads `mutex`; the other kinds leave it 0, as a zeroed slot has it.
 struct Message
     kind: MessageKind
     task: Task
     priority: u8
-    mutex: *Mutex
+    mutex: usize
 
 // How many messages one inbox ring holds: one wake or hand-over for each task of the receiving core and
 // one boost for each task of the sending core (DESIGN "Inboxes"). One slot more stays empty, so that a
@@ -97,6 +98,13 @@ shared_bounds(start: usize, end: usize)
 
 // Whether `bytes` bytes at `at` lie in `.shared`, by the bounds `shared_bounds` was given.
 private[kernel] in_shared(at: usize, bytes: usize) -> bool = within(at, bytes, shared.start, shared.end)
+
+// The place of address `at` in `.shared`: how far past the section's start it lies. A place names one
+// object in every image that shares the section, which is how `.shared` refers to `.shared`.
+private[kernel] place_of(at: usize) -> usize = at - shared.start
+
+// The address of place `place` in `.shared`.
+private[kernel] at_place(place: usize) -> usize = shared.start + place
 
 // The wait record at `index`: `core * option_tasks + slot`.
 private[kernel] waiter(index: u16) -> *Waiter = &shared.waiters[usize(index) / option_tasks][usize(index) % option_tasks]

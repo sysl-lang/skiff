@@ -15,18 +15,37 @@ import sysl.sync.{Atomic, Lock}
 // The value of `KernelLock.user` once a second core has taken the lock.
 private const SHARED_USE: u32 = 0xffff_ffff
 
+// How many bytes of an object's name its lock keeps.
+const NAME_BYTES: usize = 16
+
+// An object's name is kept in the lock itself, its first `NAME_BYTES` bytes and zeros after: the lock
+// may lie in `.shared`, and a `string` there would point into the image that filled it in, which in a
+// build of two images is another core's memory.
 struct KernelLock
-    name: string            // what a misplaced object is reported as
+    name: [NAME_BYTES]u8    // what a misplaced object is reported as
     word: Atomic[u32]       // the chip lock's word: 0 when free
     saved: u32              // what the holder's mask answered, which the release restores
     user: u32               // the core that first took the lock, plus one; SHARED_USE once another has
 
 impl KernelLock
     // A free lock for the object called `name`.
-    const new(name: string) -> KernelLock = KernelLock(name, Atomic(0), 0, 0)
+    const new(name: string) -> KernelLock = KernelLock(kept_name(name), Atomic(0), 0, 0)
+
+    // The object's name, as far as the lock kept it.
+    name_bytes(*self) -> []const u8
+        var n: usize = 0
+        while n < NAME_BYTES && self.name[n] != 0 do n += 1
+        self.name[0..<n]
 
     // The lock as the running core takes it, through its port `p`.
     on[P: Port](*self, p: *P) -> Locking[P] = Locking(self, p)
+
+// The first `NAME_BYTES` bytes of `name`, zeros after.
+private const kept_name(name: string) -> [NAME_BYTES]u8
+    var kept: [NAME_BYTES]u8
+    for i in 0..<NAME_BYTES
+        if i < name.len then kept[i] = name[i]
+    kept
 
 // A `KernelLock` taken through a port: what implements `sysl.sync.Lock`. The mask and the spin are the
 // port's, and `Lock`'s members take no port, so the pair is what is locked.
@@ -71,7 +90,7 @@ impl[P: Port] Locking[P]
             return
         if !in_shared(usize(l), sizeof(KernelLock))
             self.port.write("skiff: ".bytes)
-            self.port.write(l.name.bytes)
+            self.port.write(l.name_bytes())
             self.port.write(" is used by two cores and lies outside .shared\n".bytes)
             panic("skiff: an object two cores use lies outside .shared")
         l.user = SHARED_USE

@@ -1,0 +1,138 @@
+module skiff.kernel
+@tests
+
+import sysl.sync.Atomic
+
+// The layout fingerprint, the pointer check, the handshake and what an object's lock keeps of its name
+// (layout.sysl, lock.sysl).
+
+private struct Pair
+    a: u16
+    b: u32
+
+private struct SamePair
+    x: u16
+    y: u32
+
+private struct Swapped
+    b: u32
+    a: u16
+
+private struct Wider
+    a: u32
+    b: u32
+
+private struct Holder
+    tag: u8
+    pairs: [3]Pair
+
+private struct LongerHolder
+    tag: u8
+    pairs: [4]Pair
+
+private struct OtherHolder
+    tag: u8
+    pairs: [3]Swapped
+
+private struct Nested
+    head: u32
+    inner: Pair
+
+private struct NestedSwapped
+    head: u32
+    inner: Swapped
+
+private struct Pointing
+    count: u32
+    at: *u32
+
+private struct Named
+    name: string
+
+private struct Viewing
+    bytes: []u8
+
+private struct Deep
+    rows: [2][3]Pointing
+
+private enum Carrying
+    Nothing
+    Some(at: *u32)
+
+private struct WithEnum
+    e: Carrying
+
+@test("two structures laid out alike have one fingerprint, whatever their fields are called")
+fingerprint_alike()
+    assert(fingerprint[Pair]() == fingerprint[SamePair](), "Pair and SamePair agree")
+    assert(fingerprint[Shared]() == LAYOUT, "the kernel's layout is its structure's fingerprint")
+
+@test("moving, widening or adding a field changes the fingerprint, inside an array or a field too")
+fingerprint_differs()
+    assert(fingerprint[Pair]() != fingerprint[Swapped](), "fields moved")
+    assert(fingerprint[Pair]() != fingerprint[Wider](), "a field widened")
+    assert(fingerprint[Holder]() != fingerprint[LongerHolder](), "an array lengthened")
+    assert(fingerprint[Holder]() != fingerprint[OtherHolder](), "an array's element laid out otherwise")
+    assert(fingerprint[Nested]() != fingerprint[NestedSwapped](), "a field's own fields moved")
+    assert(fingerprint[[3]Pair]() != fingerprint[[3]Swapped](), "an array's element, at the top")
+
+@test("a fingerprint is worked out while compiling")
+fingerprint_constant()
+    const AT_BUILD = fingerprint[Holder]()
+    assert(AT_BUILD == fingerprint[Holder](), "the constant is the call")
+    assert(combine(1, 2) != combine(2, 1), "combining is in order")
+
+@test("a pointer, a string, a slice or a data enum is found, in a field, a field's field or an array's element")
+pointers_found()
+    assert(holds_pointer[*u32](), "a pointer")
+    assert(holds_pointer[Pointing](), "a pointer field")
+    assert(holds_pointer[Named](), "a string field")
+    assert(holds_pointer[Viewing](), "a slice field")
+    assert(holds_pointer[Deep](), "inside an array of arrays of structures")
+    assert(holds_pointer[WithEnum](), "an enum that carries data")
+
+@test("the objects a core may share hold no pointer, and nor does the kernel's .shared structure")
+shared_objects_point_nowhere()
+    assert(!holds_pointer[Pair](), "two numbers")
+    assert(!holds_pointer[Holder](), "an array of them")
+    assert(!holds_pointer[KernelLock](), "a lock, its name kept in it")
+    assert(!holds_pointer[Semaphore](), "a semaphore")
+    assert(!holds_pointer[Mutex](), "a mutex")
+    assert(!holds_pointer[Flags](), "event flags")
+    assert(!holds_pointer[Queue[u32, 4]](), "a queue")
+    assert(!holds_pointer[Pool[2, 64]](), "a pool")
+    assert(!holds_pointer[Channel[2]](), "a channel")
+    assert(!holds_pointer[Message](), "an inbox message")
+    assert(!holds_pointer[Shared](), "the kernel's .shared")
+    assert(!holds_pointer[Handshake](), "the handshake")
+
+@test("the handshake: an answer that agrees, one that does not, and the reply the first image reads")
+handshake()
+    var h: Handshake
+    h.offer(0x1234)
+    assert(h.offered_layout() == 0x1234, "the offer is there")
+    assert(h.meet(0x1234), "the same layout agrees")
+    assert(h.answer() == 0x1234, "the first image reads the reply")
+    var other: Handshake
+    other.offer(0x1234)
+    assert(!other.meet(0x4321), "another layout does not")
+    assert(other.answer() == 0x4321, "and the first image reads which")
+
+@test("a lock keeps its object's name, cut to NAME_BYTES, as constant data")
+lock_keeps_name()
+    var short = KernelLock.new("handed")
+    assert(short.name_bytes() == "handed".bytes, "a short name whole")
+    var long = KernelLock.new("a name longer than sixteen bytes")
+    assert(long.name_bytes() == "a name longer th".bytes, "a long one cut")
+    var empty = KernelLock.new("")
+    assert(empty.name_bytes().len == 0, "an empty one")
+    assert(long_names[1].w.lock.name_bytes() == "never given".bytes, "a lock laid into the image")
+
+private var long_names = [Semaphore.new("never given", 0, 1); 2]
+
+@test("a place in .shared names the address it was taken from")
+places()
+    shared_bounds(0x1000, 0x2000)
+    assert(place_of(0x1010) == 0x10, "the place is the distance from the start")
+    assert(at_place(place_of(0x1abc)) == 0x1abc, "and leads back")
+    shared_bounds(0, 0)
