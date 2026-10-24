@@ -409,6 +409,15 @@ A software timer calls a function once a period has passed (one-shot), or every 
   called, late and in deadline order among every timer due, in the same turn. A one-shot is inactive
   before its callback runs, and a periodic timer is already back in the list, so a callback may command
   its own timer.
+- **A command a callback sends is the service's own, and takes effect before the callback returns**: the
+  service owns the list, so it has no reason to queue to itself, and a queued stop would wait for the end
+  of the turn while the turn went on calling the timer's overdue expiries (a late turn with six due and a
+  stop at the third made six calls). This holds for start, stop, reset and change of period, for any
+  timer of the core, and needs no room in the queue. The commands already queued are carried out first,
+  so commands still take effect in the order they were sent. The service knows its own command by the
+  running task being the one that called the callback; an interrupt handler arriving during the callback
+  is indistinguishable from it and is carried out at once too, which is safe because the list is settled
+  while a callback runs. One arriving while the service carries out a command of its own is queued.
 - **The service waits through the one `WaitQueue`**: it receives on its command queue with a timeout of
   the ticks to the soonest expiry (`FOREVER` with none active), so a command wakes it as any send wakes
   a receiver, and the expiry is the wait's timeout ending on the owner's tick. A turn is: carry out every

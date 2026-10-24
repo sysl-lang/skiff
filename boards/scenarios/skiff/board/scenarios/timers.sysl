@@ -133,7 +133,17 @@ private report_timers[P: Port](p: *P, me: u32, changed_from: u32, changed_by: u3
     if apart && late_beats[me].load() >= 1
         say(p, "a periodic timer was called 5 times a period apart, once late behind a busier task, with no drift\n")
     else
-        say(p, "a periodic timer drifted, or was not called 5 times\n")
+        say(p, "a periodic timer drifted, or was not called 5 times: called ")
+        kernel.write_dec(p, beat_calls[me].load())
+        p.write(" times, due on".bytes)
+        for n in 0..<BEATS
+            p.write(" ".bytes)
+            kernel.write_dec(p, beat_dues[me][n])
+        p.write(", ".bytes)
+        kernel.write_dec(p, late_beats[me].load())
+        p.write(" late, from tick ".bytes)
+        kernel.write_dec(p, timers_start[me])
+        p.write("\n".bytes)
     if once_calls[me].load() == 1 && once[me].is_active(p) == Ok(false)
         say(p, "a one-shot timer was called once and went inactive\n")
     else
