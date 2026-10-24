@@ -214,3 +214,30 @@ others call `memcpy` and `memset`.
 
 Status: open.
 
+
+## FINDINGS 11 — an assignment in an `elif const` arm of a `const` function is refused
+
+In a `const` function, `if const … elif const …` whose `elif const` arm assigns is refused:
+
+```
+const f[T]() -> u32
+    var h: u32 = 1
+    if const T::Kind == Kind.Struct
+        h = 2
+    elif const T::Kind == Kind.Array
+        h = 3
+    h
+
+print(f[u8]())
+```
+
+```
+error: '=' assigns and yields nothing, so it cannot stand where a value is wanted — write ':=' to assign and use the value
+ --> ic.sysl:6:9
+```
+
+The same body in a function that is not `const` builds and prints `1`, and a `const` one with `else` in
+place of `elif const` builds too. skiff met it writing `kernel.fingerprint` (layout.sysl), which returns from each arm instead, the
+shape `holds_pointer` has anyway.
+
+Status: open.
