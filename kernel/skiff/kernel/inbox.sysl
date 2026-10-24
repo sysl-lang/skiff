@@ -67,12 +67,12 @@ answer_doorbell[P: Port](p: *P)
 // `Control` names a slot rather than a task: what it applies is what the slot's request holds, for the
 // task its note names now (control.sysl).
 private apply[P: Port](p: *P, c: *Core, m: Message)
-    if m.kind == MessageKind.Control
-        answer_request(p, c, m.task.slot())
-        return
     val i = c.sched.check(m.task) match
         Ok(i) -> i
         Err(_) -> return
+    if m.kind == MessageKind.Control
+        answer_request(p, c, m.task.slot())
+        return
     m.kind match
         MessageKind.Wake ->
             if wait_ended(c, i)
