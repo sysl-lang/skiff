@@ -45,4 +45,8 @@ features {
       entry         = "_start"
     }
   }
+  skewed {
+    doc     = "an image whose .shared has one more field: the boot test's proof that images that disagree stop at the handshake"
+    enables = [split]
+  }
 }

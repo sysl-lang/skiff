@@ -25,6 +25,9 @@ const CORE1_VECTORS: usize = 0x100C_0000
 struct System
     handshake: Handshake            // first, so that each image finds it whatever the rest is
     scenarios: scenarios.Across     // what the scenarios share between the cores
+#if feature_skewed
+    skew: u32                       // the boot test's image that disagrees (the `skewed` feature)
+#endif
 
 @assert(!kernel.holds_pointer[System](), "the system description's .shared holds a pointer")
 

@@ -263,4 +263,23 @@ if [ -z "$missing" ]; then
 fi
 verdict "mps2-an521 two images" 0
 
+# Two images that disagree: core 1's is built with one more field in `.shared` (the `skewed` feature).
+# Each core says it stops at the handshake, before either creates a task, and core 0 stops the machine
+# with status 3.
+skewed_image="$scratch/qemu-an521-core1-skewed.elf"
+build thumb-freestanding qemu-an521 "$skewed_image" core1,skewed
+rm -f "$scratch/an521-skewed-core1.log"
+run "$scratch/an521-skewed-core0.log" -M mps2-an521 -accel tcg,thread=multi -kernel "$core0_image" \
+    -device loader,file="$skewed_image" -serial mon:stdio -serial file:"$scratch/an521-skewed-core1.log"
+check "mps2-an521 two images that disagree, core 0" "$scratch/an521-skewed-core0.log" "skiff: hello from core 0
+skiff: core 0 stops at the handshake: core 1's image lays out .shared otherwise"
+if [ -z "$missing" ]; then
+    check "mps2-an521 two images that disagree, core 1" "$scratch/an521-skewed-core1.log" "skiff: hello from core 1
+skiff: core 1 stops at the handshake: core 0's image lays out .shared otherwise"
+fi
+if [ -z "$missing" ] && grep -q "tick 1" "$scratch/an521-skewed-core0.log" "$scratch/an521-skewed-core1.log"; then
+    missing="mps2-an521 two images that disagree: a core ran on past the handshake"
+fi
+verdict "mps2-an521 two images that disagree" 3
+
 exit $failed
