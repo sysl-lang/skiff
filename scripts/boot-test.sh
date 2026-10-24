@@ -114,6 +114,16 @@ skiff: core $1 stopped a task that made a trap the kernel does not take
 skiff: core $1 an unprivileged task's writes to BASEPRI and PRIMASK held off nothing
 skiff: core $1 the tasks their protection stopped are stopped, and the rest ran on"
 }
+
+# Grants, every core (boards/scenarios, grants.sysl): notes through a granted queue between two
+# unprivileged tasks; a pool buffer bounced between two through granted channels, each writing it while
+# it is lent to its map; a task writing a buffer it passed on stopped, the buffer still delivered.
+grants_expected() {
+    echo "skiff: core $1 an unprivileged task received 6 notes another sent through a granted queue, both blocking, in order
+skiff: core $1 two unprivileged tasks passed a pool buffer back and forth 4 times through granted channels, each writing it while it held it
+skiff: core $1 stopped a task that broke its memory protection
+skiff: core $1 an unprivileged task that wrote a buffer it had passed on was stopped, and the buffer reached its receiver"
+}
 mps2_expected="skiff: hello
 skiff: .shared holds the shared state
 skiff: core 0 tick 1
@@ -126,7 +136,8 @@ $(messages_expected 0)
 $(timers_expected 0)
 $(control_expected 0)
 $(stats_expected 0)
-$(protection_expected 0)"
+$(protection_expected 0)
+$(grants_expected 0)"
 
 # The AN521's two cores run one image, each greeting and ticking on the UART of its own number, then
 # running its own tasks at once with the other. Core 0 has no FPU (the SSE-200's CPU0, in QEMU as on
@@ -171,6 +182,8 @@ $(stats_expected 0)
 skiff: core 0 is refused another core's task statistics and high-water marks
 $(protection_expected 0)
 skiff: core 0 an unprivileged task on core 1 took a unit core 0 gave and set flags core 0 waited on, through its grants
+$(grants_expected 0)
+skiff: core 0 had the pool buffer an unprivileged task sent core 1 through granted objects back
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
 skiff: core 0 time base agrees"
@@ -199,6 +212,8 @@ skiff: core 1 core 0 suspended, resumed, re-prioritized and stopped a task of co
 $(stats_expected 1)
 $(protection_expected 1)
 skiff: core 1 an unprivileged task took a unit core 0 gave, through its grant
+$(grants_expected 1)
+skiff: core 1 an unprivileged task received notes and a filled buffer an unprivileged task of core 0 sent, through its grants
 skiff: core 1 fault BusFault"
 
 failed=0

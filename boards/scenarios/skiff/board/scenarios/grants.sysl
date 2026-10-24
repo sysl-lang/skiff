@@ -1,0 +1,261 @@
+module skiff.board.scenarios
+
+import skiff.kernel
+import skiff.kernel.{Access, Channel, FOREVER, Grant, Pool, Port, Queue, Region, Task, TaskState}
+import skiff.kernel.user
+
+// Queues, pools and channels granted to unprivileged tasks, on every core, after the protection
+// (kernel DESIGN "Grants"). R creates the tasks and judges:
+//   - Writer sends 6 notes through `letters`, a queue of 2, and reader receives them, both unprivileged
+//     and both blocking: each reaches the queue only through its grant.
+//   - Filler takes a buffer of `pages` and passes it to bouncer through `outward`, bouncer adds one to
+//     every byte and passes it back through `homeward`, 4 times; then filler gives it back. Each writes
+//     the buffer only while it holds it: the kernel lends it to the holder's map and takes it out again.
+//   - Then dropper takes a buffer, passes it into `dropbox`, and writes it once more: the buffer has left
+//     its map, so the write stops it. R collects the buffer and finds the pool whole.
+//   - With several cores, core 0's far writer sends 3 notes through `far_letters` and a filled buffer of
+//     `far_pages` through `far_channel`, all three in `.shared`, to core 1's far reader, which checks them,
+//     gives the buffer back to the pool and says so itself; core 0 finds the pool whole.
+
+// A message the queues carry: its flag is a byte only two values of which are notes.
+struct Note
+    seq: u16
+    ok: bool
+    value: i32
+
+// What each core's grant tasks write: one 256-byte region, aligned to its size, as one PMSAv7 region
+// must be.
+struct Ledger
+    received: u32           // reader's notes, in order
+    bounced: u32            // filler's round trips
+    go: u32                 // R lets dropper start
+    far_go: u32             // core 1's R lets the far reader start, once its own lines are out
+    finished: u32           // a bit for each task once it has its result
+    unused: [59]u32
+
+@assert(sizeof(Ledger) == LEDGER_BYTES, "the ledger fills one 256-byte region")
+
+private const LEDGER_BYTES: usize = 256
+
+// The bits of `finished`.
+private const READER_DONE: u32 = 1
+private const FILLER_DONE: u32 = 2
+private const FAR_WRITER_DONE: u32 = 4
+private const FAR_READER_DONE: u32 = 8
+
+// How long R gives a task its result, or a buffer its way back: ticks may come late and in bunches
+// under QEMU's multi-threaded TCG.
+private const LONG_TICKS: u32 = 300
+
+private const NOTES: u16 = 6
+private const BOUNCES: u32 = 4
+private const FAR_NOTES: u16 = 3
+
+@align(256)
+private var ledgers: [kernel.CORES]Ledger
+
+// Each core's own objects. A pool's buffers are 32 bytes on a 32-byte boundary, which both PMSAv7 and
+// PMSAv8 hold exactly as a region.
+private var letters: [kernel.CORES]Queue[Note, 2] = [Queue.new("letters"); kernel.CORES]
+private var pages: [kernel.CORES]Pool[2, 32] = [Pool.new("pages", 7); kernel.CORES]
+private var outward_pages: [kernel.CORES]Channel[1] = [Channel.new("outward pages"); kernel.CORES]
+private var homeward_pages: [kernel.CORES]Channel[1] = [Channel.new("homeward pages"); kernel.CORES]
+private var dropbox: [kernel.CORES]Channel[1] = [Channel.new("dropbox"); kernel.CORES]
+
+// What core 0's far writer sends core 1's far reader.
+@section(".shared")
+private var far_letters: Queue[Note, 2]
+@section(".shared")
+private var far_pages: Pool[2, 32]
+@section(".shared")
+private var far_channel: Channel[1]
+
+// A grant task's stack is one PMSAv7 region: 4 KiB, aligned to its size. A call on a granted object runs
+// on the caller's stack through the object's table, and at -O0 the deepest takes more than 2 KiB.
+private const GRANT_TASKS: usize = 6
+private const GRANT_STACK_WORDS: usize = 1024
+@align(4096)
+private var grant_stacks: [kernel.CORES][GRANT_TASKS][GRANT_STACK_WORDS]u32
+
+// Fill in the shared objects. Core 0 calls it before any other core starts.
+private[scenarios] fill_shared_grants()
+    far_letters = Queue.new("far letters")
+    far_pages = Pool.new("far pages", 8)
+    far_channel = Channel.new("far channel")
+
+// R's part, on the running core: create the tasks and judge them. `code` is the code every unprivileged
+// task runs.
+grants[P: Port](p: *P, code: Region)
+    val me = kernel.here_id(p)
+    val l = &ledgers[me]
+    val ledger = Region(usize(l), LEDGER_BYTES, Access.ReadWrite)
+    val stacks = &grant_stacks[me]
+    val pool = &pages[me]
+    val _ = granted(p, stacks[0], &reader_task, [code, ledger], [Grant.Messages(&letters[me])])
+    val _ = granted(p, stacks[1], &writer_task, [code, ledger], [Grant.Messages(&letters[me])])
+    val _ = granted(p, stacks[2], &filler_task, [code, ledger], [Grant.Buffers(pool), Grant.Carries(&outward_pages[me], pool), Grant.Carries(&homeward_pages[me], pool)])
+    val _ = granted(p, stacks[3], &bouncer_task, [code, ledger], [Grant.Carries(&outward_pages[me], pool), Grant.Carries(&homeward_pages[me], pool)])
+    val dropper = granted(p, stacks[4], &dropper_task, [code, ledger], [Grant.Buffers(pool), Grant.Carries(&dropbox[me], pool)])
+    if kernel.CORES > 1 && me == 0
+        val _ = granted(p, stacks[5], &far_writer_task, [code, ledger], [Grant.Messages(&far_letters), Grant.Buffers(&far_pages), Grant.Carries(&far_channel, &far_pages)])
+    else if kernel.CORES > 1 && me == 1
+        val _ = granted(p, stacks[5], &far_reader_task, [code, ledger], [Grant.Messages(&far_letters), Grant.Buffers(&far_pages), Grant.Carries(&far_channel, &far_pages)])
+
+    await_ledger(p, l, READER_DONE)
+    if l.received == u32(NOTES)
+        say(p, "an unprivileged task received 6 notes another sent through a granted queue, both blocking, in order\n")
+    else
+        say(p, "the notes through a granted queue went wrong\n")
+    await_ledger(p, l, FILLER_DONE)
+    if l.bounced == BOUNCES && pool.available(p) == 2
+        say(p, "two unprivileged tasks passed a pool buffer back and forth 4 times through granted channels, each writing it while it held it\n")
+    else
+        say(p, "a pool buffer through granted channels went wrong\n")
+    l.go = 1
+    var stopped = false
+    for _ in 0..<LONG_TICKS
+        stopped = kernel.state(p, dropper) == Ok(TaskState.Stopped)
+        if stopped then break
+        kernel.sleep(p, 1)
+    val dropped = dropbox[me].try_receive(p, pool)
+    val whole = dropped.is_some() && pool.give(p, dropped.unwrap()).is_ok() && pool.available(p) == 2
+    if stopped && whole
+        say(p, "an unprivileged task that wrote a buffer it had passed on was stopped, and the buffer reached its receiver\n")
+    else
+        say(p, "a buffer passed on stayed in its sender's map\n")
+    if kernel.CORES > 1 && me == 0
+        await_ledger(p, l, FAR_WRITER_DONE)
+        var back = false
+        for _ in 0..<LONG_TICKS
+            back = far_pages.available(p) == 2
+            if back then break
+            kernel.sleep(p, 1)
+        if back
+            say(p, "had the pool buffer an unprivileged task sent core 1 through granted objects back\n")
+        else
+            say(p, "never had the buffer an unprivileged task sent core 1 back\n")
+    else if kernel.CORES > 1 && me == 1
+        // Core 1 stops once R returns: the far reader has had its say first.
+        l.far_go = 1
+        await_ledger(p, l, FAR_READER_DONE)
+        kernel.sleep(p, 2)
+
+// An unprivileged task at priority 2; a map these scenarios give must fit.
+private granted[P: Port](p: *P, stack: []u32, entry: *extern() -> never, regions: []const Region, grants: []const Grant) -> Task
+    kernel.create_unprivileged(p, kernel.here_id(p), stack, entry, 2, regions, grants) match
+        Ok(t) -> t
+        Err(_) -> panic("skiff: a grant scenario's map was refused")
+
+// Sleep until `l.finished` has `bit`, or a long while has gone by.
+private await_ledger[P: Port](p: *P, l: *Ledger, bit: u32)
+    for _ in 0..<LONG_TICKS
+        if (l.finished & bit) != 0 then return
+        kernel.sleep(p, 1)
+
+// The running unprivileged task's ledger.
+private my_ledger() -> *Ledger = &ledgers[user.current().core()]
+
+// Sleep for good.
+private settle() -> never
+    loop
+        user.sleep(FOREVER)
+
+// Writer: 6 notes through grant 0, waiting for room.
+private writer_task() -> never
+    for n in 1u16..NOTES
+        val _ = user.send(0, Note(n, n % 2 == 0, -i32(n) * 1000), FOREVER)
+    settle()
+
+// Reader: 6 notes from grant 0, each the next in order.
+private reader_task() -> never
+    val l = my_ledger()
+    var good: u32 = 0
+    for n in 1u16..NOTES
+        user.receive[Note](0, FOREVER) match
+            Ok(Some(m)) -> if m.seq == n && m.ok == (n % 2 == 0) && m.value == -i32(n) * 1000 then good += 1
+            _ -> ()
+    l.received = good
+    l.finished |= READER_DONE
+    settle()
+
+// Filler: a buffer of grant 0, out through grant 1 and back through grant 2, 4 times, then given back.
+private filler_task() -> never
+    val l = my_ledger()
+    var good: u32 = 0
+    val first = user.take_buffer(0, FOREVER)
+    if first.is_ok() && first.unwrap().is_some()
+        var held = first.unwrap().unwrap()
+        for k in 0..<held.bytes.len
+            held.bytes[k] = u8(k)
+        for round in 1u32..BOUNCES
+            if user.pass(1, held.buffer, FOREVER) != Ok(true) then break
+            val back = user.collect(2, FOREVER)
+            if back.is_err() || back.unwrap().is_none() then break
+            held = back.unwrap().unwrap()
+            var right = true
+            for k in 0..<held.bytes.len
+                if held.bytes[k] != u8(k + usize(round)) then right = false
+            if right then good += 1
+        if user.give_buffer(0, held.buffer).is_err() then good = 0
+    l.bounced = good
+    l.finished |= FILLER_DONE
+    settle()
+
+// Bouncer: each buffer from grant 0, every byte one more, back through grant 1.
+private bouncer_task() -> never
+    for _ in 0..<BOUNCES
+        user.collect(0, FOREVER) match
+            Ok(Some(held)) ->
+                for k in 0..<held.bytes.len
+                    held.bytes[k] += 1
+                val _ = user.pass(1, held.buffer, FOREVER)
+            _ -> ()
+    settle()
+
+// Dropper: once R says go, a buffer of grant 0 into grant 1, then a write to it.
+private dropper_task() -> never
+    val l = my_ledger()
+    while l.go == 0 do user.sleep(1)
+    user.take_buffer(0, FOREVER) match
+        Ok(Some(held)) ->
+            held.bytes[0] = 1
+            if user.pass(1, held.buffer, FOREVER) == Ok(true)
+                held.bytes[0] = 2
+        _ -> ()
+    settle()
+
+// Far writer, on core 0: 3 notes through grant 0, then a buffer of grant 1 filled and sent through grant 2.
+private far_writer_task() -> never
+    val l = my_ledger()
+    for n in 1u16..FAR_NOTES
+        val _ = user.send(0, Note(n, true, i32(n)), FOREVER)
+    user.take_buffer(1, FOREVER) match
+        Ok(Some(held)) ->
+            for k in 0..<held.bytes.len
+                held.bytes[k] = u8(0xa0 + k)
+            val _ = user.pass(2, held.buffer, FOREVER)
+        _ -> ()
+    l.finished |= FAR_WRITER_DONE
+    settle()
+
+// Far reader, on core 1: the 3 notes, then the buffer, checked and given back to grant 1; it says so.
+private far_reader_task() -> never
+    val l = my_ledger()
+    while l.far_go == 0 do user.sleep(1)
+    var good = true
+    for n in 1u16..FAR_NOTES
+        user.receive[Note](0, FOREVER) match
+            Ok(Some(m)) -> if m.seq != n || !m.ok || m.value != i32(n) then good = false
+            _ -> good = false
+    user.collect(2, FOREVER) match
+        Ok(Some(held)) ->
+            for k in 0..<held.bytes.len
+                if held.bytes[k] != u8(0xa0 + k) then good = false
+            if user.give_buffer(1, held.buffer).is_err() then good = false
+        _ -> good = false
+    if good
+        val _ = user.write("skiff: core 1 an unprivileged task received notes and a filled buffer an unprivileged task of core 0 sent, through its grants\n".bytes)
+    else
+        val _ = user.write("skiff: core 1 the notes or the buffer from core 0 went wrong\n".bytes)
+    l.finished |= FAR_READER_DONE
+    settle()

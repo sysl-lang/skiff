@@ -49,14 +49,20 @@ enum MapError derives Eq
     Bad(region: usize, why: RegionError)    // the unit cannot hold this region
     Overlap(first: usize, second: usize)    // these two regions share bytes
     OverlapsStack(region: usize)            // this region shares bytes with the task's stack
+    Buffer(grant: usize, why: RegionError)  // the unit cannot hold a buffer of this grant's pool as a region
+    BufferOverlaps(grant: usize)            // a buffer of this grant's pool shares bytes with the map
     Refused(why: TaskError)                 // the task itself was refused, as `create` refuses one
 
 // A kernel object an unprivileged task may use through its calls. The object itself is in no map: the
-// kernel reaches it on the task's behalf.
+// kernel reaches it on the task's behalf. A buffer the task takes or receives is lent to its map while
+// it holds it.
 enum Grant
     Nothing
-    Units(semaphore: *Semaphore)    // take and give
-    Bits(flags: *Flags)             // set and wait
+    Units(semaphore: *Semaphore)                        // take and give
+    Bits(flags: *Flags)                                 // set and wait
+    Messages(queue: *Mailbox)                           // send and receive
+    Buffers(pool: *BufferPool)                          // take and give back
+    Carries(channel: *Carrier, pool: *BufferPool)       // send and receive buffers of `pool`
 
 // A kernel call in flight: the four arguments the task passed and the call's number, as the port's trap
 // leaves them (calls.sysl).
@@ -73,10 +79,11 @@ struct Map
     regions: [option_map_regions]Region     // the stack first, then the creator's regions
     slots: [option_map_regions]Slot         // the same, as the unit holds them
     grants: [option_grants]Grant            // the objects it may name, by index
+    loans: [option_map_regions]Buffer       // for each region, the buffer lent as it, or `NO_BUFFER`
     call: CallFrame                         // the call it is making, while `calling`
 
 // A privileged task's map: nothing.
-val NO_MAP: Map = Map(false, false, 0, [NO_REGION; option_map_regions], [NO_SLOT; option_map_regions], [Grant.Nothing; option_grants], CallFrame([0; 4], 0))
+val NO_MAP: Map = Map(false, false, 0, [NO_REGION; option_map_regions], [NO_SLOT; option_map_regions], [Grant.Nothing; option_grants], [NO_BUFFER; option_map_regions], CallFrame([0; 4], 0))
 
 // What a task broke, as a fault that stops it reports it.
 enum Violation
@@ -100,7 +107,7 @@ private stack_region(stack: []u32) -> Region = Region(usize(&stack[0]), stack.le
 // Whether the port's unit holds exactly the map of a task whose stack is `stack` and whose creator named
 // `regions` and `grants`, or the first reason it does not.
 private[kernel] check_map[P: Port](p: *P, stack: Region, regions: []const Region, grants: []const Grant) -> Result[unit, MapError]
-    val most = if p.capacity() < option_map_regions then p.capacity() else option_map_regions
+    val most = most_regions(p)
     if regions.len + 1 > most then return Err(MapError.TooManyRegions)
     if grants.len > option_grants then return Err(MapError.TooManyGrants)
     p.encode(stack) match
@@ -114,7 +121,28 @@ private[kernel] check_map[P: Port](p: *P, stack: Region, regions: []const Region
         if overlaps(r, stack) then return Err(MapError.OverlapsStack(k))
         for j in 0..<k
             if overlaps(regions[j], r) then return Err(MapError.Overlap(j, k))
+    for k in 0..<grants.len
+        grants[k] match
+            Grant.Buffers(pool) -> check_pool(p, k, pool, stack, regions)?
+            Grant.Carries(_, pool) -> check_pool(p, k, pool, stack, regions)?
+            _ -> ()
     Ok(())
+
+// Whether every buffer of `pool`, granted as `grant`, may be lent to a map holding `stack` and `regions`:
+// the unit holds it exactly as a region, and it shares no byte with any of them.
+private check_pool[P: Port](p: *P, grant: usize, pool: *BufferPool, stack: Region, regions: []const Region) -> Result[unit, MapError]
+    for b in 0..<pool.buffer_count()
+        val r = buffer_region(pool.block_at(b))
+        p.encode(r) match
+            Ok(_) -> ()
+            Err(why) -> return Err(MapError.Buffer(grant, why))
+        if overlaps(r, stack) then return Err(MapError.BufferOverlaps(grant))
+        for q in regions
+            if overlaps(r, q) then return Err(MapError.BufferOverlaps(grant))
+    Ok(())
+
+// The region a buffer is in a map it is lent to.
+private buffer_region(bytes: []u8) -> Region = Region(if bytes.len == 0 then 0 else usize(&bytes[0]), bytes.len, Access.ReadWrite)
 
 // Fill `m`, the map of the task about to take its slot, in place: for an unprivileged task (`user`) its
 // stack and `regions` as the unit holds them, which `check_map` has passed, and `grants`; for a
@@ -125,6 +153,8 @@ private[kernel] set_map[P: Port](p: *P, m: *Map, user: bool, stack: []u32, regio
     m.len = 0
     for k in 0..<option_grants
         m.grants[k] = if k < grants.len then grants[k] else Grant.Nothing
+    for k in 0..<option_map_regions
+        m.loans[k] = NO_BUFFER
     if !user then return
     m.regions[0] = stack_region(stack)
     for k in 0..<regions.len
@@ -134,6 +164,57 @@ private[kernel] set_map[P: Port](p: *P, m: *Map, user: bool, stack: []u32, regio
         m.slots[k] = p.encode(m.regions[k]) match
             Ok(s) -> s
             Err(_) -> panic("skiff: a region the unit held when the map was checked is refused now")
+
+// The most regions a map may take on the port's unit, its stack among them.
+private most_regions[P: Port](p: *P) -> usize = if p.capacity() < option_map_regions then p.capacity() else option_map_regions
+
+// Whether task `i` of core `c`, which is running and inside a call, has a free region to be lent a buffer.
+private[kernel] may_lend[P: Port](p: *P, c: *Core, i: usize) -> bool = c.maps[i].len < most_regions(p)
+
+// Lend buffer `b`, whose bytes are `bytes`, to the map of task `i` of core `c`, which is running and
+// inside a call, as a region it reads and writes: `may_lend` has said there is room, and the grant was
+// checked at creation, so the unit holds it. The unit is loaded with the new map at once.
+private[kernel] lend[P: Port](p: *P, c: *Core, i: usize, b: Buffer, bytes: []u8)
+    val r = buffer_region(bytes)
+    val s = p.encode(r) match
+        Ok(s) -> s
+        Err(_) -> panic("skiff: a buffer the unit held when the grant was checked is refused now")
+    val m = &c.maps[i]
+    val state = p.mask()
+    m.regions[m.len] = r
+    m.slots[m.len] = s
+    m.loans[m.len] = b
+    m.len += 1
+    p.load(m.slots[0..<m.len])
+    p.restore(state)
+
+// Whether buffer `b` is lent to the map of task `i` of core `c`: only a lent handle is the task's to hand on.
+private[kernel] lent(c: *Core, i: usize, b: Buffer) -> bool = loan_of(c, i, b) != 0
+
+// The region buffer `b` is lent as in task `i`'s map, or 0 (the stack's) if it is not lent.
+private loan_of(c: *Core, i: usize, b: Buffer) -> usize
+    val m = &c.maps[i]
+    if b == NO_BUFFER then return 0
+    for k in 1..<m.len
+        if m.loans[k] == b then return k
+    0
+
+// Take buffer `b`, which a call has just handed on, back out of the map of task `i` of core `c`, which is
+// running and inside a call: its region's place takes the map's last region, and the unit is loaded
+// with the new map at once.
+private[kernel] unlend[P: Port](p: *P, c: *Core, i: usize, b: Buffer)
+    val k = loan_of(c, i, b)
+    if k == 0 then return
+    val m = &c.maps[i]
+    val state = p.mask()
+    val last = m.len - 1
+    m.regions[k] = m.regions[last]
+    m.slots[k] = m.slots[last]
+    m.loans[k] = m.loans[last]
+    m.loans[last] = NO_BUFFER
+    m.len = last
+    p.load(m.slots[0..<m.len])
+    p.restore(state)
 
 // Whether two regions, each of which the unit holds, share a byte. Each is reckoned by its last byte, so
 // that one ending at the very top of the address space does not wrap to zero.

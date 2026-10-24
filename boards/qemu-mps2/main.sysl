@@ -60,9 +60,9 @@ impl Isolation for Board
 impl RunCounter for Board
     run_count(*self) -> u32 = mps2.counter_now()
 
-// What every unprivileged task runs: the code and its constants, below 0x4_0000 (link.ld). The console's
+// What every unprivileged task runs: the code and its constants, below 0x8_0000 (link.ld). The console's
 // UART, which the scenario that writes on it is granted.
-private val CODE: Region = Region(0, 0x4_0000, Access.Execute)
+private val CODE: Region = Region(0, 0x8_0000, Access.Execute)
 private val UART: Region = Region(mps2.UART0, 0x1000, Access.Device)
 
 // The status `boot` answered, which the last task stops the machine with.
@@ -131,8 +131,8 @@ private task_idle() -> never
     loop
         armv7m.wait_for_interrupt()
 
-// R: the handle checks, then the waits, the timers, task control, the statistics and the protection, then
-// the end of the run.
+// R: the handle checks, then the waits, the timers, task control, the statistics, the protection and the
+// grants, then the end of the run.
 private task_r() -> never
     var board = Board()
     scenarios.check_handles(&board, &entries)
@@ -141,6 +141,7 @@ private task_r() -> never
     scenarios.control(&board, &entries)
     scenarios.stats(&board, &entries)
     scenarios.protection(&board, &entries, CODE, UART)
+    scenarios.grants(&board, CODE)
     armv7m.halt(status)
 
 // SysTick: one tick for the kernel.

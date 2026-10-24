@@ -134,6 +134,7 @@ private protection(m: *Nothing) -> bool
     val code = Region(0, 4096, Access.Execute)
     val t = kernel.create_unprivileged(m, 0, user_stack, &body, 1, [code], [Grant.Units(&units), Grant.Bits(&events)])
     if t.is_err() || kernel.running_unprivileged(m) then return false
+    val _ = kernel.create_unprivileged(m, 0, user_stack, &body, 1, [code], [Grant.Messages(&mail), Grant.Buffers(&blocks), Grant.Carries(&carried, &blocks)])
     val (base, bytes) = kernel.running_stack(m)
     if kernel.begin_call(m, base + bytes - 32, 32, 32)
         val _ = kernel.serve_call(m)

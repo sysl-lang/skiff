@@ -45,6 +45,7 @@ trait Isolation
 
     // Hold `map` for the task the core is about to run: an unprivileged task's map, or an empty one
     // after an unprivileged task, so that a privileged one reaches memory through the default map.
+    @borrows(map)
     load(*self, map: []const Slot)
 
     // Run thread mode unprivileged, or privileged, from the return to the task about to run.
@@ -64,6 +65,7 @@ trait RunCounter
 // this trait says.
 trait Port: Doorbell + Cache + Protection + Isolation + RunCounter
     // Write `bytes` to this core's console, waiting for room as long as it takes.
+    @borrows(bytes)
     write(*self, bytes: []const u8)
 
     // How many cores the machine has: 1 on a single-core machine.

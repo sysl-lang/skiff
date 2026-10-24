@@ -557,7 +557,9 @@ implements both traits and the board delegates.
   drops the privilege again and writes the answer over the r0 of the task's frame.
 - **`dispatch` is one checked `match`, one function per call**: yield, sleep, ticks, current,
   notify, notify_wait (its value into a word of the caller's), take and give (a granted semaphore), set
-  and wait (granted flags), and write (bytes to the core's console). **Everything a task passes is
+  and wait (granted flags), write (bytes to the core's console), send and receive (a granted queue),
+  take and give back a buffer (a granted pool), and pass and collect a buffer (a granted channel).
+  **Everything a task passes is
   checked before anything is done**: a task handle as every handle is (stale, no such core); a grant
   index against the caller's own grant list and the kind the call needs; a buffer must lie wholly inside
   one region of the caller's map that allows the access (`may_reach`: `ReadWrite` for a write, `Read`,
@@ -575,25 +577,48 @@ implements both traits and the board delegates.
 
 ### Grants: how a task reaches objects, on its core or another
 
-- **A task names objects by its own grant index**, never by address: the creator lists `Grant`s
-  (`Grant.Units(*Semaphore)`, `Grant.Bits(*Flags)`), and index k is the k-th of them, at most
-  `option_grants` (default 4). An index past the list, or of another kind than the call needs, is
-  `BadHandle`. There is no global object table, so no task can name an object nobody gave it.
+- **A task names objects by its own grant index**, never by address: the creator lists `Grant`s, and
+  index k is the k-th of them, at most `option_grants` (default 4). An index past the list, or of another
+  kind than the call needs, is `BadHandle`. There is no global object table, so no task can name an
+  object nobody gave it. The kinds:
+  - `Grant.Units(*Semaphore)`: take and give. `Grant.Bits(*Flags)`: set and wait.
+  - `Grant.Messages(*Mailbox)`: send and receive through a queue, `Queue[T, N]` of any `T:
+    sysl.encoding.Plain` (a `Mailbox`). A message crosses as its bytes: the task hands the kernel the
+    address and length of a `T` of its own, the length must be the queue's `sizeof(T)` (else
+    `BadArgument`), and the bytes must be the task's to read (else `BadBuffer`). The kernel decodes them,
+    and bytes that are no `T` (a `bool` that is neither 0 nor 1, an enum's unknown number) are
+    `BadArgument`, sending nothing. A receive encodes the message into bytes the task may write.
+  - `Grant.Buffers(*BufferPool)`: take a buffer and give one back. `Grant.Carries(*Carrier,
+    *BufferPool)`: send and receive buffers through a channel, with the pool its buffers belong to
+    named by the creator, so a task cannot pair a channel with another pool than its buffers'.
 - **Objects stay out of every map.** The kernel reaches a granted object privileged, under the object's
   own lock, exactly as for a privileged caller; the task's map grants it none of the object's bytes. So
   an object in `.shared` used from both cores is granted to an unprivileged task on each core through
   that core's private grant list (a pointer kept in private memory, never in `.shared`), and the
   `.shared` rule and the outcome rule hold unchanged: a cross-core wake from a call is the same inbox
   message a privileged caller's would be.
+- **A grant is a trait object, and the kernel calls it with the running core's port as one too.**
+  Queues, channels and pools are generic over their sizes and a grant list is one table of every kind,
+  so `Mailbox`, `BufferPool` and `Carrier` are traits whose members take `p: *Port`; each forwards to
+  the object's ordinary `[P: Port]` method, which an object of the port satisfies. A channel's methods
+  take any `[Q: BufferPool]`, so a privileged caller's `*Pool[N, SIZE]` and a grant's `*BufferPool` go
+  through the same code.
+- **A buffer the task holds is lent to its map, and only for as long as it holds it.** A take or a
+  receive puts the buffer into a free region of the task's map as `ReadWrite`, reloads the unit under
+  the mask, and records the buffer's handle, address and length in three words of the task's own; a
+  give back or a send that succeeds takes it out again (the map's last region moves into its place) and
+  reloads. So the map allows exactly the buffers the task holds, never the pool's other buffers or its
+  records, and a task that touches a buffer it has handed on faults and is stopped. **Only a lent handle
+  is accepted** by a give back or a send (`BadHandle` otherwise, the loan kept); a send with no room
+  answers 0 and leaves the buffer lent. A take or receive when the map has no free region is
+  `BadBuffer`, checked before anything is taken. The record's words must be the task's to write, aligned.
+- **A pool is checked as a grant at creation**: every buffer of a `Buffers` or `Carries` pool must be
+  held by the unit exactly as one region (`MapError.Buffer(grant, why)`) and share no byte with the
+  task's stack or regions (`MapError.BufferOverlaps(grant)`). A `Pool[N, 32]`'s buffers (32 bytes on a
+  32-byte boundary) are held exactly on PMSAv7 and PMSAv8.
 - **Tasks by handle**: `notify` takes any task's handle, on any core, checked like every handle.
-- **Queues, channels and pool buffers are not granted yet.** They are generic over their sizes, and a
-  grant list is one table of every kind. The decided form is a grant per object whose call methods the
-  kernel reaches through a trait object; it needs a trait object of the port, which a kernel generic
-  over `p: *P` cannot pass on (FINDINGS 9). Once it can, a buffer a call hands the task (take,
-  receive) is **loaned** into a free region of the task's map for as long as the task holds it, and
-  taken out of the map by the give or send that hands it on: the map always allows exactly the buffers
-  the task holds, never the pool's other buffers or its records. A pool is refused as a grant at
-  creation if the unit cannot hold one of its buffers exactly.
+- A call on a granted object runs on the caller's stack through the object's table: at -O0 the deepest
+  takes more than 2 KiB, so such a task's stack is 4 KiB.
 
 ### Options
 

@@ -33,6 +33,16 @@ const CALL_GIVE: usize = 7          // grant `g`, a semaphore: give(), 1 or 0
 const CALL_SET: usize = 8           // grant `g`, flags: set(bits), the bits after
 const CALL_WAIT: usize = 9          // grant `g`, flags: wait(wanted, mode, timeout), the bits it ended on, or 0 if none came
 const CALL_WRITE: usize = 10        // write(bytes at address, length) on the core's console: the length
+const CALL_SEND: usize = 11         // grant `g`, a queue: send(the message at address, its length, timeout), 1 or 0
+const CALL_RECEIVE: usize = 12      // grant `g`, a queue: receive(into address, its length, timeout), 1 and the message there, or 0
+const CALL_TAKE_BUFFER: usize = 13  // grant `g`, a pool: take(timeout, into), 1 and the buffer lent and recorded at `into`, or 0
+const CALL_GIVE_BUFFER: usize = 14  // grant `g`, a pool: give back(handle) a lent buffer, 1
+const CALL_PASS: usize = 15         // grant `g`, a channel: send(handle, timeout) a lent buffer, 1 or 0
+const CALL_COLLECT: usize = 16      // grant `g`, a channel: receive(timeout, into), 1 and the buffer lent and recorded at `into`, or 0
+
+// What a call that hands a task a buffer records at `into`: three words, the buffer's handle, its
+// address and its length.
+const HELD_WORDS: usize = 3
 
 // The mode bits of `CALL_WAIT`.
 const WAIT_ALL: usize = 1           // every wanted bit, not any one of them
@@ -141,7 +151,106 @@ private[kernel] dispatch[P: Port](p: *P, c: *Core, i: usize, call: CallFrame) ->
                 val at: *u8 = ptr_cast(a[0])
                 p.write(at[0..<a[1]])
             a[1]
+        CALL_SEND -> send_call(p, c, i, a)
+        CALL_RECEIVE -> receive_call(p, c, i, a)
+        CALL_TAKE_BUFFER -> take_buffer_call(p, c, i, a)
+        CALL_GIVE_BUFFER -> give_buffer_call(p, c, i, a)
+        CALL_PASS -> pass_call(p, c, i, a)
+        CALL_COLLECT -> collect_call(p, c, i, a)
         _ -> REFUSED_CALL
+
+// The calls on queues, pools and channels, each a function of its own: a call runs on the caller's
+// stack, which holds the frame of `dispatch` and of the one call it makes, not every call's at once.
+
+// `CALL_SEND` for task `i` of core `c`, with arguments `a`.
+private send_call[P: Port](p: *P, c: *Core, i: usize, a: [4]usize) -> usize
+    val q = granted(c, i, a[0]) match
+        Grant.Messages(q) -> q
+        _ -> return REFUSED_HANDLE
+    if a[2] != q.message_bytes() then return REFUSED_ARGUMENT
+    if !may_reach(p, c, i, a[1], a[2], false) then return REFUSED_BUFFER
+    val at: *u8 = ptr_cast(a[1])
+    val port: *Port = p
+    q.send_bytes(port, at[0..<a[2]], u32(a[3])) match
+        Some(sent) -> if sent then 1 else 0
+        None -> REFUSED_ARGUMENT
+
+// `CALL_RECEIVE`.
+private receive_call[P: Port](p: *P, c: *Core, i: usize, a: [4]usize) -> usize
+    val q = granted(c, i, a[0]) match
+        Grant.Messages(q) -> q
+        _ -> return REFUSED_HANDLE
+    if a[2] != q.message_bytes() then return REFUSED_ARGUMENT
+    if !may_reach(p, c, i, a[1], a[2], true) then return REFUSED_BUFFER
+    val at: *u8 = ptr_cast(a[1])
+    val port: *Port = p
+    if q.receive_bytes(port, at[0..<a[2]], u32(a[3])) then 1 else 0
+
+// `CALL_TAKE_BUFFER`.
+private take_buffer_call[P: Port](p: *P, c: *Core, i: usize, a: [4]usize) -> usize
+    val pool = granted(c, i, a[0]) match
+        Grant.Buffers(pool) -> pool
+        _ -> return REFUSED_HANDLE
+    if !may_record(p, c, i, a[2]) || !may_lend(p, c, i) then return REFUSED_BUFFER
+    val port: *Port = p
+    val b = pool.take_through(port, u32(a[1])) match
+        Some(b) -> b
+        None -> return 0
+    hold(p, c, i, pool, b, a[2])
+
+// `CALL_GIVE_BUFFER`: only a buffer lent to the caller's map is its to give back.
+private give_buffer_call[P: Port](p: *P, c: *Core, i: usize, a: [4]usize) -> usize
+    val pool = granted(c, i, a[0]) match
+        Grant.Buffers(pool) -> pool
+        _ -> return REFUSED_HANDLE
+    val b = Buffer(u32(a[1]))
+    if a[1] > 0xffff_ffff || !lent(c, i, b) then return REFUSED_HANDLE
+    val port: *Port = p
+    if pool.give_through(port, b).is_err() then return REFUSED_HANDLE
+    unlend(p, c, i, b)
+    1
+
+// `CALL_PASS`: only a buffer lent to the caller's map is its to send, and it stays lent if there is no room.
+private pass_call[P: Port](p: *P, c: *Core, i: usize, a: [4]usize) -> usize
+    val (channel, pool) = granted(c, i, a[0]) match
+        Grant.Carries(channel, pool) -> (channel, pool)
+        _ -> return REFUSED_HANDLE
+    val b = Buffer(u32(a[1]))
+    if a[1] > 0xffff_ffff || !lent(c, i, b) then return REFUSED_HANDLE
+    val port: *Port = p
+    channel.send_through(port, pool, b, u32(a[2])) match
+        Ok(_) ->
+            unlend(p, c, i, b)
+            1
+        Err(BufferError.Full) -> 0
+        Err(BufferError.Stale) -> REFUSED_HANDLE
+
+// `CALL_COLLECT`.
+private collect_call[P: Port](p: *P, c: *Core, i: usize, a: [4]usize) -> usize
+    val (channel, pool) = granted(c, i, a[0]) match
+        Grant.Carries(channel, pool) -> (channel, pool)
+        _ -> return REFUSED_HANDLE
+    if !may_record(p, c, i, a[2]) || !may_lend(p, c, i) then return REFUSED_BUFFER
+    val port: *Port = p
+    val b = channel.receive_through(port, pool, u32(a[1])) match
+        Some(b) -> b
+        None -> return 0
+    hold(p, c, i, pool, b, a[2])
+
+// Whether task `i` of core `c` may be handed a buffer's record at `into`: `HELD_WORDS` aligned words of
+// its own that it may write.
+private may_record[P: Port](p: *P, c: *Core, i: usize, into: usize) -> bool = into % sizeof(usize) == 0 && may_reach(p, c, i, into, HELD_WORDS * sizeof(usize), true)
+
+// Hand buffer `b` of `pool`, just taken or received for task `i` of core `c`, to the task: lend it to its
+// map and record it at `into`, which `may_record` has passed. Answers the call's 1.
+private hold[P: Port](p: *P, c: *Core, i: usize, pool: *BufferPool, b: Buffer, into: usize) -> usize
+    val bytes = pool.storage_of(b)
+    lend(p, c, i, b, bytes)
+    val words: *usize = ptr_cast(into)
+    words[0] = usize(b.bits)
+    words[1] = usize(&bytes[0])
+    words[2] = bytes.len
+    1
 
 // Grant `g` of task `i` of core `c`: `Nothing` past the end of its list.
 private granted(c: *Core, i: usize, g: usize) -> Grant = if g >= option_grants then Grant.Nothing else c.maps[i].grants[g]

@@ -3,7 +3,7 @@ module skiff.kernel.user
 
 import sysl.sync.Atomic
 import skiff.kernel
-import skiff.kernel.{Access, Cache, Doorbell, Grant, Isolation, Port, Protection, Region, RegionError, RunCounter, Semaphore, Slot}
+import skiff.kernel.{Access, Cache, Channel, Doorbell, Grant, Isolation, Pool, Port, Protection, Queue, Region, RegionError, RunCounter, Semaphore, Slot}
 
 // `skiff.kernel.user` on the host: its trap lays the call's frame in the running task's stack and goes
 // through `begin_call`, `serve_call` and `end_call`, as the port's trap handler does, so each function
@@ -111,3 +111,48 @@ user_calls()
     assert(notify_wait(0, 0, &into, 0) == Err(Refusal.BadBuffer), "a word outside its map")
     assert(wait(0, 1, false, false, 0) == Err(Refusal.BadHandle), "flags it was not given")
     assert_eq(desk.used, 2)
+
+// A message a queue carries.
+struct Reading derives Eq
+    channel: u8
+    value: i32
+    fresh: bool
+
+// The host runs a task's functions on its own stack, not the task's: a region over the host stack around
+// `local` plays the part of the task's stack for the bytes those functions hand the kernel.
+private host_stack(local: usize) -> Region
+    val base = (local & ~usize(0xfff)) - 0x4000
+    Region(base, 0x8000, Access.ReadWrite)
+
+// A pool off the host's stack, which plays the task's.
+private var pool: Pool[2, 32] = Pool.new("pool", 1)
+private var ch: Channel[1] = Channel.new("ch")
+
+@test("a queue, a pool and a channel granted: messages sent and received, a buffer taken, passed, collected and given back")
+user_grants()
+    var q: Queue[Reading, 2] = Queue.new("q")
+    var s = Semaphore.new("s", 0, 1)
+    var here_now: u32 = 0
+    val _ = kernel.create_unprivileged(&desk, 0, stack, &body, 2, [host_stack(usize(&here_now))], [Grant.Messages(&q), Grant.Buffers(&pool), Grant.Carries(&ch, &pool), Grant.Units(&s)]).unwrap()
+    val _ = kernel.here(&desk).sched.first()
+    assert(send(0, Reading(3, -40, true), 0) == Ok(true), "a message sent")
+    assert(send(0, Reading(4, 7, false), 0) == Ok(true), "another")
+    assert(send(0, Reading(5, 0, true), 0) == Ok(false), "a full queue")
+    assert(send(0, 7u32, 0) == Err(Refusal.BadArgument), "a message of another size")
+    assert(send(3, Reading(5, 0, true), 0) == Err(Refusal.BadHandle), "a semaphore's grant")
+    assert(receive[Reading](0, 0) == Ok(Some(Reading(3, -40, true))), "the first back")
+    assert(receive[Reading](0, 0) == Ok(Some(Reading(4, 7, false))), "the second")
+    assert(receive[Reading](0, 0) == Ok(None), "an empty queue")
+    val held = take_buffer(1, 0).unwrap().unwrap()
+    assert_eq(held.bytes.len, 32)
+    held.bytes[0] = u8('h')
+    assert(write(held.bytes[0..<1]) == Ok(1), "its bytes are the task's")
+    assert(give_buffer(1, kernel.NO_BUFFER) == Err(Refusal.BadHandle), "a buffer it does not hold")
+    assert(pass(2, held.buffer, 0) == Ok(true), "passed through the channel")
+    assert(write(held.bytes[0..<1]) == Err(Refusal.BadBuffer), "and gone from its map")
+    assert(pass(2, held.buffer, 0) == Err(Refusal.BadHandle), "passed again")
+    val back = collect(2, 0).unwrap().unwrap()
+    assert_eq(back.bytes[0], u8('h'))
+    assert(collect(2, 0).unwrap().is_none(), "an empty channel")
+    assert(give_buffer(1, back.buffer) == Ok(()), "given back")
+    assert_eq(pool.available(&desk), 2)

@@ -1,7 +1,8 @@
 module skiff.kernel.user
 
+import sysl.encoding.Plain
 import skiff.kernel
-import skiff.kernel.{Action, Task}
+import skiff.kernel.{Action, Buffer, Task}
 
 // The kernel as an unprivileged task calls it: one function per call, each trapping into the kernel with
 // the call's number and its arguments (kernel calls.sysl). A privileged task calls the kernel directly
@@ -90,3 +91,51 @@ wait(grant: usize, wanted: u32, all: bool, clear: bool, timeout: u32) -> Result[
 
 // Write `bytes` on the core's console.
 write(bytes: []const u8) -> Result[usize, Refusal] = call(kernel.CALL_WRITE, address(bytes), bytes.len, 0, 0)
+
+// Send `m` through the queue granted as `grant`, waiting up to `timeout` ticks for room. Answers whether
+// it was sent. The queue's messages must be of type `T`: a message of another size is `BadArgument`.
+send[T: Plain](grant: usize, m: T, timeout: u32) -> Result[bool, Refusal]
+    Ok(call(kernel.CALL_SEND, grant, usize(&m), sizeof(T), usize(timeout))? == 1)
+
+// Receive the oldest message of the queue granted as `grant`, waiting up to `timeout` ticks for one.
+// Answers None if none came.
+receive[T: Plain](grant: usize, timeout: u32) -> Result[Option[T], Refusal]
+    var into: T
+    if call(kernel.CALL_RECEIVE, grant, usize(&into), sizeof(T), usize(timeout))? == 0 then return Ok(None)
+    Ok(Some(into))
+
+// A buffer the task holds: its handle, and its bytes, which are in the task's map until it hands the
+// buffer on.
+struct Held
+    buffer: Buffer
+    bytes: []u8
+
+// Take a buffer of the pool granted as `grant`, waiting up to `timeout` ticks for one. Answers None if
+// none came; `BadBuffer` if the task's map has no free region to hold one.
+take_buffer(grant: usize, timeout: u32) -> Result[Option[Held], Refusal]
+    var record: [kernel.HELD_WORDS]usize = [0; kernel.HELD_WORDS]
+    if call(kernel.CALL_TAKE_BUFFER, grant, usize(timeout), usize(&record[0]), 0)? == 0 then return Ok(None)
+    Ok(Some(held(record)))
+
+// Give buffer `b`, which the task holds, back to the pool granted as `grant`. Its bytes leave the
+// task's map.
+give_buffer(grant: usize, b: Buffer) -> Result[unit, Refusal]
+    val _ = call(kernel.CALL_GIVE_BUFFER, grant, usize(b.bits), 0, 0)?
+    Ok(())
+
+// Send buffer `b`, which the task holds, through the channel granted as `grant`, waiting up to `timeout`
+// ticks for room. Answers whether it was sent; once it is, its bytes have left the task's map.
+pass(grant: usize, b: Buffer, timeout: u32) -> Result[bool, Refusal]
+    Ok(call(kernel.CALL_PASS, grant, usize(b.bits), usize(timeout), 0)? == 1)
+
+// Receive the oldest buffer of the channel granted as `grant`, waiting up to `timeout` ticks for one.
+// Answers None if none came; `BadBuffer` if the task's map has no free region to hold one.
+collect(grant: usize, timeout: u32) -> Result[Option[Held], Refusal]
+    var record: [kernel.HELD_WORDS]usize = [0; kernel.HELD_WORDS]
+    if call(kernel.CALL_COLLECT, grant, usize(timeout), usize(&record[0]), 0)? == 0 then return Ok(None)
+    Ok(Some(held(record)))
+
+// The buffer a call recorded.
+private held(record: [kernel.HELD_WORDS]usize) -> Held
+    val at: *u8 = ptr_cast(record[1])
+    Held(Buffer(u32(record[0])), at[0..<record[2]])

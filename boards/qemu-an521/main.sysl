@@ -150,9 +150,9 @@ private task_idle() -> never
     loop
         armv7m.wait_for_interrupt()
 
-// R: the handle checks, then the waits, the timers, task control, the statistics and the protection, then
-// the end of the run. Core 1 faults; core 0 waits until it sees core 1 stopped, ticks on, and stops the
-// machine.
+// R: the handle checks, then the waits, the timers, task control, the statistics, the protection and the
+// grants, then the end of the run. Core 1 faults; core 0 waits until it sees core 1 stopped, ticks on,
+// and stops the machine.
 private task_r() -> never
     var board = Board()
     scenarios.check_handles(&board, &entries)
@@ -163,6 +163,7 @@ private task_r() -> never
     val me = an521.core_id()
     val code = Region(usize(&__code_start), usize(&__code_end) - usize(&__code_start), Access.Execute)
     scenarios.protection(&board, &entries, code, Region(an521.uart_base(me), an521.UART_STRIDE, Access.Device))
+    scenarios.grants(&board, code)
     if me == 1
         val nothing: *Word = ptr_cast(NOWHERE)
         kernel.write_hex(&board, nothing.v)

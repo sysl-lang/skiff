@@ -1,5 +1,6 @@
 module skiff.kernel
 
+import sysl.encoding.Plain
 import sysl.sync.Lock
 
 // Message queues: `N` messages of type `T`, first in first out, copied in by a send and out by a
@@ -128,3 +129,33 @@ impl[T, const N: usize] Queue[T, N]
             self.kept_slots += 1
             val _ = wake_at(p, &self.w, s, Outcome.Given)
         m
+
+// A queue whatever its message type and size, as an unprivileged task's grant reaches it: a message
+// crosses as the bytes of one, which the queue reads as its type and refuses when they are no value of
+// it. The port is taken as an object, so one table holds queues of every type.
+trait Mailbox
+    // How many bytes one message takes.
+    message_bytes(*self) -> usize
+
+    // Send the message `m` holds, waiting up to `timeout` ticks for room: Some(whether it was sent), or
+    // None, sending nothing, when its first `message_bytes` bytes are no message.
+    @borrows(m)
+    send_bytes(*self, p: *Port, m: []const u8, timeout: u32) -> Option[bool]
+
+    // Receive the oldest message into `into`, which holds `message_bytes` at least, waiting up to
+    // `timeout` ticks for one. Answers whether one came.
+    @borrows(into)
+    receive_bytes(*self, p: *Port, into: []u8, timeout: u32) -> bool
+
+impl[T: Plain, const N: usize] Mailbox for Queue[T, N]
+    message_bytes(*self) -> usize = sizeof(T)
+
+    send_bytes(*self, p: *Port, m: []const u8, timeout: u32) -> Option[bool]
+        val message = T.decode(m)?
+        Some(self.send(p, message, timeout))
+
+    receive_bytes(*self, p: *Port, into: []u8, timeout: u32) -> bool
+        val m = self.receive(p, timeout) match
+            Some(m) -> m
+            None -> return false
+        m.encode(into)

@@ -1,0 +1,231 @@
+module skiff.kernel
+@tests
+
+// Grants of queues, pools and channels on the host: each call acting through its grant and every one of
+// its refusals, and a pool's buffers lent to the task's map while it holds them, over the recording port
+// (kernel_tests.sysl), whose unit holds 32-byte-granular regions as PMSAv8 does.
+
+private body() -> never
+    loop
+        ()
+
+@align(32)
+private var gstacks: [2][64]u32
+@align(32)
+private var desk: [64]u8
+@align(32)
+private var sign: [64]u8
+@align(32)
+private var spare: [3][32]u8
+
+// A message a queue carries: its flag is a byte only two values of which are messages.
+struct Pair derives Eq
+    n: u16
+    ok: bool
+
+private span(bytes: []u8, access: Access) -> Region = Region(usize(&bytes[0]), bytes.len, access)
+
+private at(bytes: []u8) -> usize = usize(&bytes[0])
+
+// An unprivileged task on stack `n`, granted its desk read-write, the sign read-only, and `grants`, with
+// `more` regions beside: made the running task.
+private granted_task(r: *Recorder, n: usize, more: []const Region, grants: []const Grant) -> Task
+    var regions: [4]Region = [span(desk, Access.ReadWrite), span(sign, Access.Read), NO_REGION, NO_REGION]
+    for k in 0..<more.len
+        regions[2 + k] = more[k]
+    val t = create_unprivileged(r, 0, gstacks[n], &body, 2, regions[0..<2 + more.len], grants).unwrap()
+    if !here(r).sched.started()
+        val _ = here(r).sched.first()
+    val _ = switch_context(r, 0)
+    assert(current(r) == t, "the task runs")
+    t
+
+private make(r: *Recorder, number: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> usize
+    val c = here(r)
+    dispatch(r, c, usize(c.sched.running), CallFrame([a0, a1, a2, a3], number))
+
+private map_of(r: *Recorder) -> *Map
+    val c = here(r)
+    &c.maps[usize(c.sched.running)]
+
+// The three words a buffer call recorded at the front of the desk.
+private record(word: usize) -> usize
+    val words: *usize = ptr_cast(at(desk))
+    words[word]
+
+@test("a granted queue sends the message the task's bytes hold and receives into its bytes")
+queue_calls()
+    var r = recorder(1, 0)
+    var q: Queue[Pair, 2] = Queue.new("q")
+    val _ = granted_task(&r, 0, [], [Grant.Messages(&q)])
+    val m: *Pair = ptr_cast(at(desk))
+    *m = Pair(7, true)
+    assert_eq(make(&r, CALL_SEND, 0, at(desk), 4, 0), 1)
+    *m = Pair(9, false)
+    assert_eq(make(&r, CALL_SEND, 0, at(desk), 4, 0), 1)
+    assert_eq(make(&r, CALL_SEND, 0, at(desk), 4, 0), 0)
+    assert_eq(q.waiting(&r), 2)
+    val into: *Pair = ptr_cast(at(desk) + 32)
+    assert_eq(make(&r, CALL_RECEIVE, 0, at(desk) + 32, 4, 0), 1)
+    assert(*into == Pair(7, true), "the first message")
+    assert_eq(make(&r, CALL_RECEIVE, 0, at(desk) + 32, 4, 0), 1)
+    assert(*into == Pair(9, false), "the second")
+    assert_eq(make(&r, CALL_RECEIVE, 0, at(desk) + 32, 4, 0), 0)
+
+@test("a queue call is refused for another grant's kind, a stale index, a wrong length, bytes outside the map, and bytes that are no message")
+queue_refusals()
+    var r = recorder(1, 0)
+    var q: Queue[Pair, 2] = Queue.new("q")
+    var s = Semaphore.new("s", 0, 1)
+    val _ = granted_task(&r, 0, [], [Grant.Messages(&q), Grant.Units(&s)])
+    val m: *Pair = ptr_cast(at(desk))
+    *m = Pair(1, true)
+    var theirs: [4]u8 = [0; 4]
+    assert_eq(make(&r, CALL_SEND, 1, at(desk), 4, 0), REFUSED_HANDLE)
+    assert_eq(make(&r, CALL_SEND, 2, at(desk), 4, 0), REFUSED_HANDLE)
+    assert_eq(make(&r, CALL_SEND, option_grants + 3, at(desk), 4, 0), REFUSED_HANDLE)
+    assert_eq(make(&r, CALL_SEND, 0, at(desk), 2, 0), REFUSED_ARGUMENT)
+    assert_eq(make(&r, CALL_SEND, 0, at(theirs), 4, 0), REFUSED_BUFFER)
+    assert_eq(make(&r, CALL_SEND, 0, at(desk) + 62, 4, 0), REFUSED_BUFFER)
+    desk[2] = 2
+    assert_eq(make(&r, CALL_SEND, 0, at(desk), 4, 0), REFUSED_ARGUMENT)
+    assert_eq(q.waiting(&r), 0)
+    assert(q.try_send(&r, Pair(5, true)), "a privileged send")
+    assert_eq(make(&r, CALL_RECEIVE, 1, at(desk), 4, 0), REFUSED_HANDLE)
+    assert_eq(make(&r, CALL_RECEIVE, 0, at(desk), 8, 0), REFUSED_ARGUMENT)
+    assert_eq(make(&r, CALL_RECEIVE, 0, at(sign), 4, 0), REFUSED_BUFFER)
+    assert_eq(make(&r, CALL_RECEIVE, 0, at(theirs), 4, 0), REFUSED_BUFFER)
+    assert_eq(q.waiting(&r), 1)
+    assert_eq(theirs[0], 0)
+
+@test("a buffer taken is lent to the task's map, recorded, and taken out of the map by its give back")
+pool_lends()
+    var r = recorder(1, 0)
+    var pool: Pool[2, 32] = Pool.new("pool", 3)
+    val _ = granted_task(&r, 0, [], [Grant.Buffers(&pool)])
+    val loads = r.loads
+    assert_eq(make(&r, CALL_TAKE_BUFFER, 0, 0, at(desk), 0), 1)
+    val b = Buffer(u32(record(0)))
+    assert_eq(b.pool(), 3)
+    assert_eq(record(1), usize(&pool.storage(b)[0]))
+    assert_eq(record(2), 32)
+    val m = map_of(&r)
+    assert_eq(m.len, 4)
+    assert(m.loans[3] == b, "lent as the last region")
+    assert_eq(r.loads, loads + 1)
+    assert_eq(r.loaded, 4)
+    assert_eq(make(&r, CALL_WRITE, record(1), 32, 0, 0), 32)
+    assert_eq(make(&r, CALL_GIVE_BUFFER, 0, usize(b.bits), 0, 0), 1)
+    assert_eq(m.len, 3)
+    assert(m.loans[3] == NO_BUFFER, "the loan gone")
+    assert_eq(r.loads, loads + 2)
+    assert_eq(r.loaded, 3)
+    assert_eq(make(&r, CALL_WRITE, record(1), 32, 0, 0), REFUSED_BUFFER)
+    assert_eq(pool.available(&r), 2)
+
+@test("a give back of a buffer the task does not hold, or through another grant, is refused and keeps every loan")
+pool_refusals()
+    var r = recorder(1, 0)
+    var pool: Pool[2, 32] = Pool.new("pool", 3)
+    var other: Pool[2, 32] = Pool.new("other", 4)
+    var s = Semaphore.new("s", 0, 1)
+    val _ = granted_task(&r, 0, [], [Grant.Buffers(&pool), Grant.Buffers(&other), Grant.Units(&s)])
+    val mine = pool.try_take(&r).unwrap()
+    assert_eq(make(&r, CALL_GIVE_BUFFER, 0, usize(mine.bits), 0, 0), REFUSED_HANDLE)
+    assert_eq(make(&r, CALL_TAKE_BUFFER, 2, 0, at(desk), 0), REFUSED_HANDLE)
+    assert_eq(make(&r, CALL_TAKE_BUFFER, 3, 0, at(desk), 0), REFUSED_HANDLE)
+    assert_eq(make(&r, CALL_TAKE_BUFFER, 0, 0, at(desk) + 4, 0), REFUSED_BUFFER)
+    assert_eq(make(&r, CALL_TAKE_BUFFER, 0, 0, at(sign), 0), REFUSED_BUFFER)
+    assert_eq(make(&r, CALL_TAKE_BUFFER, 0, 0, at(desk) + 48, 0), REFUSED_BUFFER)
+    assert_eq(pool.available(&r), 1)
+    assert_eq(make(&r, CALL_TAKE_BUFFER, 0, 0, at(desk), 0), 1)
+    val b = Buffer(u32(record(0)))
+    assert_eq(make(&r, CALL_GIVE_BUFFER, 1, usize(b.bits), 0, 0), REFUSED_HANDLE)
+    assert_eq(make(&r, CALL_GIVE_BUFFER, 2, usize(b.bits), 0, 0), REFUSED_HANDLE)
+    assert_eq(make(&r, CALL_GIVE_BUFFER, 0, usize(b.bits) + 1, 0, 0), REFUSED_HANDLE)
+    assert_eq(make(&r, CALL_GIVE_BUFFER, 0, usize(NO_BUFFER.bits), 0, 0), REFUSED_HANDLE)
+    assert(map_of(&r).loans[3] == b, "still lent")
+    assert_eq(make(&r, CALL_GIVE_BUFFER, 0, usize(b.bits), 0, 0), 1)
+    assert_eq(make(&r, CALL_GIVE_BUFFER, 0, usize(b.bits), 0, 0), REFUSED_HANDLE)
+    assert_eq(pool.available(&r), 1)
+
+@test("a take with no free region in the map is refused, taking nothing; a give back frees one, and the last region moves into its place")
+pool_full_map()
+    var r = recorder(1, 0)
+    var pool: Pool[3, 32] = Pool.new("pool", 3)
+    val _ = granted_task(&r, 0, [span(spare[0], Access.ReadWrite)], [Grant.Buffers(&pool)])
+    assert_eq(make(&r, CALL_TAKE_BUFFER, 0, 0, at(desk), 0), 1)
+    val first = Buffer(u32(record(0)))
+    assert_eq(make(&r, CALL_TAKE_BUFFER, 0, 0, at(desk), 0), 1)
+    val second = Buffer(u32(record(0)))
+    val second_at = record(1)
+    assert_eq(map_of(&r).len, option_map_regions)
+    assert_eq(make(&r, CALL_TAKE_BUFFER, 0, 0, at(desk), 0), REFUSED_BUFFER)
+    assert_eq(pool.available(&r), 1)
+    assert_eq(make(&r, CALL_GIVE_BUFFER, 0, usize(first.bits), 0, 0), 1)
+    assert(map_of(&r).loans[4] == second, "the last region moved into the freed place")
+    assert_eq(make(&r, CALL_WRITE, second_at, 32, 0, 0), 32)
+    assert_eq(make(&r, CALL_TAKE_BUFFER, 0, 0, at(desk), 0), 1)
+    assert_eq(pool.available(&r), 1)
+
+@test("a granted channel carries a lent buffer out of the sender's map and lends it to the receiver's")
+channel_calls()
+    var r = recorder(1, 0)
+    var pool: Pool[2, 32] = Pool.new("pool", 3)
+    var ch: Channel[1] = Channel.new("ch")
+    val _ = granted_task(&r, 0, [], [Grant.Buffers(&pool), Grant.Carries(&ch, &pool)])
+    assert_eq(make(&r, CALL_TAKE_BUFFER, 0, 0, at(desk), 0), 1)
+    val b = Buffer(u32(record(0)))
+    val bytes = record(1)
+    assert_eq(make(&r, CALL_PASS, 1, usize(b.bits), 0, 0), 1)
+    assert_eq(map_of(&r).len, 3)
+    assert_eq(ch.waiting(&r), 1)
+    assert_eq(make(&r, CALL_WRITE, bytes, 32, 0, 0), REFUSED_BUFFER)
+    assert_eq(make(&r, CALL_PASS, 1, usize(b.bits), 0, 0), REFUSED_HANDLE)
+    assert_eq(make(&r, CALL_COLLECT, 1, 0, at(desk), 0), 1)
+    val got = Buffer(u32(record(0)))
+    assert(got != b, "a new generation")
+    assert_eq(record(1), bytes)
+    assert(map_of(&r).loans[3] == got, "lent again")
+    assert_eq(make(&r, CALL_COLLECT, 1, 0, at(desk), 0), 0)
+    assert_eq(make(&r, CALL_GIVE_BUFFER, 0, usize(got.bits), 0, 0), 1)
+    assert_eq(pool.available(&r), 2)
+
+@test("a channel call is refused for another grant's kind, a buffer not lent, a record outside the map, and no free region; a full channel keeps the loan")
+channel_refusals()
+    var r = recorder(1, 0)
+    var pool: Pool[2, 32] = Pool.new("pool", 3)
+    var ch: Channel[1] = Channel.new("ch")
+    val _ = granted_task(&r, 0, [span(spare[0], Access.ReadWrite), span(spare[1], Access.ReadWrite)], [Grant.Buffers(&pool), Grant.Carries(&ch, &pool)])
+    val theirs = pool.try_take(&r).unwrap()
+    assert_eq(make(&r, CALL_PASS, 1, usize(theirs.bits), 0, 0), REFUSED_HANDLE)
+    assert_eq(make(&r, CALL_PASS, 0, usize(theirs.bits), 0, 0), REFUSED_HANDLE)
+    assert_eq(make(&r, CALL_COLLECT, 0, 0, at(desk), 0), REFUSED_HANDLE)
+    assert_eq(make(&r, CALL_TAKE_BUFFER, 1, 0, at(desk), 0), REFUSED_HANDLE)
+    assert(ch.try_send(&r, &pool, theirs).is_ok(), "a privileged send fills the channel")
+    assert_eq(make(&r, CALL_COLLECT, 1, 0, at(sign), 0), REFUSED_BUFFER)
+    assert_eq(make(&r, CALL_COLLECT, 1, 0, at(desk) + 2, 0), REFUSED_BUFFER)
+    assert_eq(ch.waiting(&r), 1)
+    assert_eq(make(&r, CALL_TAKE_BUFFER, 0, 0, at(desk), 0), 1)
+    val b = Buffer(u32(record(0)))
+    assert_eq(map_of(&r).len, option_map_regions)
+    assert_eq(make(&r, CALL_COLLECT, 1, 0, at(desk), 0), REFUSED_BUFFER)
+    assert_eq(ch.waiting(&r), 1)
+    assert_eq(make(&r, CALL_PASS, 1, usize(b.bits), 0, 0), 0)
+    assert(map_of(&r).loans[5] == b, "a full channel leaves the buffer lent")
+    assert_eq(make(&r, CALL_GIVE_BUFFER, 0, usize(b.bits), 0, 0), 1)
+    assert_eq(make(&r, CALL_COLLECT, 1, 0, at(desk), 0), 1)
+
+@test("a pool whose buffers the unit cannot hold, or that shares bytes with the map, is refused as a grant")
+pool_grant_refused()
+    var r = recorder(1, 0)
+    var odd: Pool[2, 48] = Pool.new("odd", 1)
+    var pool: Pool[2, 32] = Pool.new("pool", 2)
+    var ch: Channel[1] = Channel.new("ch")
+    var s = Semaphore.new("s", 0, 1)
+    assert(create_unprivileged(&r, 0, gstacks[0], &body, 2, [], [Grant.Units(&s), Grant.Buffers(&odd)]) == Err(MapError.Buffer(1, RegionError.Unaligned)), "an unholdable buffer")
+    assert(create_unprivileged(&r, 0, gstacks[0], &body, 2, [], [Grant.Carries(&ch, &odd)]) == Err(MapError.Buffer(0, RegionError.Unaligned)), "a channel's unholdable pool")
+    val over = Region(usize(&pool.storage(buffer_handle(2, 1, 1))[0]), 32, Access.Read)
+    assert(create_unprivileged(&r, 0, gstacks[0], &body, 2, [over], [Grant.Buffers(&pool)]) == Err(MapError.BufferOverlaps(0)), "a buffer in the map")
+    assert(create_unprivileged(&r, 0, gstacks[0], &body, 2, [over], [Grant.Carries(&ch, &pool)]) == Err(MapError.BufferOverlaps(0)), "a channel's pool in the map")
+    assert(create_unprivileged(&r, 0, gstacks[0], &body, 2, [], [Grant.Buffers(&pool), Grant.Carries(&ch, &pool)]).is_ok(), "a pool clear of the map")

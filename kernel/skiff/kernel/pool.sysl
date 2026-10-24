@@ -193,5 +193,43 @@ impl[const N: usize, const SIZE: usize] Pool[N, SIZE]
         self.generations[i] = g
         buffer_handle(self.id, i, g)
 
+// A pool of buffers whatever its sizes, as a channel and an unprivileged task's grant reach it: every
+// member that takes the port takes it as an object, so one table holds pools of every size, each called
+// later with the running core's port.
+trait BufferPool
+    // The id its handles carry.
+    handle_id(*self) -> u8
+
+    // How many buffers it holds in all.
+    buffer_count(*self) -> usize
+
+    // The bytes of buffer `index`, whoever holds it.
+    block_at(*self, index: usize) -> []u8
+
+    // The bytes of the buffer `b` names, which the caller owns or is handing over; `b` is this pool's.
+    storage_of(*self, b: Buffer) -> []u8
+
+    // `take`, through a port object.
+    take_through(*self, p: *Port, timeout: u32) -> Option[Buffer]
+
+    // `give`, through a port object.
+    give_through(*self, p: *Port, b: Buffer) -> Result[unit, BufferError]
+
+    // Check that `b` is its buffer's current handle and issue the next generation, as a hand-over does.
+    reissue_through(*self, p: *Port, b: Buffer) -> Result[Buffer, BufferError]
+
+    // Give buffer `issued`, which `reissue_through` took from the holder of `was`, back to that holder.
+    restore_through(*self, p: *Port, issued: Buffer, was: Buffer)
+
+impl[const N: usize, const SIZE: usize] BufferPool for Pool[N, SIZE]
+    handle_id(*self) -> u8 = self.id
+    buffer_count(*self) -> usize = N
+    block_at(*self, index: usize) -> []u8 = self.blocks[index].bytes[..]
+    storage_of(*self, b: Buffer) -> []u8 = self.storage(b)
+    take_through(*self, p: *Port, timeout: u32) -> Option[Buffer] = self.take(p, timeout)
+    give_through(*self, p: *Port, b: Buffer) -> Result[unit, BufferError] = self.give(p, b)
+    reissue_through(*self, p: *Port, b: Buffer) -> Result[Buffer, BufferError] = self.reissue(p, b)
+    restore_through(*self, p: *Port, issued: Buffer, was: Buffer) = self.restore(p, issued, was)
+
 // The generation after `g`, wrapping past 4095 to 1: never 0.
 private next_buffer_generation(g: u16) -> u16 = if u32(g) == BUFFER_GENERATIONS then 1 else g + 1

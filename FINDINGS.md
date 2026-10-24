@@ -193,7 +193,8 @@ A language move that would discharge it: let `[P: Port](p: *P)` bind `P` to the 
 handed a `*Port`, so `*P` is the object (Rust's `?Sized`), or any other spelling of "a pointer to
 something implementing `Port`, concrete or erased".
 
-Status: open.
+Status: fixed in sysl 0.5.2 (0.5.1 let a `*Port` bind `[P: Port](p: *P)`; 0.5.2 also through a generic type
+holding `*P`, `KernelLock.on[P] -> Locking[P]`). Queues, channels and pool buffers are granted (DESIGN "Grants").
 
 ## FINDINGS 10 — the standard module lays down no `__aeabi_memmove`
 
@@ -212,5 +213,5 @@ it; any freestanding program whose copy the optimiser turns into a move fails to
 What would discharge it: `__aeabi_memmove`/`4`/`8` beside the others, calling the board's `memmove` as the
 others call `memcpy` and `memset`.
 
-Status: open.
+Status: fixed in sysl 0.5.1.
 
