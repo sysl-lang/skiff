@@ -10,7 +10,7 @@ private body() -> never
         ()
 
 @align(32)
-private var gstacks: [2][64]u32
+private var gstacks: [2][128]u32
 @align(32)
 private var desk: [64]u8
 @align(32)

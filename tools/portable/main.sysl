@@ -114,6 +114,24 @@ private body() -> never
     loop
         ()
 
+// What a board places in `.shared` beside the kernel's structure, and the handshake two images make over
+// it: the fingerprint and the pointer check are worked out while compiling, so this build is what proves
+// they fold on each CPU family.
+struct Placed
+    handshake: kernel.Handshake
+    blocks: Pool[2, 48]
+    counts: [4]u32
+
+@assert(!kernel.holds_pointer[Placed](), "a structure for .shared holds a pointer")
+private const PLACED: u32 = kernel.combine(kernel.fingerprint[Placed](), kernel.LAYOUT)
+private var meeting: kernel.Handshake
+
+private handshake() -> bool
+    meeting.offer(PLACED)
+    if meeting.await_offer() != PLACED then return false
+    meeting.answer(PLACED)
+    meeting.await_answer() == PLACED
+
 private var beat: kernel.Timer
 
 private beaten(t: *kernel.Timer, due: u32) = ()
@@ -135,6 +153,7 @@ private protection(m: *Nothing) -> bool
     val t = kernel.create_unprivileged(m, 0, user_stack, &body, 1, [code], [Grant.Units(&units), Grant.Bits(&events)])
     if t.is_err() || kernel.running_unprivileged(m) then return false
     val _ = kernel.create_unprivileged(m, 0, user_stack, &body, 1, [code], [Grant.Messages(&mail), Grant.Buffers(&blocks), Grant.Carries(&carried, &blocks)])
+    if usize(kernel.running_trace(m)) == 0 || usize(kernel.handler_trace(m)) == 0 then return false
     val (base, bytes) = kernel.running_stack(m)
     if kernel.begin_call(m, base + bytes - 32, 32, 32)
         val _ = kernel.serve_call(m)
@@ -166,7 +185,7 @@ probe() -> i32
     if !kernel.stopped(here.id) || kernel.expired(kernel.ticks(), 0) then return 1
     if t.is_err() || kernel.delete(&m, t.unwrap()).is_ok() then return 1
     if !control(&m, t.unwrap()) then return 1
-    if !protection(&m) || !timers(&m) then return 1
+    if !protection(&m) || !timers(&m) || !handshake() then return 1
     if here.sched.started()
         kernel.sleep(&m, 1)
         kernel.sleep_until(&m, 1)

@@ -10,7 +10,7 @@ private loop_body() -> never
     loop
         ()
 
-private var stream_stacks: [4][64]u32
+private var stream_stacks: [4][128]u32
 
 // A task at `priority` on core 0 of `r`, on stack `i`.
 private stream_task(r: *Recorder, i: usize, priority: u8) -> Task = create(r, 0, stream_stacks[i], &loop_body, priority).unwrap()

@@ -1,0 +1,47 @@
+module skiff.kernel
+
+import sysl.debug.ErrorTraceStore
+
+// Error return traces (DESIGN "Error traces"). Every `?` whose failure arm is taken records its site in
+// the trace of whatever is running, which the port's hook (`sysl_error_trace_here`) answers. So every
+// task has a trace of its own, and each core one for its interrupt handlers and one for its code before
+// it runs its tasks: one task's failures never show in another's trace, nor an interrupt's in the task
+// it interrupted.
+//
+// **A task's trace is the top of its own stack**, `TRACE_WORDS` words that the kernel takes from the
+// stack at creation and empties there, before the task can run; its frames go below them. So the trace
+// lies inside the task's map (its stack is region 0), and an unprivileged task records into it with no
+// access to anything else. No other task's map holds another's stack, so no task reaches another's trace.
+//
+// The core's two traces are kernel data, which only privileged code reaches: a handler, or the code a
+// core runs before its tasks. An unprivileged task never reads them.
+
+// The words of a task's stack, at its top, that hold its error trace.
+const TRACE_WORDS: usize = (sizeof(ErrorTraceStore) + 3) / 4
+
+// Each core's trace for its interrupt handlers and the kernel code they run.
+private var handler_traces: [option_cores]ErrorTraceStore = [ErrorTraceStore.new(); option_cores]
+
+// Each core's trace for what it runs before its tasks.
+private var boot_traces: [option_cores]ErrorTraceStore = [ErrorTraceStore.new(); option_cores]
+
+// The trace of the task whose stack starts at `stack` and has `bytes` bytes: its top `TRACE_WORDS` words.
+private[kernel] trace_at(stack: usize, bytes: usize) -> *ErrorTraceStore = ptr_cast(stack + bytes - TRACE_WORDS * 4)
+
+// Make the top of `stack` an empty trace for the task about to run on it, and answer the rest of the
+// stack, below it, which the task's frames go on. The stack has more than `TRACE_WORDS` words.
+private[kernel] reserve_trace(stack: []u32) -> []u32
+    trace_at(usize(&stack[0]), stack.len * 4).init()
+    stack[..<stack.len - TRACE_WORDS]
+
+// The trace of the running core's thread: its running task's, or the core's own before it runs its
+// tasks. A handler's is `handler_trace`. Neither fails, allocates or records a failure, so a port's
+// trace hook may call them.
+running_trace[P: Port](p: *P) -> *ErrorTraceStore
+    val c = here(p)
+    if !c.sched.started() then return &boot_traces[here_id(p)]
+    val t = &c.sched.tasks[usize(c.sched.running)]
+    trace_at(t.stack, t.stack_bytes)
+
+// The trace of the running core's interrupt handlers.
+handler_trace[P: Port](p: *P) -> *ErrorTraceStore = &handler_traces[here_id(p)]

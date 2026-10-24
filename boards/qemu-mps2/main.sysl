@@ -3,6 +3,7 @@
 // the time base kept count of them. Then it runs the scenarios' tasks (skiff.board.scenarios), and the
 // last of them stops the machine with the status `boot` answered.
 
+import sysl.debug.ErrorTraceStore
 import sysl.sync.Atomic
 import skiff.arch.armv7m
 import skiff.board.scenarios
@@ -65,6 +66,11 @@ impl RunCounter for Board
 private val CODE: Region = Region(0, 0x8_0000, Access.Execute)
 private val UART: Region = Region(mps2.UART0, 0x1000, Access.Device)
 
+// What the scenarios share between cores: with one core, nobody else, but it lies in `.shared` as on a
+// machine of several.
+@section(".shared")
+private var objects: scenarios.Across
+
 // The status `boot` answered, which the last task stops the machine with.
 private var status: i32 = 0
 
@@ -80,6 +86,7 @@ skiff_main() -> never
     if kernel.shared_within(usize(&__shared_start), usize(&__shared_end))
         board.write("skiff: .shared holds the shared state\n".bytes)
     kernel.shared_bounds(usize(&__shared_start), usize(&__shared_end))
+    scenarios.share(&objects, false)
     armv7m.set_irq_priority(mps2.TIMER0_IRQ, armv7m.KERNEL_IRQ_PRIORITY)
     armv7m.enable_irq(mps2.TIMER0_IRQ)
     scenarios.create_tasks(&board, 0, &entries)
@@ -140,6 +147,7 @@ private task_r() -> never
     scenarios.timers(&board, &entries)
     scenarios.control(&board, &entries)
     scenarios.stats(&board, &entries)
+    scenarios.traces(&board, &entries, CODE)
     scenarios.protection(&board, &entries, CODE, UART)
     scenarios.grants(&board, CODE)
     armv7m.halt(status)
@@ -181,6 +189,11 @@ board_call(frame: *u32, registers: *u32) -> usize
 board_serve() -> usize
     var board = Board()
     kernel.serve_call(&board)
+
+// The error return trace every `?` records into: the handlers', the code's before the tasks, or the
+// running task's (armv7m traces.sysl).
+@export("sysl_error_trace_here")
+board_trace() -> *ErrorTraceStore = armv7m.error_trace_here(&Board())
 
 // The first task's privilege, from the SVC that starts it.
 @export("skiff_first_privilege")

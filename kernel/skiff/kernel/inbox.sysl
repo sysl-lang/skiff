@@ -36,7 +36,7 @@ private[kernel] post[P: Port](p: *P, kind: MessageKind, t: Task, priority: u8, m
         write_dec(p, from)
         p.write(" is full\n".bytes)
         panic("skiff: an inbox is full")
-    ring.slots[tail] = Message(kind, t, priority, mutex)
+    ring.slots[tail] = Message(kind, t, priority, if mutex == null then 0 else place_of(usize(mutex)))
     ring.tail.store(next, Ordering.Release)
     p.restore(mask)
     p.ring(to)
@@ -84,7 +84,8 @@ private apply[P: Port](p: *P, c: *Core, m: Message)
                 if e > c.sched.tasks[i].priority then c.sched.set_effective(i, e)
                 val _ = c.sched.wake(i)
         MessageKind.Boost ->
-            if m.mutex.owned_by(p, m.task) then inherit(p, c, i, m.priority)
+            val mutex: *Mutex = ptr_cast(at_place(m.mutex))
+            if mutex.owned_by(p, m.task) then inherit(p, c, i, m.priority)
         _ -> ()
 
 // Whether task `i` of core `c` is blocked on a wait that has ended: what a wake or a hand-over finds.

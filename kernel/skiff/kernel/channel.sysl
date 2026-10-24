@@ -49,7 +49,7 @@ impl[const N: usize] Channel[N]
     private[kernel] taken[P: Port, Q: BufferPool](*self, p: *P, pool: *Q, b: Buffer) -> Buffer
         if b.pool() != pool.handle_id()
             p.write("skiff: channel ".bytes)
-            p.write(self.q.w.lock.name.bytes)
+            p.write(self.q.w.lock.name_bytes())
             p.write(" received with another pool than its buffers'\n".bytes)
             panic("skiff: a channel received with another pool than its buffers'")
         p.invalidate(pool.storage_of(b))

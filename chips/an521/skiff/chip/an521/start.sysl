@@ -1,14 +1,16 @@
 module skiff.chip.an521
 
-// Reset for both of the AN521's cores: one image, one `_start`. Like the MPS2's, it runs with no stack
-// set up, so it is assembly. Each core reads its number from the SSE-200's CPU_IDENTITY (0x5001_F000)
-// and
+// Reset for both of the AN521's cores, in one image or in each of two. Like the MPS2's, it runs with no
+// stack set up, so it is assembly. Each core reads its number from the SSE-200's CPU_IDENTITY
+// (0x5001_F000) and
 //   - takes the top of its own stack, `_stack_top0` or `_stack_top1` from the link script;
 //   - grants itself the FPU (CPACR CP10/CP11 full access; the register is per core);
-//   - core 0 alone zeroes `.bss` and `.shared`, since core 1 is held in reset until core 0 releases it
-//     (`release_core1`, sysctl.sysl) and may not touch what core 0 is clearing. `.data` needs no copy:
-//     the image is loaded into RAM where it runs;
-//   - calls `skiff_main`, which the board program exports and both cores run.
+//   - core 0 zeroes `.bss` and `.shared`, since core 1 is held in reset until core 0 releases it
+//     (`release_core1`, sysctl.sysl) and may not touch what core 0 is clearing. Core 1 zeroes
+//     [`__core1_zero_start`, `__core1_zero_end`): nothing in one image, where `.bss` is core 0's to clear,
+//     and its own image's `.bss` in a build of two. `.data` needs no copy: an image is loaded into RAM
+//     where it runs;
+//   - calls `skiff_main`, which the board program exports.
 asm
     [thumb]
         ".syntax unified"
@@ -29,10 +31,16 @@ asm
         "str r1, [r0]"
         "dsb"
         "isb"
-        "cmp r4, #0"
-        "bne 2f"
         "movs r2, #0"
-        "ldr r0, =__bss_start"
+        "cmp r4, #0"
+        "beq 8f"
+        "ldr r0, =__core1_zero_start"
+        "ldr r1, =__core1_zero_end"
+        "9: cmp r0, r1"
+        "beq 2f"
+        "str r2, [r0], #4"
+        "b 9b"
+        "8: ldr r0, =__bss_start"
         "ldr r1, =__bss_end"
         "1: cmp r0, r1"
         "beq 6f"

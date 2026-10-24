@@ -83,7 +83,7 @@ free_slot_is_stale()
 @test("a handle for a core the machine does not have is stale, and a task is not created there")
 bad_core()
     var r = recorder(1, 0)
-    var stack: [64]u32 = [0; 64]
+    var stack: [128]u32 = [0; 128]
     assert(delete(&r, task_handle(1, 0, 1)) == Err(TaskError.Stale), "core 1 of one")
     assert(delete(&r, task_handle(255, 0, 1)) == Err(TaskError.Stale), "core 255")
     assert(create(&r, 1, stack, &body, 1) == Err(TaskError.NoCore), "creating on core 1 of one")
@@ -91,7 +91,7 @@ bad_core()
 @test("a task is created at priority 1 to 31 only")
 create_priorities()
     var r = recorder(1, 0)
-    var stack: [64]u32 = [0; 64]
+    var stack: [128]u32 = [0; 128]
     assert(create(&r, 0, stack, &body, 0) == Err(TaskError.Priority), "the idle task's priority")
     assert(create(&r, 0, stack, &body, 32) == Err(TaskError.Priority), "above 31")
     val t = create(&r, 0, stack, &body, 31).unwrap()
@@ -102,7 +102,7 @@ create_priorities()
 @test("a full table refuses a task, and the idle task is never deleted")
 full_and_idle()
     var r = recorder(1, 0)
-    var stack: [64]u32 = [0; 64]
+    var stack: [128]u32 = [0; 128]
     for _ in 0..<option_tasks
         assert(create(&r, 0, stack, &body, 1).is_ok(), "room")
     assert(create(&r, 0, stack, &body, 1) == Err(TaskError.Full), "full")
@@ -249,7 +249,7 @@ delete_running()
 @test("creating a task that outranks the running one asks for a switch; one that does not, does not")
 create_preempts()
     var r = recorder(1, 0)
-    var stack: [64]u32 = [0; 64]
+    var stack: [128]u32 = [0; 128]
     val low = create(&r, 0, stack, &body, 1).unwrap()
     assert_eq(r.switches, 0)
     here(&r).sched.first()
@@ -263,7 +263,7 @@ create_preempts()
 @test("sleep takes the running task out of the ready set until the tick its deadline comes")
 sleep_until_deadline()
     var r = recorder(1, 0)
-    var stack: [64]u32 = [0; 64]
+    var stack: [128]u32 = [0; 128]
     start(&r)
     val t = create(&r, 0, stack, &body, 1).unwrap()
     here(&r).sched.add_at(1, 77, IDLE_PRIORITY)

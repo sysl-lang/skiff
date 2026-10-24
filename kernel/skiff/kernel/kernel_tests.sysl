@@ -30,6 +30,7 @@ private[kernel] struct Recorder
     unit: usize         // how many regions a map may take on its unit
     reserve: usize      // the bytes at the bottom of every stack its guard takes
     clock: u32          // the core's counter, moved by hand
+    context_words: usize    // how many words the stack the last new context was laid on had
 
 // The counter is whatever the test last set it to.
 impl RunCounter for Recorder
@@ -95,7 +96,9 @@ impl Port for Recorder
     idle(*self)
         tick(self)
 
-    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize = usize(&stack[0])
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize
+        self.context_words = stack.len
+        usize(&stack[0])
 
     request_switch(*self)
         self.switches += 1
@@ -119,7 +122,7 @@ impl Doorbell for Recorder
     ring(*self, core: u32) = panic("one core never rings")
     clear(*self) = panic("one core never rings")
 
-private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, [], [], null, null, 0, 0, 0, 0, 0, 0, false, 8, 0, 0)
+private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, [], [], null, null, 0, 0, 0, 0, 0, 0, false, 8, 0, 0, 0)
 
 // Whether `r` recorded exactly `want`.
 private[kernel] recorded(r: *Recorder, want: string) -> bool

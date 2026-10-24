@@ -1,0 +1,33 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+
+// Error traces on several cores (machine.sysl): each core answers its own handlers' trace and its own
+// running task's, never another core's.
+
+@test("each core's handlers and running task have traces of their own")
+traces_per_core()
+    var m = machine()
+    on(&m, 0)
+    val boot0 = usize(kernel.running_trace(&m))
+    val handler0 = usize(kernel.handler_trace(&m))
+    on(&m, 1)
+    val boot1 = usize(kernel.running_trace(&m))
+    val handler1 = usize(kernel.handler_trace(&m))
+    assert(boot0 != boot1 && handler0 != handler1, "a boot trace and a handlers' trace per core")
+    assert(boot0 != handler0 && boot1 != handler1 && boot0 != handler1 && boot1 != handler0, "all four apart")
+    val t0 = task_on(&m, 0, 0, 1)
+    val t1 = task_on(&m, 1, 1, 1)
+    begin(&m)
+    on(&m, 0)
+    switch_now(&m)
+    assert(kernel.current(&m) == t0, "core 0 runs its task")
+    val in0 = usize(kernel.running_trace(&m))
+    on(&m, 1)
+    switch_now(&m)
+    assert(kernel.current(&m) == t1, "core 1 runs its task")
+    val in1 = usize(kernel.running_trace(&m))
+    assert(in0 != in1, "each core's running task its own")
+    assert(in0 != handler0 && in1 != handler1, "a task's trace is not its core's handlers'")
+    assert_eq(usize(kernel.handler_trace(&m)), handler1)

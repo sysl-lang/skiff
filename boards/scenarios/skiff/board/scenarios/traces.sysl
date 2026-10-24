@@ -1,0 +1,151 @@
+module skiff.board.scenarios
+
+import sysl.debug.{error_trace, ErrorTrace}
+import skiff.kernel
+import skiff.kernel.{Access, Port, Region}
+import skiff.kernel.user
+
+// Error return traces, on every core, once the statistics have reported (kernel DESIGN "Error traces").
+// Every `?` whose failure arm is taken records its site in the trace of whatever runs: each task its own,
+// at the top of its stack, and the core's handlers theirs.
+//
+//   - Left and right, both unprivileged and at one priority, take turns failing `ROUNDS` times each:
+//     inside the arm that handles its failure each yields to the other, which fails in turn, and on its
+//     return finds its trace exactly as it left it, its own two sites (left) or three (right), none of
+//     the other's. Each finds its trace empty again when the statement handling the failure is done.
+//     So an unprivileged task's failure path runs without faulting, and two tasks keep their traces apart.
+//   - R fails three sites deep and, inside the arm handling it, raises timer 0's interrupt, whose handler
+//     fails one site deep and looks at its trace: it must hold that one site alone, and R's trace must be
+//     as R left it.
+
+// How many times each of left and right fails.
+private const ROUNDS: u32 = 20
+
+// How many ticks R gives a scenario before judging it: a core's ticks may come late under QEMU's
+// multi-threaded TCG.
+private const SETTLE_TICKS: u32 = 50
+
+// What left and right write besides their stacks: one 32-byte region, aligned to its size.
+struct Tally
+    start: u32          // the tick they start on
+    left: u32           // the rounds each found its trace as it left it
+    right: u32
+    finished: u32       // a bit for each once it is done
+    unused: [4]u32
+
+@assert(sizeof(Tally) == TALLY_BYTES, "a tally fills one 32-byte region")
+
+private const TALLY_BYTES: usize = 32
+private const LEFT_DONE: u32 = 1
+private const RIGHT_DONE: u32 = 2
+
+@align(32)
+private var tallies: [kernel.CORES]Tally
+
+// Left's and right's stacks: one PMSAv7 region each, 2 KiB aligned to its size.
+@align(2048)
+private var turn_stacks: [kernel.CORES][2][STACK_WORDS]u32
+
+// What the interrupt handler saw: whether it is to fail (armed), and how many sites its trace held then.
+private var armed: [kernel.CORES]bool
+private var seen: [kernel.CORES]u32
+
+// The failure every scenario here starts from, and one and two `?`s handing it on.
+private origin(tag: u32) -> Result[u32, u32] = Err(tag)
+
+private one_hop(tag: u32) -> Result[u32, u32]
+    val v = origin(tag)?
+    Ok(v)
+
+private two_hops(tag: u32) -> Result[u32, u32]
+    val v = one_hop(tag)?
+    Ok(v)
+
+// Whether two copies of a trace hold the same sites.
+private same(a: ErrorTrace, b: ErrorTrace) -> bool
+    if a.count != b.count then return false
+    for i in 0..<a.len()
+        if a.sites[i] != b.sites[i] then return false
+    true
+
+// R's part, on the running core: create left and right, raise the interrupt from inside a failure of its
+// own, and judge both.
+traces[P: Port](p: *P, e: *Entries, code: Region)
+    val me = kernel.here_id(p)
+    val x = &tallies[me]
+    val t = kernel.ticks() + 2
+    x.start = t
+    val tally = Region(usize(x), TALLY_BYTES, Access.ReadWrite)
+    for k in 0..<2
+        val entry = if k == 0 then &left_task else &right_task
+        kernel.create_unprivileged(p, me, turn_stacks[me][k], entry, 2, [code, tally], []) match
+            Ok(_) -> ()
+            Err(_) -> panic("skiff: a scenario's map was refused")
+
+    var kept = false
+    two_hops(7) match
+        Ok(_) -> ()
+        Err(_) ->
+            val before = error_trace()
+            seen[me] = 0
+            armed[me] = true
+            (e.raise)()
+            for _ in 0..<SETTLE_TICKS
+                if !armed[me] then break
+                kernel.sleep(p, 1)
+            kept = !armed[me] && seen[me] == 1 && before.len() == 3 && same(before, error_trace())
+    if kept && error_trace().is_empty()
+        say(p, "an interrupt's failure kept to its own error trace and left the task's as it was\n")
+    else
+        say(p, "an interrupt's failure reached the interrupted task's error trace\n")
+
+    kernel.sleep_until(p, t)
+    for _ in 0..<SETTLE_TICKS
+        if x.finished == (LEFT_DONE | RIGHT_DONE) then break
+        kernel.sleep(p, 1)
+    if x.left == ROUNDS && x.right == ROUNDS
+        say(p, "two unprivileged tasks took turns failing 20 times, each keeping its own error trace\n")
+    else
+        say(p, "two unprivileged tasks' error traces got mixed\n")
+
+// Timer 0's interrupt, when R has armed it: fail one site deep and count the trace's sites.
+private[scenarios] traces_from_interrupt[P: Port](p: *P, me: u32)
+    if !armed[me] then return
+    origin(9) match
+        Ok(_) -> ()
+        Err(_) -> seen[me] = u32(error_trace().len())
+    armed[me] = false
+
+// The running unprivileged task's tally.
+private tally() -> *Tally = &tallies[user.current().core()]
+
+// One side's turns: fail one hop deep (two sites) or, if `deep`, two (three sites), and inside the arm
+// handling it yield to the other side, then check the trace is as it was. Answers the rounds that were.
+private take_turns(deep: bool) -> u32
+    val sites: usize = if deep then 3 else 2
+    var good: u32 = 0
+    for n in 0..<ROUNDS
+        if !error_trace().is_empty() then continue
+        (if deep then two_hops(n) else one_hop(n)) match
+            Ok(_) -> ()
+            Err(_) ->
+                val before = error_trace()
+                user.yield_now()
+                if before.len() == sites && same(before, error_trace()) then good += 1
+    good
+
+private left_task() -> never
+    val x = tally()
+    user.sleep_until(x.start)
+    x.left = take_turns(false)
+    x.finished |= LEFT_DONE
+    loop
+        user.sleep(kernel.FOREVER)
+
+private right_task() -> never
+    val x = tally()
+    user.sleep_until(x.start)
+    x.right = take_turns(true)
+    x.finished |= RIGHT_DONE
+    loop
+        user.sleep(kernel.FOREVER)

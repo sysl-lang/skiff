@@ -95,6 +95,13 @@ skiff: core $1 a timer stopped before it expired was never called
 skiff: core $1 a reset timer and one whose period changed each counted from its command
 skiff: core $1 every timer callback ran in its own core's timer service"
 }
+# Error traces, every core (boards/scenarios, traces.sysl): an interrupt's failure kept to the core's
+# handlers' trace, the interrupted task's untouched; two unprivileged tasks failing in turn, each finding
+# only its own sites in its trace.
+traces_expected() {
+    echo "skiff: core $1 an interrupt's failure kept to its own error trace and left the task's as it was
+skiff: core $1 two unprivileged tasks took turns failing 20 times, each keeping its own error trace"
+}
 # Protection, every core (boards/scenarios, protection.sysl): a map the MPU cannot hold refused at
 # creation; an unprivileged task's round trips with a privileged one; a task reading kernel memory, a
 # stack overflow and a null load each stopped alone and reported; calls with buffers, grants or handles
@@ -136,6 +143,7 @@ $(messages_expected 0)
 $(timers_expected 0)
 $(control_expected 0)
 $(stats_expected 0)
+$(traces_expected 0)
 $(protection_expected 0)
 $(grants_expected 0)"
 
@@ -160,9 +168,9 @@ $(grants_expected 0)"
 # on purpose: it
 # reports the fault on its own console and stops. Core 0 sees it stopped, takes more ticks, finds that
 # the time base counted its own ticks and none of core 1's, and stops the machine with status 0.
-an521_core0_expected="skiff: hello from core 0
-skiff: .shared holds the shared state
-skiff: core 0 tick 1
+an521_core0_greeting="skiff: hello from core 0
+skiff: .shared holds the shared state"
+an521_core0_run="skiff: core 0 tick 1
 skiff: core 0 tick 2
 skiff: core 0 tick 3
 $(tasks_expected 0)
@@ -180,6 +188,7 @@ $(control_expected 0)
 skiff: core 0 asked core 1 to suspend, resume, re-prioritize and stop a task of its own, and core 1 did
 $(stats_expected 0)
 skiff: core 0 is refused another core's task statistics and high-water marks
+$(traces_expected 0)
 $(protection_expected 0)
 skiff: core 0 an unprivileged task on core 1 took a unit core 0 gave and set flags core 0 waited on, through its grants
 $(grants_expected 0)
@@ -187,12 +196,12 @@ skiff: core 0 had the pool buffer an unprivileged task sent core 1 through grant
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
 skiff: core 0 time base agrees"
-an521_core1_expected="skiff: hello from core 1
-skiff: core 1 tick 1
+an521_core0_expected="$an521_core0_greeting
+$an521_core0_run"
+an521_core1_ticks="skiff: core 1 tick 1
 skiff: core 1 tick 2
-skiff: core 1 tick 3
-$(tasks_expected 1)
-$(waits_expected 1)
+skiff: core 1 tick 3"
+an521_core1_run="$(waits_expected 1)
 $(messages_expected 1)
 skiff: core 1 took every unit core 0 gave
 skiff: core 1 received every message core 0 sent, in order
@@ -210,11 +219,30 @@ $(timers_expected 1)
 $(control_expected 1)
 skiff: core 1 core 0 suspended, resumed, re-prioritized and stopped a task of core 1 through its inbox
 $(stats_expected 1)
+$(traces_expected 1)
 $(protection_expected 1)
 skiff: core 1 an unprivileged task took a unit core 0 gave, through its grant
 $(grants_expected 1)
 skiff: core 1 an unprivileged task received notes and a filled buffer an unprivileged task of core 0 sent, through its grants
 skiff: core 1 fault BusFault"
+an521_core1_expected="skiff: hello from core 1
+$an521_core1_ticks
+$(tasks_expected 1)
+$an521_core1_run"
+
+# The AN521 as two images (boards/qemu-an521 with `--features core0` and `--features core1`): each core
+# runs its own, built from the one board program, and the two meet at the handshake, agreeing on the
+# layout of `.shared`, before either creates a task. Then the run is the one image's, except that core
+# 1's image uses its FPU, so its floating-point tasks run too, and that core 0 cannot name core 1's
+# timers at all, which are core 1's own.
+split_core0_expected="$an521_core0_greeting
+skiff: core 0 and core 1 agree on the layout of .shared
+$(echo "$an521_core0_run" | grep -v -x -F "skiff: core 0 may not command a timer of core 1")"
+split_core1_expected="skiff: hello from core 1
+skiff: core 1 agrees with core 0 on the layout of .shared
+$an521_core1_ticks
+$(tasks_expected 1 "f32 registers survived the switches")
+$an521_core1_run"
 
 failed=0
 
@@ -268,11 +296,11 @@ verdict() {
     fi
 }
 
-# build <target> <board> <image>. The standard library supplies the runtime helpers a freestanding link
+# build <target> <board> <image> [<features>]. The standard library supplies the runtime helpers a freestanding link
 # needs (the 64-bit divide, `__aeabi_mem*`, soft floating point), so nothing else is linked.
 build() {
-    if ! "$compiler" build $opt --target "$1" -o "$3" "$root/boards/$2"; then
-        echo "FAIL: $2 did not build"
+    if ! "$compiler" build $opt --target "$1" ${4:+--features "$4"} -o "$3" "$root/boards/$2"; then
+        echo "FAIL: $2 ${4:-} did not build"
         exit 1
     fi
 }
@@ -302,5 +330,39 @@ if [ -z "$missing" ]; then
     check "mps2-an521 core 1" "$scratch/an521-core1.log" "$an521_core1_expected"
 fi
 verdict mps2-an521 0
+
+# The AN521 as two images: core 0's is the kernel QEMU starts, and core 1's is loaded beside it, where
+# core 0 points core 1 when it releases it.
+core0_image="$scratch/qemu-an521-core0.elf"
+core1_image="$scratch/qemu-an521-core1.elf"
+build thumb-freestanding-soft qemu-an521 "$core0_image" core0
+build thumb-freestanding qemu-an521 "$core1_image" core1
+rm -f "$scratch/an521-split-core1.log"
+run "$scratch/an521-split-core0.log" -M mps2-an521 -accel tcg,thread=multi -kernel "$core0_image" \
+    -device loader,file="$core1_image" -serial mon:stdio -serial file:"$scratch/an521-split-core1.log"
+check "mps2-an521 two images, core 0" "$scratch/an521-split-core0.log" "$split_core0_expected"
+if [ -z "$missing" ]; then
+    check "mps2-an521 two images, core 1" "$scratch/an521-split-core1.log" "$split_core1_expected"
+fi
+verdict "mps2-an521 two images" 0
+
+# Two images that disagree: core 1's is built with one more field in `.shared` (the `skewed` feature).
+# Each core says it stops at the handshake, before either creates a task, and core 0 stops the machine
+# with status 3.
+skewed_image="$scratch/qemu-an521-core1-skewed.elf"
+build thumb-freestanding qemu-an521 "$skewed_image" core1,skewed
+rm -f "$scratch/an521-skewed-core1.log"
+run "$scratch/an521-skewed-core0.log" -M mps2-an521 -accel tcg,thread=multi -kernel "$core0_image" \
+    -device loader,file="$skewed_image" -serial mon:stdio -serial file:"$scratch/an521-skewed-core1.log"
+check "mps2-an521 two images that disagree, core 0" "$scratch/an521-skewed-core0.log" "skiff: hello from core 0
+skiff: core 0 stops at the handshake: core 1's image lays out .shared otherwise"
+if [ -z "$missing" ]; then
+    check "mps2-an521 two images that disagree, core 1" "$scratch/an521-skewed-core1.log" "skiff: hello from core 1
+skiff: core 1 stops at the handshake: core 0's image lays out .shared otherwise"
+fi
+if [ -z "$missing" ] && grep -q "tick 1" "$scratch/an521-skewed-core0.log" "$scratch/an521-skewed-core1.log"; then
+    missing="mps2-an521 two images that disagree: a core ran on past the handshake"
+fi
+verdict "mps2-an521 two images that disagree" 3
 
 exit $failed

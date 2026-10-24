@@ -22,10 +22,10 @@ import skiff.kernel.{Buffer, Channel, FOREVER, Pool, Port}
 private const ROUND_TRIPS: u32 = 8
 
 // How many buffers core 0 passes to core 1.
-private const STREAMED: u32 = 100
+private[scenarios] const STREAMED: u32 = 100
 
 // How many buffers the pool between the cores holds.
-private const STREAM_BUFFERS: usize = 4
+private[scenarios] const STREAM_BUFFERS: usize = 4
 
 // Each core's own pool and channels, laid into the image as constant data. The cores' pools never
 // meet, so they share an id.
@@ -35,19 +35,11 @@ private var homeward: [kernel.CORES]Channel[1] = [Channel.new("homeward"); kerne
 // Where each core's sender filled the buffer it last sent.
 private var filled_at: [kernel.CORES]usize
 
-// The pool and the channel the cores pass buffers through: in `.shared`, so filled in by core 0.
-@section(".shared")
-private var stream: Pool[STREAM_BUFFERS, 256]
-@section(".shared")
-private var streamed: Channel[2]
-// Where core 0 filled each buffer it sent, by its number.
-@section(".shared")
-private var origins: [STREAMED]usize
-
-// Fill in the shared objects of the buffers. Core 0 calls it before any other core starts.
+// Fill in the pool and the channel the cores pass buffers through, in `.shared` (`Across`). Core 0 calls
+// it before any other core starts.
 fill_shared_buffers()
-    stream = Pool.new("stream", 2)
-    streamed = Channel.new("streamed")
+    common.stream = Pool.new("stream", 2)
+    common.streamed = Channel.new("streamed")
 
 // The receiver's side of the round trips: check each buffer, change it, and send it back.
 private[scenarios] buffers_receiver[P: Port](p: *P, me: u32)
@@ -89,14 +81,16 @@ private[scenarios] buffers_sender[P: Port](p: *P, me: u32)
 // The hammers' buffers between the cores, after their waits across cores: core 0 fills and sends, core
 // 1 receives, checks and gives back.
 private[scenarios] buffers_across[P: Port](p: *P, me: u32)
+    val stream = &common.stream
+    val streamed = &common.streamed
     if me == 0
         for n in 0..<STREAMED
             val b = stream.take(p, FOREVER).unwrap()
             val bytes = stream.bytes(p, b).unwrap()
             for i in 0..<bytes.len
                 bytes[i] = streamed_byte(n, i)
-            origins[n] = usize(&bytes[0])
-            val _ = streamed.send(p, &stream, b, FOREVER)
+            common.origins[n] = usize(&bytes[0]) - usize(stream)
+            val _ = streamed.send(p, stream, b, FOREVER)
         var back: [STREAM_BUFFERS]Buffer
         for i in 0..<back.len
             back[i] = stream.take(p, FOREVER).unwrap()
@@ -110,13 +104,13 @@ private[scenarios] buffers_across[P: Port](p: *P, me: u32)
         var exact: u32 = 0
         var in_place: u32 = 0
         for n in 0..<STREAMED
-            val b = streamed.receive(p, &stream, FOREVER).unwrap()
+            val b = streamed.receive(p, stream, FOREVER).unwrap()
             val bytes = stream.bytes(p, b).unwrap()
             var same = true
             for i in 0..<bytes.len
                 if bytes[i] != streamed_byte(n, i) then same = false
             if same then exact += 1
-            if usize(&bytes[0]) == origins[n] then in_place += 1
+            if usize(&bytes[0]) - usize(stream) == common.origins[n] then in_place += 1
             val _ = stream.give(p, b)
         if exact == STREAMED && in_place == STREAMED
             say(p, "received 100 buffers core 0 filled, in place and every byte as written\n")

@@ -9,7 +9,7 @@ private body() -> never
     loop
         ()
 
-private var stat_stacks: [4][64]u32
+private var stat_stacks: [4][128]u32
 
 private on_stack(r: *Recorder, n: usize, priority: u8) -> Task = create(r, 0, stat_stacks[n], &body, priority).unwrap()
 
@@ -136,17 +136,20 @@ stopped_slot_reused_resets()
     assert_eq(run_time(&r, again), 0)
     assert(task_stats(&r, first) == Err(TaskError.Stale), "the stopped task's handle is stale")
 
-@test("a fresh stack is painted: its high-water mark is all of it above the reserve")
+// The words of a test stack below its error trace, which its frames may use.
+private const FRAME_WORDS: usize = 128 - TRACE_WORDS
+
+@test("a fresh stack is painted: its high-water mark is all of it above the reserve and below its trace")
 fresh_stack_untouched()
     var r = recorder(1, 0)
     stat_stacks[0][10] = 7
     val a = on_stack(&r, 0, 1)
-    assert(stack_high_water(&r, a) == Ok(64 * 4), "all 256 bytes")
+    assert(stack_high_water(&r, a) == Ok(FRAME_WORDS * 4), "every byte below the trace")
     r.reserve = 40
-    assert(stack_high_water(&r, a) == Ok(64 * 4 - 40), "above the reserve")
+    assert(stack_high_water(&r, a) == Ok(FRAME_WORDS * 4 - 40), "above the reserve")
     r.reserve = 42
-    assert(stack_high_water(&r, a) == Ok(64 * 4 - 44), "from the first word above it")
-    r.reserve = 64 * 4
+    assert(stack_high_water(&r, a) == Ok(FRAME_WORDS * 4 - 44), "from the first word above it")
+    r.reserve = 128 * 4
     assert(stack_high_water(&r, a) == Ok(0), "a stack all reserve has no room")
 
 @test("a deeper task's high-water mark is lower, and stops at the first word it reached")
@@ -154,13 +157,13 @@ deep_lower_than_shallow()
     var r = recorder(1, 0)
     val deep = on_stack(&r, 0, 1)
     val shallow = on_stack(&r, 1, 1)
-    // Each writes down from the top, as a stack is pushed.
-    for k in 56..<64
+    // Each writes down from the bottom of its trace, as a stack is pushed.
+    for k in FRAME_WORDS - 8..<FRAME_WORDS
         stat_stacks[1][k] = 0
-    for k in 20..<64
+    for k in 20..<FRAME_WORDS
         stat_stacks[0][k] = u32(k)
-    assert(stack_high_water(&r, shallow) == Ok(56 * 4), "shallow: 8 words used")
-    assert(stack_high_water(&r, deep) == Ok(20 * 4), "deep: 44 words used")
+    assert(stack_high_water(&r, shallow) == Ok((FRAME_WORDS - 8) * 4), "shallow: 8 words used")
+    assert(stack_high_water(&r, deep) == Ok(20 * 4), "deep: the rest used")
     // A word written lower down, the words between it and the frames still painted, lowers the mark: the
     // scan stops at the lowest word ever reached.
     stat_stacks[0][5] = 1

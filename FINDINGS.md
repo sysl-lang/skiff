@@ -215,3 +215,45 @@ others call `memcpy` and `memset`.
 
 Status: fixed in sysl 0.5.1.
 
+## FINDINGS 11 — an assignment in an `elif const` arm of a `const` function is refused
+
+In a `const` function, `if const … elif const …` whose `elif const` arm assigns is refused:
+
+```
+const f[T]() -> u32
+    var h: u32 = 1
+    if const T::Kind == Kind.Struct
+        h = 2
+    elif const T::Kind == Kind.Array
+        h = 3
+    h
+
+print(f[u8]())
+```
+
+```
+error: '=' assigns and yields nothing, so it cannot stand where a value is wanted — write ':=' to assign and use the value
+ --> ic.sysl:6:9
+```
+
+The same body in a function that is not `const` builds and prints `1`, and a `const` one with `else` in
+place of `elif const` builds too. skiff met it writing `kernel.fingerprint` (layout.sysl), which returns from each arm instead, the
+shape `holds_pointer` has anyway.
+
+Status: open.
+
+## FINDINGS 12 — one store word per image
+
+sysl 0.5.1 reached a freestanding image's error return trace through one image-wide pointer,
+`sysl_error_trace_current`, which `use_error_trace` sets and every statement handling a failure reads.
+That cannot work for skiff: on the AN521 each core's context switch overwrites the other core's choice, so
+a task records into whichever store the other core made current last; and an unprivileged task cannot
+read the word at all, since it lies in the kernel's data, outside its map, and PMSAv8 has no
+privileged-write, unprivileged-read permission that would let the kernel map it read-only and still
+write it. The first unprivileged task whose failure path ran faulted on the read (`sysl_trace`), so both
+boards built with `error_traces = false`.
+
+Status: fixed in sysl 0.5.2 by a weak hook, `sysl_error_trace_here() -> *ErrorTraceStore`, which the
+runtime calls on every failure path and every read of the trace and an OS overrides. skiff's hook (DESIGN
+"Error traces") answers each core's handlers' trace in handler mode, and the running task's, kept at the
+top of its own stack, in thread mode; both boards build with traces on.

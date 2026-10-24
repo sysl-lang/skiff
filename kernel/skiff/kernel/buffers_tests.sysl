@@ -10,7 +10,7 @@ private idle_body() -> never
     loop
         ()
 
-private var buffer_stacks: [3][64]u32
+private var buffer_stacks: [3][128]u32
 
 // A task at `priority` on core 0 of `r`, on stack `i`.
 private buffer_task(r: *Recorder, i: usize, priority: u8) -> Task = create(r, 0, buffer_stacks[i], &idle_body, priority).unwrap()

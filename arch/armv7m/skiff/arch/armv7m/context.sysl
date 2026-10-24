@@ -164,7 +164,7 @@ start_first(sp: usize) -> never
     loop
         ()
 
-private const CONTROL_NPRIV: u32 = 1 << 0
+private[armv7m] const CONTROL_NPRIV: u32 = 1 << 0
 
 // Make thread mode unprivileged, or privileged again, from the return to thread mode: CONTROL.nPRIV,
 // written only from a handler (IPSR not 0); in thread mode it does nothing, and the SVC that starts the

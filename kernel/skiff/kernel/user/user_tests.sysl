@@ -63,7 +63,7 @@ impl RunCounter for Desk
 private var desk: Desk = Desk([0; 64], 0, 0)
 
 @align(32)
-private var stack: [64]u32
+private var stack: [128]u32
 @align(32)
 private var said: [32]u8
 

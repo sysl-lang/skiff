@@ -42,7 +42,7 @@ private serving() -> never
     loop
         ()
 
-private var serving_stacks: [2][64]u32
+private var serving_stacks: [2][128]u32
 
 @test("a one-shot timer expires once, a period after its start, and is then inactive")
 one_shot()

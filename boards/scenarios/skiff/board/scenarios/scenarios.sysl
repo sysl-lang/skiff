@@ -97,7 +97,7 @@ create_tasks[P: Port](p: *P, core: u32, e: *Entries)
     val _ = created(kernel.create(p, core, stacks[core][9], e.timed, 3))
     val _ = created(kernel.create(p, core, stacks[core][10], e.raiser, 2))
     if kernel.CORES > 1
-        hammers[core] = created(kernel.create(p, core, stacks[core][11], e.hammer, 2))
+        common.hammers[core] = created(kernel.create(p, core, stacks[core][11], e.hammer, 2))
     receivers[core] = created(kernel.create(p, core, stacks[core][12], e.receiver, 4))
     val _ = created(kernel.create(p, core, stacks[core][13], e.sender, 3))
     if kernel.CORES > 1 && core == 0

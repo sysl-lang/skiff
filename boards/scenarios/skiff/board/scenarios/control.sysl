@@ -51,12 +51,10 @@ private var sorted = [Semaphore.new("sorted", 0, 2); kernel.CORES]
 private var stopped_on = [Semaphore.new("stopped on", 0, 1); kernel.CORES]
 private var held = [Mutex.new("held"); kernel.CORES]
 
-// Core 0's requests of core 1's ticker, a step at a time: core 1 publishes the handle, and each core
-// moves `stage` on once its part of a step is done.
-private var far_task: Atomic[u32]
+// Core 0's requests of core 1's ticker, a step at a time: core 1 publishes the handle (`Across.far_task`),
+// and each core moves `Across.control_stage` on once its part of a step is done. How often the ticker
+// has run is core 1's own.
 private var far_count: Atomic[u32]
-private var stage: Atomic[u32]
-private var far_verdict: Atomic[u32]
 
 // How long a core waits for the other's step: the cores reach these scenarios at different times, and
 // multi-threaded TCG delivers a core's ticks late and in bunches.
@@ -194,22 +192,22 @@ private stop_waiter[P: Port](p: *P, e: *Entries, me: u32)
     else
         say(p, "task control acted on a stale handle\n")
 
-// Sleep until `stage` reaches `n`, or `STEP_TICKS` ticks have gone by; answer whether it did.
-private reached[P: Port](p: *P, n: u32) -> bool = holds_within(p, STEP_TICKS, stage.load() >= n)
+// Sleep until `Across.control_stage` reaches `n`, or `STEP_TICKS` ticks have gone by; answer whether it did.
+private reached[P: Port](p: *P, n: u32) -> bool = holds_within(p, STEP_TICKS, common.control_stage.load() >= n)
 
 // Core 0: ask core 1, through its inbox, to suspend its ticker, resume it at priority 3, and stop it.
 private ask_core_1[P: Port](p: *P)
-    var right = holds_within(p, STEP_TICKS, far_task.load() != 0)
-    val far = Task(far_task.load())
+    var right = holds_within(p, STEP_TICKS, common.far_task.load() != 0)
+    val far = Task(common.far_task.load())
     right = right && kernel.suspend(p, far).is_ok()
-    stage.store(1)
+    common.control_stage.store(1)
     right = right && reached(p, 2)
     right = right && kernel.resume(p, far).is_ok() && kernel.set_priority(p, far, 3).is_ok()
-    stage.store(3)
+    common.control_stage.store(3)
     right = right && reached(p, 4)
     right = right && kernel.stop(p, far).is_ok()
-    stage.store(5)
-    right = right && reached(p, 6) && far_verdict.load() == 1
+    common.control_stage.store(5)
+    right = right && reached(p, 6) && common.far_verdict.load() == 1
     if right
         say(p, "asked core 1 to suspend, resume, re-prioritize and stop a task of its own, and core 1 did\n")
     else
@@ -218,19 +216,19 @@ private ask_core_1[P: Port](p: *P)
 // Core 1: publish a ticker for core 0 to control, and check each step on it.
 private answer_core_0[P: Port](p: *P, e: *Entries)
     val far = spawn(p, e, 1, FAR, 2)
-    far_task.store(far.bits)
+    common.far_task.store(far.bits)
     var right = reached(p, 1) && within(p,kernel.suspended(p, far) == Ok(true))
     val before = far_count.load()
     kernel.sleep(p, 5)
     right = right && far_count.load() == before
-    stage.store(2)
+    common.control_stage.store(2)
     right = right && reached(p, 3) && within(p,kernel.suspended(p, far) == Ok(false) && kernel.priority(p, far) == Ok(3))
     right = right && within(p,far_count.load() > before)
-    stage.store(4)
+    common.control_stage.store(4)
     right = right && reached(p, 5) && within(p,is_in(p, far, TaskState.Stopped))
     val _ = kernel.delete(p, far)
-    far_verdict.store(if right then 1 else 2)
-    stage.store(6)
+    common.far_verdict.store(if right then 1 else 2)
+    common.control_stage.store(6)
     if right
         say(p, "core 0 suspended, resumed, re-prioritized and stopped a task of core 1 through its inbox\n")
     else

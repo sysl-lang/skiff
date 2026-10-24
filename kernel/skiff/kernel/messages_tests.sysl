@@ -10,7 +10,7 @@ private spin() -> never
     loop
         ()
 
-private var task_stacks: [5][64]u32
+private var task_stacks: [5][128]u32
 
 // A task at `priority` on core 0 of `r`, on stack `i`.
 private make_task(r: *Recorder, i: usize, priority: u8) -> Task = create(r, 0, task_stacks[i], &spin, priority).unwrap()

@@ -1,0 +1,101 @@
+module skiff.kernel
+
+import sysl.sync.{Atomic, Ordering}
+
+// What two images built apart must agree on before they share `.shared` (DESIGN "Two images").
+//
+// Each image works out a **layout fingerprint** while it compiles: a hash of the sizes and offsets of
+// every field of the structures it places in `.shared`, field within field and element within array.
+// Two images whose structures are laid out alike have one fingerprint; a field added, moved, resized
+// or retyped in one of them changes it. The first image offers its fingerprint in a `Handshake`, which
+// lies at the start of `.shared` so that its own place never depends on the layout, and the other
+// answers with its own: if the two differ, neither runs on.
+//
+// And **nothing in `.shared` holds a pointer**: another image's pointer would name memory that is not
+// its own. `holds_pointer[T]()` is the compile-time check, which `Shared` passes (an `@assert` below),
+// and so must every structure a board places beside it.
+
+// The hash's two constants (32-bit FNV-1a).
+private const BASIS: u32 = 2166136261
+private const PRIME: u32 = 16777619
+
+// The hash `h` with `value` taken into it.
+private const mix(h: u32, value: usize) -> u32 = (h ^ u32(value & 0xffff_ffff)) * PRIME
+
+// The layout fingerprint of `T`: its size, then for each field its offset, its size and, for a
+// structure or an array, the fingerprint of what it holds.
+const fingerprint[T]() -> u32 = mix_layout[T](BASIS)
+
+private const mix_layout[T](start: u32) -> u32
+    val sized = mix(start, sizeof(T))
+    if const T::Kind == Kind.Struct
+        var h = sized
+        for const f in T::Fields
+            h = mix_layout[f::Type](mix(h, f.offset))
+        return h
+    elif const T::Kind == Kind.Array
+        var a: T
+        return mix_element(sized, a)
+    sized
+
+// The element of an array, named by the array's own type, which is how a type yields its element's.
+private const mix_element[E, const N: usize](h: u32, a: [N]E) -> u32 = mix_layout[E](mix(h, N))
+
+// Whether a `T` holds an address anywhere in it: a pointer, a reference, a string, a slice or a
+// function, in a field, a field's field or an array's element. An enum that carries data counts as
+// holding one, since what its variants carry is not looked into.
+const holds_pointer[T]() -> bool
+    if const T::Kind == Kind.Pointer || T::Kind == Kind.Ref || T::Kind == Kind.Weak || T::Kind == Kind.String || T::Kind == Kind.Slice || T::Kind == Kind.Fn || T::Kind == Kind.Trait || T::Kind == Kind.DataEnum
+        return true
+    elif const T::Kind == Kind.Struct || T::Kind == Kind.Tuple || T::Kind == Kind.Union
+        var found = false
+        for const f in T::Fields
+            found = found || holds_pointer[f::Type]()
+        return found
+    elif const T::Kind == Kind.Array
+        var a: T
+        return element_holds_pointer(a)
+    false
+
+private const element_holds_pointer[E, const N: usize](a: [N]E) -> bool = holds_pointer[E]()
+
+// The kernel's own `.shared` structure holds no pointer, and this is its fingerprint, which a board
+// takes into the one it offers.
+@assert(!holds_pointer[Shared](), "the kernel's .shared structure holds a pointer")
+const LAYOUT: u32 = fingerprint[Shared]()
+
+// Two fingerprints taken together, in order: a board's for what it places in `.shared`, with the
+// kernel's `LAYOUT`.
+const combine(a: u32, b: u32) -> u32 = mix(mix(BASIS, usize(a)), usize(b))
+
+// The meeting place of two images: the first offers its fingerprint, the other answers with its own.
+// It lies at the start of `.shared`, where each image finds it whatever else it lays out. Zeroed, it
+// holds no offer and no answer.
+struct Handshake
+    offered: Atomic[u32]        // 1 once `layout` holds the first image's fingerprint
+    layout: Atomic[u32]
+    answered: Atomic[u32]       // 1 once `reply` holds the other image's
+    reply: Atomic[u32]
+
+// The first image offers and then waits for the answer; the other waits for the offer, compares it with
+// its own and, having said whatever it has to say, answers. Each side then knows both fingerprints.
+impl Handshake
+    // The first image's side: offer `layout`. It runs before the other image's core is released.
+    offer(*self, layout: u32)
+        self.layout.store(layout, Ordering.Relaxed)
+        self.offered.store(1, Ordering.Release)
+
+    // The other image's side: wait for the offer and give it back.
+    await_offer(*self) -> u32
+        while self.offered.load(Ordering.Acquire) == 0 do ()
+        self.layout.load(Ordering.Relaxed)
+
+    // The other image's side again: answer with its own `layout`.
+    answer(*self, layout: u32)
+        self.reply.store(layout, Ordering.Relaxed)
+        self.answered.store(1, Ordering.Release)
+
+    // The first image's side again: wait for the answer and give it back.
+    await_answer(*self) -> u32
+        while self.answered.load(Ordering.Acquire) == 0 do ()
+        self.reply.load(Ordering.Relaxed)
