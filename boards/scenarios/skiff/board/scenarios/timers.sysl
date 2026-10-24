@@ -5,19 +5,21 @@ import skiff.kernel
 import skiff.kernel.{Port, Task, Timer, TimerError}
 
 // Software timers, on every core, run by R once the waits have reported, from its tick t. R creates the
-// core's timer service (priority 6, its body `kernel.serve_timers`) and a hog (7), creates five timers
-// and starts them all at t:
+// core's timer service (priority 6, its body `kernel.serve_timers`), creates five timers, starts them
+// all, and then, from t, the tick after the starts, runs a hog (7):
 //
-//   - beat, periodic, 3 ticks: called 5 times, due a period apart. The hog spins from t+7 to t+11 above
-//     the service, so the call due at t+9 runs late, and the next is still due at t+12: no drift.
+//   - beat, periodic, 3 ticks: called 5 times, due a period apart. The hog spins from t+6 to t+12 above
+//     the service, so a call due in between runs late, and the next is still due a period after it: no
+//     drift.
 //   - once, one-shot, 5: called once, and then inactive.
-//   - muted, periodic, 10: stopped at t+1, never called.
-//   - snooze, one-shot, 10: reset at t+2, so due 10 ticks after the reset, not at t+10.
-//   - stretch, periodic, 10: its period changed to 3 at t+1, so due 3 after the change and every 3 after.
+//   - muted, periodic, 30: stopped at t+1, never called.
+//   - snooze, one-shot, 30: reset at t+2, so due 30 ticks after the reset.
+//   - stretch, periodic, 30: its period changed to 3 at t+1, so due 3 after the change and every 3 after.
 //
 // Every callback checks that it runs on its timer's core, as that core's service task. The checks read
-// the deadlines the callbacks were given, not the clock, so they hold however late QEMU delivers a core's
-// tick. On a machine of several cores, core 0 may not start core 1's beat.
+// the deadlines the callbacks were given, and the ticks each command was sent between, never a tick
+// assumed: under multi-threaded TCG on a busy host a core's ticks come late and in bunches. On a machine
+// of several cores, core 0 may not start core 1's beat.
 
 private const SERVICE_PRIORITY: u8 = 6
 private const HOG_PRIORITY: u8 = 7
@@ -73,11 +75,11 @@ fired[P: Port](p: *P, t: *Timer, due: u32)
             if n + 1 == STRETCHES then accepted(t.stop(p, 0))
         val _ = stretch_calls[me].add(1)
 
-// The hog: above the service from t+7 to t+11, so a call due then waits.
+// The hog: above the service from t+6 to t+12, so a beat due in between waits.
 hog_task[P: Port](p: *P) -> never
     val me = kernel.here_id(p)
-    kernel.sleep_until(p, timers_start[me] + 7)
-    while kernel.ticks() - timers_start[me] < 11 do ()
+    kernel.sleep_until(p, timers_start[me] + 6)
+    while kernel.ticks() - timers_start[me] < 12 do ()
     kernel.exit(p)
 
 // R's software timers, on the running core.
@@ -86,25 +88,29 @@ timers[P: Port](p: *P, e: *Entries)
     services[me] = created(kernel.create(p, me, timer_stacks[me][0], e.timers, SERVICE_PRIORITY))
     accepted(kernel.create_timer(p, &beat[me], "beat", 3, true, e.fired))
     accepted(kernel.create_timer(p, &once[me], "once", 5, false, e.fired))
-    accepted(kernel.create_timer(p, &muted[me], "muted", 10, true, e.fired))
-    accepted(kernel.create_timer(p, &snooze[me], "snooze", 10, false, e.fired))
-    accepted(kernel.create_timer(p, &stretch[me], "stretch", 10, true, e.fired))
+    accepted(kernel.create_timer(p, &muted[me], "muted", 30, true, e.fired))
+    accepted(kernel.create_timer(p, &snooze[me], "snooze", 30, false, e.fired))
+    accepted(kernel.create_timer(p, &stretch[me], "stretch", 30, true, e.fired))
     if me == 1 then beat_published.store(1)
+    for x in [&beat[me], &once[me], &muted[me], &snooze[me], &stretch[me]]
+        accepted(x.start(p, 0))
     val t = kernel.ticks()
     timers_start[me] = t
     val _ = created(kernel.create(p, me, timer_stacks[me][1], e.hog, HOG_PRIORITY))
-    for x in [&beat[me], &once[me], &muted[me], &snooze[me], &stretch[me]]
-        accepted(x.start(p, 0))
     kernel.sleep_until(p, t + 1)
     accepted(muted[me].stop(p, 0))
+    val changed_from = kernel.ticks()
     accepted(stretch[me].change_period(p, 3, 0))
+    val changed_by = kernel.ticks()
     kernel.sleep_until(p, t + 2)
+    val reset_from = kernel.ticks()
     accepted(snooze[me].reset(p, 0))
+    val reset_by = kernel.ticks()
     var waited: u32 = 0
-    while !all_called(me) && waited < 60
+    while !all_called(me) && waited < 100
         kernel.sleep(p, 1)
         waited += 1
-    report_timers(p, me, t)
+    report_timers(p, me, changed_from, changed_by, reset_from, reset_by)
     if kernel.CORES > 1 && me == 0
         waited = 0
         while beat_published.load() == 0 && waited < 200
@@ -118,9 +124,10 @@ timers[P: Port](p: *P, e: *Entries)
 // Whether every timer that should be called has been, as often as it should.
 private all_called(me: u32) -> bool = beat_calls[me].load() >= BEATS && once_calls[me].load() >= 1 && snooze_calls[me].load() >= 1 && stretch_calls[me].load() >= STRETCHES
 
-// The verdicts, one line each.
-private report_timers[P: Port](p: *P, me: u32, t: u32)
-    var apart = beat_calls[me].load() == BEATS && beat_dues[me][0] - t >= 3 && beat_dues[me][0] - t <= 4
+// The verdicts, one line each. The change of period was sent on a tick from `changed_from` to
+// `changed_by`, and the reset on one from `reset_from` to `reset_by`.
+private report_timers[P: Port](p: *P, me: u32, changed_from: u32, changed_by: u32, reset_from: u32, reset_by: u32)
+    var apart = beat_calls[me].load() == BEATS
     for n in 1..<BEATS
         if beat_dues[me][n] != beat_dues[me][0] + 3 * n then apart = false
     if apart && late_beats[me].load() >= 1
@@ -135,9 +142,8 @@ private report_timers[P: Port](p: *P, me: u32, t: u32)
         say(p, "a timer stopped before it expired was never called\n")
     else
         say(p, "a stopped timer was called\n")
-    val reset_counted = snooze_calls[me].load() == 1 && snooze_due[me] - t >= 12
-    val first = stretch_dues[me][0] - t
-    val changed_counted = first >= 4 && first < 10 && stretch_dues[me][1] - stretch_dues[me][0] == 3
+    val reset_counted = snooze_calls[me].load() == 1 && within(snooze_due[me], reset_from + 30, reset_by + 30)
+    val changed_counted = within(stretch_dues[me][0], changed_from + 3, changed_by + 3) && stretch_dues[me][1] - stretch_dues[me][0] == 3
     if reset_counted && changed_counted
         say(p, "a reset timer and one whose period changed each counted from its command\n")
     else
@@ -146,6 +152,9 @@ private report_timers[P: Port](p: *P, me: u32, t: u32)
         say(p, "every timer callback ran in its own core's timer service\n")
     else
         say(p, "a timer callback ran outside its core's timer service\n")
+
+// Whether tick `at` is from `from` to `to`, across the wrap.
+private within(at: u32, from: u32, to: u32) -> bool = at - from <= to - from
 
 // A timer call the scenario cannot go on without.
 private accepted(result: Result[unit, TimerError])
