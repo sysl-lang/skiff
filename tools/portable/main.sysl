@@ -112,7 +112,9 @@ private var meeting: kernel.Handshake
 
 private handshake() -> bool
     meeting.offer(PLACED)
-    meeting.meet(PLACED) && meeting.answer() == PLACED && meeting.offered_layout() == PLACED
+    if meeting.await_offer() != PLACED then return false
+    meeting.answer(PLACED)
+    meeting.await_answer() == PLACED
 
 private var user_stack: [64]u32 = [0; 64]
 

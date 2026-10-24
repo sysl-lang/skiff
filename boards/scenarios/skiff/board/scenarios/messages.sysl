@@ -41,20 +41,14 @@ private[scenarios] var from_interrupt: [kernel.CORES]Queue[u32, 1] = [Queue.new(
 private var mail: [kernel.CORES]Queue[u32, 2] = [Queue.new("mail"); kernel.CORES]
 private var events = [Flags.new("events", 0); kernel.CORES]
 private[scenarios] var receivers: [kernel.CORES]Task
-private[scenarios] var hammers: [kernel.CORES]Task
 private var found_full: [kernel.CORES]Atomic[u32]
 private var sets_made: [kernel.CORES]Atomic[u32]
 
-// The objects the cores pass things through: in `.shared`, so filled in by core 0.
-@section(".shared")
-private var carried: Queue[u32, 4]
-@section(".shared")
-private var signals: Flags
-
-// Fill in the shared objects of the messages. Core 0 calls it before any other core starts.
+// Fill in the objects the cores pass things through, in `.shared` (`Across`). Core 0 calls it before any
+// other core starts.
 fill_shared_messages()
-    carried = Queue.new("carried")
-    signals = Flags.new("signals", 0)
+    common.carried = Queue.new("carried")
+    common.signals = Flags.new("signals", 0)
 
 // The receiver: the three scenarios' waiting side.
 receiver_task[P: Port](p: *P) -> never
@@ -131,17 +125,18 @@ private report_timeout[P: Port](p: *P, empty: bool, waited: u32, timeout: u32, w
 // The hammers' messages between the cores, after the semaphore's: core 0 sends, gives and sets, core 1
 // receives, takes and answers, neither waiting on the other's objects.
 across_cores[P: Port](p: *P, me: u32)
+    val c = common
     if me == 0
         for m in 0..<CARRIED
-            while !carried.try_send(p, m) do ()
+            while !c.carried.try_send(p, m) do ()
         for _ in 0..<CARRIED
-            val _ = kernel.notify_give(p, hammers[1])
+            val _ = kernel.notify_give(p, c.hammers[1])
         // Each answer must find the ping cleared: core 1 clears it as its wait ends, before it answers.
         var crossed: u32 = 0
         for _ in 0..<CARRIED
-            val _ = signals.set(p, PING)
-            var answer = signals.wait(p, PONG, false, true, 0)
-            while answer.is_none() do answer = signals.wait(p, PONG, false, true, 0)
+            val _ = c.signals.set(p, PING)
+            var answer = c.signals.wait(p, PONG, false, true, 0)
+            while answer.is_none() do answer = c.signals.wait(p, PONG, false, true, 0)
             if answer.unwrap() & PING != 0 then crossed += 1
         if crossed == 0
             say(p, "two cores passed event flags back and forth 1000 times\n")
@@ -153,12 +148,12 @@ across_cores[P: Port](p: *P, me: u32)
         var next: u32 = 0
         var in_order = true
         while next < CARRIED
-            carried.try_receive(p) match
+            c.carried.try_receive(p) match
                 Some(m) ->
                     if m != next then in_order = false
                     next += 1
                 None -> ()
-        if in_order && carried.waiting(p) == 0
+        if in_order && c.carried.waiting(p) == 0
             say(p, "received every message core 0 sent, in order\n")
         else
             say(p, "received core 0's messages out of order\n")
@@ -166,5 +161,5 @@ across_cores[P: Port](p: *P, me: u32)
         while taken < CARRIED do taken += kernel.notify_take(p, true, 0)
         if taken == CARRIED then say(p, "took every notification core 0 gave\n") else say(p, "took more notifications than core 0 gave\n")
         for _ in 0..<CARRIED
-            while signals.wait(p, PING, false, true, 0).is_none() do ()
-            val _ = signals.set(p, PONG)
+            while c.signals.wait(p, PING, false, true, 0).is_none() do ()
+            val _ = c.signals.set(p, PONG)

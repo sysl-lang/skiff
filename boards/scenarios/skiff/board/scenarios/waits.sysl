@@ -36,20 +36,12 @@ private var from_irq = [Semaphore.new("from an interrupt", 0, 1); kernel.CORES]
 private var middle_done: [kernel.CORES]Atomic[u32]
 private var woke: [kernel.CORES]Atomic[u32]
 private[scenarios] var waits_done: [kernel.CORES]Atomic[u32]
-private var arrived_hammers: Atomic[u32]
-private var done_hammers: Atomic[u32]
-private var refused_takes: Atomic[u32]
 
-// The two objects every core uses: in `.shared`, which start-up zeroes, so core 0 fills them in.
-@section(".shared")
-private var hammered: Semaphore
-@section(".shared")
-private var passed: Semaphore
-
-// Fill in the shared objects. Core 0 calls it before any other core starts.
+// Fill in the objects every core uses, in `.shared` (`Across`), which start-up zeroes. Core 0 calls it
+// before any other core starts.
 fill_shared_objects()
-    hammered = Semaphore.new("hammered", 0, 0xffff_ffff)
-    passed = Semaphore.new("passed", 0, 4)
+    common.hammered = Semaphore.new("hammered", 0, 0xffff_ffff)
+    common.passed = Semaphore.new("passed", 0, 4)
     fill_shared_messages()
     fill_shared_crossing()
     fill_shared_buffers()
@@ -135,34 +127,35 @@ interrupt[P: Port](p: *P)
 hammer_task[P: Port](p: *P) -> never
     val me = kernel.here_id(p)
     kernel.sleep_until(p, epochs[me] + 140)
-    val _ = arrived_hammers.add(1)
-    while arrived_hammers.load() < u32(kernel.CORES) do ()
+    val c = common
+    val _ = c.arrived_hammers.add(1)
+    while c.arrived_hammers.load() < u32(kernel.CORES) do ()
     for _ in 0..<ROUNDS
-        val _ = hammered.give(p)
-        val _ = hammered.give(p)
-        if !hammered.try_take(p)
-            val _ = refused_takes.add(1)
-    val _ = done_hammers.add(1)
+        val _ = c.hammered.give(p)
+        val _ = c.hammered.give(p)
+        if !c.hammered.try_take(p)
+            val _ = c.refused_takes.add(1)
+    val _ = c.done_hammers.add(1)
     if me == 0
-        while done_hammers.load() < u32(kernel.CORES) do ()
-        val left = hammered.available(p)
-        if left == ROUNDS * u32(kernel.CORES) && refused_takes.load() == 0
+        while c.done_hammers.load() < u32(kernel.CORES) do ()
+        val left = c.hammered.available(p)
+        if left == ROUNDS * u32(kernel.CORES) && c.refused_takes.load() == 0
             say(p, "two cores' gives and takes left the shared count exact\n")
         else
             say(p, "the shared count is ")
             kernel.write_dec(p, left)
             p.write(" with ".bytes)
-            kernel.write_dec(p, refused_takes.load())
+            kernel.write_dec(p, c.refused_takes.load())
             p.write(" takes refused, not ".bytes)
             kernel.write_dec(p, ROUNDS * u32(kernel.CORES))
             p.write("\n".bytes)
         for _ in 0..<PASSED
-            while !passed.give(p) do ()
+            while !c.passed.give(p) do ()
     else if me == 1
         var taken: u32 = 0
         while taken < PASSED
-            if passed.try_take(p) then taken += 1
-        if passed.available(p) == 0
+            if c.passed.try_take(p) then taken += 1
+        if c.passed.available(p) == 0
             say(p, "took every unit core 0 gave\n")
         else
             say(p, "took the units core 0 gave and found more\n")

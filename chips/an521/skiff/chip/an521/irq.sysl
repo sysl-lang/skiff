@@ -2,12 +2,14 @@ module skiff.chip.an521
 
 // The SSE-200's interrupts, as far as the board uses them: the vector table's chip half, which the link
 // script puts straight after the architecture's sixteen words. Both cores run from the one table, and
-// each core's NVIC is its own. Interrupt 3, timer 0's, goes to the board's `skiff_timer0`, and interrupt
-// 6, MHU0's, to the doorbell's handler (mhu.sysl); the others up to it stop the machine, as an unhandled
-// system exception does. No device past it is ever enabled.
+// each core's NVIC is its own. Interrupts 3 and 4, timer 0's and timer 1's, go to the board's
+// `skiff_timer0`, and interrupt 6, MHU0's, to the doorbell's handler (mhu.sysl); the others up to it stop
+// the machine, as an unhandled system exception does. No device past it is ever enabled.
 
-// Timer 0's interrupt. The board raises it from software (the timer itself is never started).
+// Timer 0's and timer 1's interrupts. The board raises them from software (the timers themselves are
+// never started): one core's, or one for each core where the board gives each core a timer of its own.
 const TIMER0_IRQ: u32 = 3
+const TIMER1_IRQ: u32 = 4
 
 asm
     [thumb]
@@ -16,7 +18,7 @@ asm
         ".word skiff_exception"
         ".endr"
         ".word skiff_timer0"
-        ".word skiff_exception"
+        ".word skiff_timer0"
         ".word skiff_exception"
         ".word skiff_an521_mhu0"
         ".text"

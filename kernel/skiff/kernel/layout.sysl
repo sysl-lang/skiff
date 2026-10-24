@@ -77,23 +77,25 @@ struct Handshake
     answered: Atomic[u32]       // 1 once `reply` holds the other image's
     reply: Atomic[u32]
 
+// The first image offers and then waits for the answer; the other waits for the offer, compares it with
+// its own and, having said whatever it has to say, answers. Each side then knows both fingerprints.
 impl Handshake
     // The first image's side: offer `layout`. It runs before the other image's core is released.
     offer(*self, layout: u32)
         self.layout.store(layout, Ordering.Relaxed)
         self.offered.store(1, Ordering.Release)
 
-    // The other image's side: wait for the offer, answer with `layout`, and say whether the two agree.
-    meet(*self, layout: u32) -> bool
+    // The other image's side: wait for the offer and give it back.
+    await_offer(*self) -> u32
         while self.offered.load(Ordering.Acquire) == 0 do ()
+        self.layout.load(Ordering.Relaxed)
+
+    // The other image's side again: answer with its own `layout`.
+    answer(*self, layout: u32)
         self.reply.store(layout, Ordering.Relaxed)
         self.answered.store(1, Ordering.Release)
-        self.layout.load(Ordering.Relaxed) == layout
-
-    // The fingerprint the first image offered, once offered.
-    offered_layout(*self) -> u32 = self.layout.load(Ordering.Acquire)
 
     // The first image's side again: wait for the answer and give it back.
-    answer(*self) -> u32
+    await_answer(*self) -> u32
         while self.answered.load(Ordering.Acquire) == 0 do ()
         self.reply.load(Ordering.Relaxed)

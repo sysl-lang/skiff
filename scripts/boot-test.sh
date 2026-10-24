@@ -104,9 +104,9 @@ $(protection_expected 0)"
 # on purpose: it
 # reports the fault on its own console and stops. Core 0 sees it stopped, takes more ticks, finds that
 # the time base counted its own ticks and none of core 1's, and stops the machine with status 0.
-an521_core0_expected="skiff: hello from core 0
-skiff: .shared holds the shared state
-skiff: core 0 tick 1
+an521_core0_greeting="skiff: hello from core 0
+skiff: .shared holds the shared state"
+an521_core0_run="skiff: core 0 tick 1
 skiff: core 0 tick 2
 skiff: core 0 tick 3
 $(tasks_expected 0)
@@ -123,12 +123,12 @@ skiff: core 0 an unprivileged task on core 1 took a unit core 0 gave and set fla
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
 skiff: core 0 time base agrees"
-an521_core1_expected="skiff: hello from core 1
-skiff: core 1 tick 1
+an521_core0_expected="$an521_core0_greeting
+$an521_core0_run"
+an521_core1_ticks="skiff: core 1 tick 1
 skiff: core 1 tick 2
-skiff: core 1 tick 3
-$(tasks_expected 1)
-$(waits_expected 1)
+skiff: core 1 tick 3"
+an521_core1_run="$(waits_expected 1)
 $(messages_expected 1)
 skiff: core 1 took every unit core 0 gave
 skiff: core 1 received every message core 0 sent, in order
@@ -143,6 +143,23 @@ skiff: core 1 the low task gave up the priority core 0's task lent it with the m
 $(protection_expected 1)
 skiff: core 1 an unprivileged task took a unit core 0 gave, through its grant
 skiff: core 1 fault BusFault"
+an521_core1_expected="skiff: hello from core 1
+$an521_core1_ticks
+$(tasks_expected 1)
+$an521_core1_run"
+
+# The AN521 as two images (boards/qemu-an521 with `--features core0` and `--features core1`): each core
+# runs its own, built from the one board program, and the two meet at the handshake, agreeing on the
+# layout of `.shared`, before either creates a task. Then the run is the one image's, except that core
+# 1's image uses its FPU, so its floating-point tasks run too.
+split_core0_expected="$an521_core0_greeting
+skiff: core 0 and core 1 agree on the layout of .shared
+$an521_core0_run"
+split_core1_expected="skiff: hello from core 1
+skiff: core 1 agrees with core 0 on the layout of .shared
+$an521_core1_ticks
+$(tasks_expected 1 "f32 registers survived the switches")
+$an521_core1_run"
 
 failed=0
 
@@ -196,11 +213,11 @@ verdict() {
     fi
 }
 
-# build <target> <board> <image>. The standard library supplies the runtime helpers a freestanding link
+# build <target> <board> <image> [<features>]. The standard library supplies the runtime helpers a freestanding link
 # needs (the 64-bit divide, `__aeabi_mem*`, soft floating point), so nothing else is linked.
 build() {
-    if ! "$compiler" build $opt --target "$1" -o "$3" "$root/boards/$2"; then
-        echo "FAIL: $2 did not build"
+    if ! "$compiler" build $opt --target "$1" ${4:+--features "$4"} -o "$3" "$root/boards/$2"; then
+        echo "FAIL: $2 ${4:-} did not build"
         exit 1
     fi
 }
@@ -230,5 +247,20 @@ if [ -z "$missing" ]; then
     check "mps2-an521 core 1" "$scratch/an521-core1.log" "$an521_core1_expected"
 fi
 verdict mps2-an521 0
+
+# The AN521 as two images: core 0's is the kernel QEMU starts, and core 1's is loaded beside it, where
+# core 0 points core 1 when it releases it.
+core0_image="$scratch/qemu-an521-core0.elf"
+core1_image="$scratch/qemu-an521-core1.elf"
+build thumb-freestanding-soft qemu-an521 "$core0_image" core0
+build thumb-freestanding qemu-an521 "$core1_image" core1
+rm -f "$scratch/an521-split-core1.log"
+run "$scratch/an521-split-core0.log" -M mps2-an521 -accel tcg,thread=multi -kernel "$core0_image" \
+    -device loader,file="$core1_image" -serial mon:stdio -serial file:"$scratch/an521-split-core1.log"
+check "mps2-an521 two images, core 0" "$scratch/an521-split-core0.log" "$split_core0_expected"
+if [ -z "$missing" ]; then
+    check "mps2-an521 two images, core 1" "$scratch/an521-split-core1.log" "$split_core1_expected"
+fi
+verdict "mps2-an521 two images" 0
 
 exit $failed

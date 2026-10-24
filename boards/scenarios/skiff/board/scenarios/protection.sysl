@@ -69,12 +69,6 @@ private var vaults: [kernel.CORES][16]u8
 private var pings = [Semaphore.new("ping", 0, 1); kernel.CORES]
 private var marks = [Flags.new("marks", 0); kernel.CORES]
 
-// What a task of core 1 takes and sets, given and waited for by core 0.
-@section(".shared")
-private var across: Semaphore
-@section(".shared")
-private var crossed: Flags
-
 // An unprivileged task's stack is one PMSAv7 region: 2 KiB, aligned to its size. A kernel call runs on
 // the caller's stack, and at -O0 the deepest takes more than 1 KiB.
 private const USER_TASKS: usize = 8
@@ -82,10 +76,11 @@ private const USER_TASKS: usize = 8
 private var user_stacks: [kernel.CORES][USER_TASKS][STACK_WORDS]u32
 private var own_stacks: [kernel.CORES][3][STACK_WORDS]u32
 
-// Fill in the shared objects. Core 0 calls it before any other core starts.
+// Fill in what a task of core 1 takes and sets, given and waited for by core 0, in `.shared` (`Across`).
+// Core 0 calls it before any other core starts.
 private[scenarios] fill_shared_protection()
-    across = Semaphore.new("across", 0, 1)
-    crossed = Flags.new("crossed", 0)
+    common.across = Semaphore.new("across", 0, 1)
+    common.crossed_bits = Flags.new("crossed", 0)
 
 // R's part, on the running core: create the tasks, judge each scenario as it falls due, and return once
 // every verdict is in. `code` is the code every unprivileged task runs, and `uart` the registers of the
@@ -121,7 +116,7 @@ protection[P: Port](p: *P, e: *Entries, code: Region, uart: Region)
     val trapper = unprivileged(p, stacks[5], &trapper_task, [code, shared], [])
     val masker = unprivileged(p, stacks[6], &masker_task, [code, shared], [])
     if kernel.CORES > 1 && me == 1
-        val _ = unprivileged(p, stacks[7], &crosser_task, [code, shared], [Grant.Units(&across), Grant.Bits(&crossed)])
+        val _ = unprivileged(p, stacks[7], &crosser_task, [code, shared], [Grant.Units(&common.across), Grant.Bits(&common.crossed_bits)])
 
     await_finished(p, x, WORKER_DONE, t + 2)
     if x.round_trips == 5
@@ -157,14 +152,14 @@ protection[P: Port](p: *P, e: *Entries, code: Region, uart: Region)
     else
         say(p, "a task that broke its protection ran on, or one that did not was stopped\n")
     if kernel.CORES > 1 && me == 0
-        val _ = across.give(p)
-        if crossed.wait(p, 1, false, false, 300).is_some()
+        val _ = common.across.give(p)
+        if common.crossed_bits.wait(p, 1, false, false, 300).is_some()
             say(p, "an unprivileged task on core 1 took a unit core 0 gave and set flags core 0 waited on, through its grants\n")
         else
             say(p, "the unprivileged task on core 1 never set the flags core 0 waited on\n")
     else if kernel.CORES > 1 && me == 1
         // Core 1 stops once R returns: the crosser has had its say first.
-        val _ = crossed.wait(p, 1, false, false, 300)
+        val _ = common.crossed_bits.wait(p, 1, false, false, 300)
         kernel.sleep(p, 2)
 
 // An unprivileged task at priority 2; a map these scenarios give must fit.

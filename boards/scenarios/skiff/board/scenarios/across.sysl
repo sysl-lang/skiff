@@ -1,0 +1,55 @@
+module skiff.board.scenarios
+
+import sysl.sync.Atomic
+import skiff.kernel
+import skiff.kernel.{Channel, Flags, Mutex, Pool, Queue, Semaphore, Task}
+
+// Everything the scenarios share between cores, in one structure: the objects two cores use and the
+// counters and handles each core reads of the other's. It lives in `.shared`, so it holds handles and
+// numbers, never a pointer (`kernel.holds_pointer`), and its layout is one structure's, the same in
+// every image built from the board, which is what a two-image build's fingerprint checks.
+//
+// The board places it: in `.shared`, in its system description, and hands it over with `share` in every
+// image before any task runs. Core 0 fills its objects in (`fill_shared_objects`) before any other core
+// starts; start-up has zeroed the rest.
+struct Across
+    // The hammers (waits.sysl).
+    hammered: Semaphore
+    passed: Semaphore
+    arrived_hammers: Atomic[u32]
+    done_hammers: Atomic[u32]
+    refused_takes: Atomic[u32]
+    // Each core's hammer, which its own core creates and the other notifies (messages.sysl, crossing.sysl).
+    hammers: [kernel.CORES]Task
+    // The messages between the cores (messages.sysl).
+    carried: Queue[u32, 4]
+    signals: Flags
+    // The waits across cores and the inversion (crossing.sysl).
+    handed: Semaphore
+    turns: Mutex
+    posted: Queue[u32, 2]
+    raised: Flags
+    ping: Semaphore
+    pong: Semaphore
+    contended: Mutex
+    stage: Atomic[u32]             // the number of the wait core 1 is about to make
+    turns_held: Atomic[u32]        // whether core 0 holds `turns`
+    crossed: Atomic[u32]           // how many hammers have finished their waits across cores
+    contended_held: Atomic[u32]    // whether the owner holds `contended`
+    worker_done: Atomic[u32]       // whether the worker has finished
+    // The buffers core 0 streams to core 1 (buffers.sysl); `origins[n]` is where in `stream` core 0
+    // filled buffer `n`, as a distance from the pool's start.
+    stream: Pool[STREAM_BUFFERS, 256]
+    streamed: Channel[2]
+    origins: [STREAMED]usize
+    // What core 1's unprivileged crosser takes and sets (protection.sysl).
+    across: Semaphore
+    crossed_bits: Flags
+
+// The board's `Across`, in `.shared`.
+private[scenarios] var common: *Across
+
+// Use `objects`, in `.shared`, for everything the cores share. Each image calls it before its first task
+// is created.
+share(objects: *Across)
+    common = objects

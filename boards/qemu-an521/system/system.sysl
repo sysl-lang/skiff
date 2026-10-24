@@ -1,0 +1,76 @@
+module system
+
+import skiff.board.scenarios
+import skiff.kernel
+import skiff.kernel.Handshake
+
+// The AN521's system description: what core 0's image and core 1's agree on when the board is built as
+// two (the `core0` and `core1` features), and what the one image follows too.
+//
+//   - Where each image lies and where `.shared` lies. The link scripts say it again (core0.ld,
+//     core1.ld); each image checks at boot that its script put `.shared` at `SHARED_BASE`.
+//   - What lies in `.shared`: one `System`, the handshake at its head, then the kernel's own structure.
+//     Neither holds a pointer, which the build checks, and their layout fingerprint, `LAYOUT`, is what
+//     the two images compare in the handshake before either runs a task.
+//   - Which core owns each peripheral and each interrupt. One owner each: a resource listed for two
+//     cores is a build error. In two images each core takes what it owns and nothing else.
+
+// Where `.shared` begins, in both images.
+const SHARED_BASE: usize = 0x1018_0000
+
+// Where core 1's image begins, with its vector table, which core 0 points core 1 at.
+const CORE1_VECTORS: usize = 0x100C_0000
+
+// Everything a board places in `.shared` beside the kernel's structure.
+struct System
+    handshake: Handshake            // first, so that each image finds it whatever the rest is
+    scenarios: scenarios.Across     // what the scenarios share between the cores
+
+@assert(!kernel.holds_pointer[System](), "the system description's .shared holds a pointer")
+
+// The layout both images must have: `System`'s and the kernel's.
+const LAYOUT: u32 = kernel.combine(kernel.fingerprint[System](), kernel.LAYOUT)
+
+// The one `System`, in a section of its own that both link scripts put first in `.shared`.
+@section(".shared.system")
+var placed: System
+
+// What a core may own.
+enum Resource: u8
+    Uart0 = 0       // UART 0, core 0's console
+    Uart1 = 1       // UART 1, core 1's console
+    Timer0 = 2      // timer 0's interrupt, which the scenarios raise from software
+    Timer1 = 3      // timer 1's interrupt, the same for another core
+    Doorbell0 = 4   // MHU0's interrupt as core 0's NVIC takes it: the doorbell rung for core 0
+    Doorbell1 = 5   // the same, for core 1
+    Security = 6    // the SSE-200's system control and peripheral protection: core 1's release, the UARTs' access
+
+struct Owned
+    what: Resource
+    core: u32
+
+// Which core owns what.
+val OWNERS: [7]Owned = [
+    Owned(Resource.Uart0, 0),
+    Owned(Resource.Timer0, 0),
+    Owned(Resource.Doorbell0, 0),
+    Owned(Resource.Security, 0),
+    Owned(Resource.Uart1, 1),
+    Owned(Resource.Timer1, 1),
+    Owned(Resource.Doorbell1, 1),
+]
+
+// Whether every resource in `OWNERS` has one owner.
+private const owned_once() -> bool
+    for i in 0..<OWNERS.len
+        for j in (i + 1)..<OWNERS.len
+            if OWNERS[i].what == OWNERS[j].what then return false
+    true
+
+@assert(owned_once(), "a peripheral or an interrupt is owned by two cores (system.sysl's OWNERS): each has one owner")
+
+// Whether core `core` owns `what`.
+const owns(core: u32, what: Resource) -> bool
+    for o in OWNERS
+        if o.what == what && o.core == core then return true
+    false
