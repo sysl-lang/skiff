@@ -49,16 +49,11 @@ private var trickled: [kernel.CORES]u8
 private var piped_full: [kernel.CORES]Atomic[u32]
 private var framed_full: [kernel.CORES]Atomic[u32]
 
-// The buffers between the cores: in `.shared`, so filled in by core 0.
-@section(".shared")
-private var poured: StreamBuffer[64]
-@section(".shared")
-private var posted_frames: MessageBuffer[64]
-
-// Fill in the shared objects of the streams. Core 0 calls it before any other core starts.
+// Fill in the buffers between the cores, in `.shared` (`Across`). Core 0 calls it before any other core
+// starts.
 fill_shared_streams()
-    poured = StreamBuffer.new("poured", ACROSS_LEVEL)
-    posted_frames = MessageBuffer.new("posted frames")
+    common.poured = StreamBuffer.new("poured", ACROSS_LEVEL)
+    common.posted_frames = MessageBuffer.new("posted frames")
 
 // What timer 0's interrupt writes: the next byte of `trickle`.
 private[scenarios] trickle_from_interrupt[P: Port](p: *P, me: u32)
@@ -182,13 +177,13 @@ private[scenarios] streams_across[P: Port](p: *P, me: u32)
             val n = if ACROSS - written < chunk.len then ACROSS - written else chunk.len
             for i in 0..<n
                 chunk[i] = across_byte(written + i)
-            written += poured.send(p, chunk[..<n], FOREVER)
+            written += common.poured.send(p, chunk[..<n], FOREVER)
         var frame: [16]u8
         for n in 0u32..<ACROSS_MESSAGES
             val length = usize(1 + n % 16)
             for i in 0..<length
                 frame[i] = u8((n + u32(i)) & 0xff)
-            val _ = posted_frames.send(p, frame[..<length], FOREVER)
+            val _ = common.posted_frames.send(p, frame[..<length], FOREVER)
     else if me == 1
         var got: [20]u8
         var read: usize = 0
@@ -196,8 +191,8 @@ private[scenarios] streams_across[P: Port](p: *P, me: u32)
         while read < ACROSS
             // The last bytes may be fewer than the trigger level: wait for no more than are left.
             if ACROSS - read < ACROSS_LEVEL
-                val _ = poured.set_trigger(p, ACROSS - read)
-            val n = poured.receive(p, got[..], FOREVER)
+                val _ = common.poured.set_trigger(p, ACROSS - read)
+            val n = common.poured.receive(p, got[..], FOREVER)
             for i in 0..<n
                 if got[i] != across_byte(read + i) then exact = false
             read += n
@@ -207,7 +202,7 @@ private[scenarios] streams_across[P: Port](p: *P, me: u32)
             say(p, "read bytes core 0 wrote into a stream out of order\n")
         var whole = true
         for n in 0u32..<ACROSS_MESSAGES
-            val length = posted_frames.receive(p, got[..], FOREVER)
+            val length = common.posted_frames.receive(p, got[..], FOREVER)
             if length != usize(1 + n % 16) then whole = false
             for i in 0..<length
                 if got[i] != u8((n + u32(i)) & 0xff) then whole = false

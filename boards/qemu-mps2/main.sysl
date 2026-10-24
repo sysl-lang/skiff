@@ -81,7 +81,7 @@ skiff_main() -> never
     if kernel.shared_within(usize(&__shared_start), usize(&__shared_end))
         board.write("skiff: .shared holds the shared state\n".bytes)
     kernel.shared_bounds(usize(&__shared_start), usize(&__shared_end))
-    scenarios.share(&objects)
+    scenarios.share(&objects, false)
     armv7m.set_irq_priority(mps2.TIMER0_IRQ, armv7m.KERNEL_IRQ_PRIORITY)
     armv7m.enable_irq(mps2.TIMER0_IRQ)
     scenarios.create_tasks(&board, 0, &entries)

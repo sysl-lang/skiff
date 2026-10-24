@@ -46,10 +46,6 @@ private var stretch_dues: [kernel.CORES][STRETCHES]u32
 private var stretch_calls: [kernel.CORES]Atomic[u32]
 private var strays: [kernel.CORES]Atomic[u32]
 
-// Whether core 1's beat has been created, for core 0 to try commanding it.
-@section(".shared")
-private var beat_published: Atomic[u32]
-
 // The timers' callback, on whichever timer expired.
 fired[P: Port](p: *P, t: *Timer, due: u32)
     val me = kernel.here_id(p)
@@ -91,7 +87,7 @@ timers[P: Port](p: *P, e: *Entries)
     accepted(kernel.create_timer(p, &muted[me], "muted", 30, true, e.fired))
     accepted(kernel.create_timer(p, &snooze[me], "snooze", 30, false, e.fired))
     accepted(kernel.create_timer(p, &stretch[me], "stretch", 30, true, e.fired))
-    if me == 1 then beat_published.store(1)
+    if me == 1 then common.beat_published.store(1)
     for x in [&beat[me], &once[me], &muted[me], &snooze[me], &stretch[me]]
         accepted(x.start(p, 0))
     val t = kernel.ticks()
@@ -111,9 +107,10 @@ timers[P: Port](p: *P, e: *Entries)
         kernel.sleep(p, 1)
         waited += 1
     report_timers(p, me, changed_from, changed_by, reset_from, reset_by)
-    if kernel.CORES > 1 && me == 0
+    // Core 1's timers are its own: in two images, core 0 cannot even name them.
+    if kernel.CORES > 1 && me == 0 && !apart
         waited = 0
-        while beat_published.load() == 0 && waited < 200
+        while common.beat_published.load() == 0 && waited < 200
             kernel.sleep(p, 1)
             waited += 1
         if beat[1].start(p, 0) == Err(TimerError.Remote) && beat[1].stop(p, 0) == Err(TimerError.Remote)

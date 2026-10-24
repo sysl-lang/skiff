@@ -2,7 +2,7 @@ module skiff.board.scenarios
 
 import sysl.sync.Atomic
 import skiff.kernel
-import skiff.kernel.{Channel, Flags, Mutex, Pool, Queue, Semaphore, Task}
+import skiff.kernel.{Channel, Flags, MessageBuffer, Mutex, Pool, Queue, Semaphore, StreamBuffer, Task}
 
 // Everything the scenarios share between cores, in one structure: the objects two cores use and the
 // counters and handles each core reads of the other's. It lives in `.shared`, so it holds handles and
@@ -45,11 +45,27 @@ struct Across
     // What core 1's unprivileged crosser takes and sets (protection.sysl).
     across: Semaphore
     crossed_bits: Flags
+    // The stream and the message buffer core 0 writes and core 1 reads (streams.sysl).
+    poured: StreamBuffer[64]
+    posted_frames: MessageBuffer[64]
+    // Whether core 1's beat has been created, for core 0 to try commanding it (timers.sysl).
+    beat_published: Atomic[u32]
+    // Core 1's far ticker, which core 0 controls a step at a time, the step, and core 1's verdict
+    // (control.sysl).
+    far_task: Atomic[u32]
+    control_stage: Atomic[u32]
+    far_verdict: Atomic[u32]
 
 // The board's `Across`, in `.shared`.
 private[scenarios] var common: *Across
 
-// Use `objects`, in `.shared`, for everything the cores share. Each image calls it before its first task
-// is created.
-share(objects: *Across)
+// Whether each core runs an image of its own. A core can then name nothing of another core's that is not
+// in `.shared`: what lies in its own image under another core's number is its own copy, which nothing
+// uses.
+private[scenarios] var apart: bool
+
+// Use `objects`, in `.shared`, for everything the cores share; `own_images` says whether each core runs
+// an image of its own. Each image calls it before its first task is created.
+share(objects: *Across, own_images: bool)
     common = objects
+    apart = own_images

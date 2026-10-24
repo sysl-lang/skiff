@@ -196,10 +196,11 @@ $an521_core1_run"
 # The AN521 as two images (boards/qemu-an521 with `--features core0` and `--features core1`): each core
 # runs its own, built from the one board program, and the two meet at the handshake, agreeing on the
 # layout of `.shared`, before either creates a task. Then the run is the one image's, except that core
-# 1's image uses its FPU, so its floating-point tasks run too.
+# 1's image uses its FPU, so its floating-point tasks run too, and that core 0 cannot name core 1's
+# timers at all, which are core 1's own.
 split_core0_expected="$an521_core0_greeting
 skiff: core 0 and core 1 agree on the layout of .shared
-$an521_core0_run"
+$(echo "$an521_core0_run" | grep -v -x -F "skiff: core 0 may not command a timer of core 1")"
 split_core1_expected="skiff: hello from core 1
 skiff: core 1 agrees with core 0 on the layout of .shared
 $an521_core1_ticks
