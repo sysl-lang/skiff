@@ -58,6 +58,7 @@ enum TaskError
     Remote          // the task is another core's and that core runs: only the owner changes its tasks
     NoCore          // the machine has no such core
     Idle            // the idle task is never deleted
+    Stack           // the stack has no room below the task's error trace (traces.sysl)
 
 // What a slot holds.
 enum TaskState
@@ -385,15 +386,18 @@ private[kernel] add_task[P: Port](p: *P, core: u32, stack: []u32, entry: *extern
     if usize(core) >= option_cores then return Err(TaskError.NoCore)
     val me = here_id(p)
     if remote(core, me, core_state(core)) then return Err(TaskError.Remote)
+    if stack.len <= TRACE_WORDS then return Err(TaskError.Stack)
     val c = core_at(core)
-    // Painted before its first frame is laid on top, and before the mask: no task runs on it yet.
+    // Painted before its trace and its first frame are laid on top, and before the mask: no task runs on
+    // it yet.
     paint(stack)
+    val frames = reserve_trace(stack)
     val state = p.mask()
     val result = c.sched.free_slot() match
         Some(i) ->
             // The map goes in before the task can run: a reused slot never keeps its last task's.
             set_map(p, &c.maps[i], user, stack, regions, grants)
-            c.sched.add_on(i, stack, p.new_context(stack, entry), priority)
+            c.sched.add_on(i, stack, p.new_context(frames, entry), priority)
             // Its note is the new task's before the task can run, and before anyone has the handle.
             renew_note(p, core, i, c.sched.handle(core, i))
             if core == me && c.sched.outranks_running(i) then p.request_switch()
@@ -486,12 +490,14 @@ yield_now[P: Port](p: *P)
 run[P: Port](p: *P, idle_stack: []u32, idle: *extern() -> never) -> never
     val c = here(p)
     if c.sched.started() then panic("skiff: the core already runs its tasks")
+    if idle_stack.len <= TRACE_WORDS then panic("skiff: the idle stack has no room below its error trace")
     paint(idle_stack)
+    val frames = reserve_trace(idle_stack)
     val _ = p.mask()
     c.sched.free_slot() match
         Some(i) ->
             set_map(p, &c.maps[i], false, idle_stack, [], [])
-            c.sched.add_on(i, idle_stack, p.new_context(idle_stack, idle), IDLE_PRIORITY)
+            c.sched.add_on(i, idle_stack, p.new_context(frames, idle), IDLE_PRIORITY)
         None -> panic("skiff: no slot left for the idle task")
     val sp = c.sched.first()
     protect_running(p, c)

@@ -20,6 +20,9 @@ import skiff.kernel.{Port, Violation}
 // r0. The SVC handler made the processor fill the frame's FPU half on entry, so a task that uses the FPU
 // gets its s0-s15 and FPSCR back too.
 //
+// **`svc 3` answers the running task's error trace** in r0 and returns to the task at once
+// (traces.sysl).
+//
 // **Any other trap stops the task**, as a fault would: an SVC number the kernel does not take, a call
 // frame outside the task's stack (it moved its stack pointer somewhere else first), a call inside a call,
 // or a return with no call in flight. An unprivileged task reaches nothing privileged except through
@@ -93,6 +96,10 @@ call_entry[P: Port](p: *P, frame: *u32, registers: *u32) -> Option[usize]
             *exc_return = EXC_RETURN_THREAD_PSP
             set_thread_privilege(false)
             return Some(at - FRAME_BYTES)
+    else if *svc == SVC_TRACE
+        // The running task's error trace, in the r0 it resumes with (traces.sysl).
+        frame[0] = u32(usize(kernel.running_trace(p)))
+        return Some(at)
     else if *svc == SVC_RETURN && kernel.end_call(p)
         val r = &resumes[core][slot]
         val call: *u32 = ptr_cast(r.frame)

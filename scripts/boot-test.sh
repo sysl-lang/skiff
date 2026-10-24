@@ -95,6 +95,13 @@ skiff: core $1 a timer stopped before it expired was never called
 skiff: core $1 a reset timer and one whose period changed each counted from its command
 skiff: core $1 every timer callback ran in its own core's timer service"
 }
+# Error traces, every core (boards/scenarios, traces.sysl): an interrupt's failure kept to the core's
+# handlers' trace, the interrupted task's untouched; two unprivileged tasks failing in turn, each finding
+# only its own sites in its trace.
+traces_expected() {
+    echo "skiff: core $1 an interrupt's failure kept to its own error trace and left the task's as it was
+skiff: core $1 two unprivileged tasks took turns failing 20 times, each keeping its own error trace"
+}
 # Protection, every core (boards/scenarios, protection.sysl): a map the MPU cannot hold refused at
 # creation; an unprivileged task's round trips with a privileged one; a task reading kernel memory, a
 # stack overflow and a null load each stopped alone and reported; calls with buffers, grants or handles
@@ -126,6 +133,7 @@ $(messages_expected 0)
 $(timers_expected 0)
 $(control_expected 0)
 $(stats_expected 0)
+$(traces_expected 0)
 $(protection_expected 0)"
 
 # The AN521's two cores run one image, each greeting and ticking on the UART of its own number, then
@@ -169,6 +177,7 @@ $(control_expected 0)
 skiff: core 0 asked core 1 to suspend, resume, re-prioritize and stop a task of its own, and core 1 did
 $(stats_expected 0)
 skiff: core 0 is refused another core's task statistics and high-water marks
+$(traces_expected 0)
 $(protection_expected 0)
 skiff: core 0 an unprivileged task on core 1 took a unit core 0 gave and set flags core 0 waited on, through its grants
 skiff: core 0 sees core 1 stopped
@@ -197,6 +206,7 @@ $(timers_expected 1)
 $(control_expected 1)
 skiff: core 1 core 0 suspended, resumed, re-prioritized and stopped a task of core 1 through its inbox
 $(stats_expected 1)
+$(traces_expected 1)
 $(protection_expected 1)
 skiff: core 1 an unprivileged task took a unit core 0 gave, through its grant
 skiff: core 1 fault BusFault"

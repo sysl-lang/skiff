@@ -569,9 +569,8 @@ implements both traits and the board delegates.
   task's own stack, a return with no call in flight, a call made inside a call.
 - A privileged task may trap too, and every buffer check passes for it; it has no grants, and no need
   to trap: it calls the kernel directly.
-- **An unprivileged task's code may touch nothing outside its map**, the runtime's included: a board
-  that runs unprivileged tasks builds with `error_traces = false`, since a freestanding image keeps one
-  error return trace for the whole program, which every statement handling a failure reads and restores.
+- **An unprivileged task's code may touch nothing outside its map**, the runtime's included: its error
+  return trace is in its own stack ("Error traces").
 
 ### Grants: how a task reaches objects, on its core or another
 
@@ -594,6 +593,32 @@ implements both traits and the board delegates.
   taken out of the map by the give or send that hands it on: the map always allows exactly the buffers
   the task holds, never the pool's other buffers or its records. A pool is refused as a grant at
   creation if the unit cannot hold one of its buffers exactly.
+
+### Error traces
+
+Every `?` whose failure arm is taken records its site in an error return trace, and every statement
+handling a failure reads the trace and puts it back. On a freestanding target the runtime asks the hook
+`sysl_error_trace_here` which trace that is, from wherever the `?` runs (a task, a handler, unprivileged
+code), and the board supplies the hook. One image-wide word cannot answer: each core's switch would
+overwrite the other's, and behind the MPU an unprivileged task cannot read the kernel's data.
+
+- **Every task has a trace of its own, at the top of its own stack**: `TRACE_WORDS` words the kernel takes
+  from the stack in `create`, `create_unprivileged` and `run` (the idle task), empties there before the
+  task can run, and lays the task's frames below. A stack with no room below its trace is
+  `TaskError.Stack`. The task's map holds its whole stack (region 0), so its trace is inside the map; no
+  map holds another task's stack unless its creator grants it, so no task reaches another's trace. A
+  stopped task's frame goes below its trace, which keeps what it held.
+- **Each core has two traces of its own in kernel data**: one for its handlers and the kernel code they
+  run, one for what it runs before its tasks. Only privileged code reaches them.
+- **Which one is running is read from the processor**, never from a shared word (`running_trace(p)`,
+  `handler_trace(p)`; the arch's `error_trace_here`): in handler mode, the core's handlers' trace; in
+  privileged thread mode, the running task's (or the boot trace before the core runs its tasks), read
+  from the kernel's data; in unprivileged thread mode, the running task's, which `svc 3` answers. On
+  Armv7-M and Armv8-M an unprivileged MRS reads IPSR and CONTROL, and nothing that says which task runs:
+  MSP, PSP, the masks and Armv8-M's stack limits read as zero. The trap costs a few dozen cycles, paid
+  only on a failure path: a `?` that succeeds asks nothing.
+- **An interrupt's failure never touches the interrupted task's trace**, and a task's failure is still in
+  its trace when it is switched back in, however many others failed meanwhile.
 
 ### Options
 

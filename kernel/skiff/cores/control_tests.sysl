@@ -217,4 +217,4 @@ offline_core()
     assert_eq(priority_on(&m, b), 2)
     assert(suspended_on(&m, a), "suspended")
 
-private var stacks_for_idle: [1][64]u32
+private var stacks_for_idle: [1][128]u32

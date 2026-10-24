@@ -9,7 +9,7 @@ private idle_body() -> never
     loop
         ()
 
-private var stacks: [4][64]u32
+private var stacks: [4][128]u32
 
 // A task at `priority` on core 0 of `r`.
 private task_at(r: *Recorder, i: usize, priority: u8) -> Task = create(r, 0, stacks[i], &idle_body, priority).unwrap()

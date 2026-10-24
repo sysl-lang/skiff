@@ -132,6 +132,7 @@ interrupt[P: Port](p: *P)
     val _ = from_irq[me].give(p)
     val _ = from_interrupt[me].try_send(p, kernel.ticks() - epochs[me])
     trickle_from_interrupt(p, me)
+    traces_from_interrupt(p, me)
 
 // A hammer, at tick 155 on every core of several: give twice, take once, `ROUNDS` times, all cores at
 // once. Then core 0 passes `PASSED` units to core 1, which takes them without waiting.

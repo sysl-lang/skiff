@@ -214,3 +214,19 @@ others call `memcpy` and `memset`.
 
 Status: open.
 
+## FINDINGS 11 — one store word per image
+
+sysl 0.5.1 reached a freestanding image's error return trace through one image-wide pointer,
+`sysl_error_trace_current`, which `use_error_trace` sets and every statement handling a failure reads.
+That cannot work for skiff: on the AN521 each core's context switch overwrites the other core's choice, so
+a task records into whichever store the other core made current last; and an unprivileged task cannot
+read the word at all, since it lies in the kernel's data, outside its map, and PMSAv8 has no
+privileged-write, unprivileged-read permission that would let the kernel map it read-only and still
+write it. The first unprivileged task whose failure path ran faulted on the read (`sysl_trace`), so both
+boards built with `error_traces = false`.
+
+Status: fixed in sysl 0.5.2 by a weak hook, `sysl_error_trace_here() -> *ErrorTraceStore`, which the
+runtime calls on every failure path and every read of the trace and an OS overrides. skiff's hook (DESIGN
+"Error traces") answers each core's handlers' trace in handler mode, and the running task's, kept at the
+top of its own stack, in thread mode; both boards build with traces on.
+

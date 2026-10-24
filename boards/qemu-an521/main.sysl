@@ -5,6 +5,7 @@
 // stops it alone. Core 0 sees it stopped, ticks on, checks that the time base counted its ticks and no
 // others, and stops the machine with status 0.
 
+import sysl.debug.ErrorTraceStore
 import sysl.sync.Atomic
 import skiff.arch.armv7m
 import skiff.arch.armv8m
@@ -162,6 +163,7 @@ private task_r() -> never
     scenarios.stats(&board, &entries)
     val me = an521.core_id()
     val code = Region(usize(&__code_start), usize(&__code_end) - usize(&__code_start), Access.Execute)
+    scenarios.traces(&board, &entries, code)
     scenarios.protection(&board, &entries, code, Region(an521.uart_base(me), an521.UART_STRIDE, Access.Device))
     if me == 1
         val nothing: *Word = ptr_cast(NOWHERE)
@@ -218,6 +220,11 @@ board_call(frame: *u32, registers: *u32) -> usize
 board_serve() -> usize
     var board = Board()
     kernel.serve_call(&board)
+
+// The error return trace every `?` records into, on either core: that core's handlers', its code's before
+// its tasks, or its running task's (armv7m traces.sysl).
+@export("sysl_error_trace_here")
+board_trace() -> *ErrorTraceStore = armv7m.error_trace_here(&Board())
 
 // The first task's privilege, from the SVC that starts it.
 @export("skiff_first_privilege")

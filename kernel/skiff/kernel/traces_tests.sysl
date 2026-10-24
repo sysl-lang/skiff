@@ -1,0 +1,115 @@
+module skiff.kernel
+@tests
+
+import sysl.debug.{error_trace, use_error_trace, ErrorTraceStore}
+
+// Error traces on the host: each task's at the top of its own stack, emptied whenever a task takes the
+// stack, its frames below it, and the core's own for its handlers and for before its tasks.
+
+private body() -> never
+    loop
+        ()
+
+@align(32)
+private var trace_stacks: [3][128]u32
+
+// The words of a test stack below its trace.
+private const BELOW: usize = 128 - TRACE_WORDS
+
+// The first word of the trace at the top of stack `n`: its count, which an empty trace holds 0 in.
+private count_word(n: usize) -> u32 = trace_stacks[n][BELOW]
+
+private fail(n: int) -> Result[int, string] = if n > 0 then Err("failed") else Ok(n)
+
+private hand_on(n: int) -> Result[int, string]
+    val v = fail(n)?
+    Ok(v)
+
+@test("a task's trace is the top of its stack, emptied at creation; its frames go below it")
+reserved_at_create()
+    var r = recorder(1, 0)
+    for k in 0..<128
+        trace_stacks[0][k] = 0x1234_5678
+    val t = create(&r, 0, trace_stacks[0], &body, 1).unwrap()
+    assert_eq(count_word(0), 0)
+    assert_eq(r.context_words, BELOW)
+    assert_eq(here(&r).sched.tasks[t.slot()].stack, usize(&trace_stacks[0][0]))
+    assert_eq(here(&r).sched.tasks[t.slot()].stack_bytes, 128 * 4)
+    assert_eq(trace_stacks[0][BELOW - 1], STACK_PAINT)
+    here(&r).sched.first()
+    assert_eq(usize(running_trace(&r)), usize(&trace_stacks[0][BELOW]))
+
+@test("an unprivileged task's trace lies inside its map: its stack, region 0, holds it")
+trace_in_map()
+    var r = recorder(1, 0)
+    val t = create_unprivileged(&r, 0, trace_stacks[1], &body, 1, [], []).unwrap()
+    val m = &here(&r).maps[t.slot()]
+    here(&r).sched.first()
+    val at = usize(running_trace(&r))
+    assert(at >= m.regions[0].base && at + sizeof(ErrorTraceStore) <= m.regions[0].base + m.regions[0].bytes, "inside region 0")
+    assert(may_reach(&r, here(&r), t.slot(), at, sizeof(ErrorTraceStore), true), "a buffer the task may write")
+
+@test("a reused slot or stack starts with an empty trace, whatever the last task left in it")
+emptied_on_reuse()
+    var r = recorder(1, 0)
+    val t = create(&r, 0, trace_stacks[0], &body, 1).unwrap()
+    trace_stacks[0][BELOW] = 5
+    assert(delete(&r, t).is_ok(), "deleted")
+    val again = create(&r, 0, trace_stacks[0], &body, 1).unwrap()
+    assert_eq(again.slot(), t.slot())
+    assert_eq(count_word(0), 0)
+
+@test("each running task answers its own trace, and the core's handlers and boot code their own")
+one_per_task()
+    var r = recorder(1, 0)
+    assert_eq(usize(running_trace(&r)), usize(running_trace(&r)))
+    val boot = usize(running_trace(&r))
+    val handler = usize(handler_trace(&r))
+    assert(boot != handler, "before its tasks, the core's boot trace, not its handlers'")
+    val a = create(&r, 0, trace_stacks[0], &body, 2).unwrap()
+    here(&r).sched.first()
+    assert(current(&r) == a, "a runs")
+    val in_a = usize(running_trace(&r))
+    val b = create(&r, 0, trace_stacks[1], &body, 3).unwrap()
+    val _ = switch_context(&r, 0)
+    assert(current(&r) == b, "b runs")
+    val in_b = usize(running_trace(&r))
+    assert_eq(in_a, usize(&trace_stacks[0][BELOW]))
+    assert_eq(in_b, usize(&trace_stacks[1][BELOW]))
+    assert(in_b != boot && in_b != handler && in_a != handler, "every trace apart")
+    assert_eq(usize(handler_trace(&r)), handler)
+
+@test("a failure recorded in one task's trace never shows in another's, and is still there on its return")
+failures_apart()
+    var r = recorder(1, 0)
+    val a = create(&r, 0, trace_stacks[0], &body, 2).unwrap()
+    here(&r).sched.first()
+    val own = use_error_trace(running_trace(&r))
+    // A statement handling a failure puts the trace back when it completes, so each task looks inside
+    // the arm that handles its failure.
+    hand_on(1) match
+        Ok(_) -> assert(false, "a fails")
+        Err(_) ->
+            assert_eq(error_trace().len(), 2)
+            val b = create(&r, 0, trace_stacks[1], &body, 3).unwrap()
+            val _ = switch_context(&r, 0)
+            assert(current(&r) == b, "b runs")
+            val _ = use_error_trace(running_trace(&r))
+            assert_eq(error_trace().len(), 0)
+            fail(1) match
+                Ok(_) -> assert(false, "b fails")
+                Err(_) -> assert_eq(error_trace().len(), 1)
+            sleep(&r, 5)
+            val _ = switch_context(&r, 0)
+            assert(current(&r) == a, "a runs again")
+            val _ = use_error_trace(running_trace(&r))
+            assert_eq(error_trace().len(), 2)
+    val _ = use_error_trace(own)
+
+@test("a stack with no room below its trace is refused, and nothing is created")
+stack_too_small()
+    var r = recorder(1, 0)
+    val before = here(&r).sched.free_slot()
+    assert(create(&r, 0, trace_stacks[2][..<TRACE_WORDS], &body, 1) == Err(TaskError.Stack), "only a trace's room")
+    assert(here(&r).sched.free_slot() == before, "no slot taken")
+    assert(create(&r, 0, trace_stacks[2][..<TRACE_WORDS + 1], &body, 1).is_ok(), "one word more")

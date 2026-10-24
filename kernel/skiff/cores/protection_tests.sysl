@@ -13,7 +13,7 @@ private body() -> never
         ()
 
 @align(32)
-private var ustacks: [2][64]u32
+private var ustacks: [2][128]u32
 @align(32)
 private var code: [64]u8
 

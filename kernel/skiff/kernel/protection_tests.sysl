@@ -10,8 +10,8 @@ private body() -> never
         ()
 
 @align(32)
-private var ustacks: [3][64]u32
-private var pstacks: [3][64]u32
+private var ustacks: [3][128]u32
+private var pstacks: [3][128]u32
 
 // What the tasks here are granted: a page they write, a page they only read, code, a device.
 @align(32)
@@ -59,7 +59,7 @@ map_built()
     assert(m.user && !m.calling, "unprivileged, outside a call")
     assert_eq(m.len, 5)
     assert_eq(m.regions[0].base, usize(&ustacks[0][0]))
-    assert_eq(m.regions[0].bytes, 256)
+    assert_eq(m.regions[0].bytes, 512)
     assert(m.regions[0].access == Access.ReadWrite, "its stack, read-write")
     assert_eq(m.regions[2].base, addr(notice))
     assert_eq(m.slots[1].first, u32(addr(page) & 0xffff_ffff))
@@ -77,7 +77,7 @@ map_refused()
     val before = here(&r).sched.free_slot()
     assert(create_unprivileged(&r, 0, ustacks[0], &body, 2, [code_region, odd], []) == Err(MapError.Bad(1, RegionError.Unaligned)), "an unaligned region")
     assert(create_unprivileged(&r, 0, ustacks[0], &body, 2, [code_region, region(page, Access.Read), region(notice, Access.Read)], []) == Err(MapError.TooManyRegions), "more than the unit holds")
-    assert(create_unprivileged(&r, 0, ustacks[0][1..<64], &body, 2, [], []) == Err(MapError.Stack(RegionError.Unaligned)), "a stack the unit cannot hold")
+    assert(create_unprivileged(&r, 0, ustacks[0][1..<128], &body, 2, [], []) == Err(MapError.Stack(RegionError.Unaligned)), "a stack the unit cannot hold")
     assert(create_unprivileged(&r, 0, ustacks[0], &body, 2, [region(page, Access.Read), Region(addr(page) + 32, 32, Access.ReadWrite)], []) == Err(MapError.Overlap(0, 1)), "two regions sharing bytes")
     assert(create_unprivileged(&r, 0, ustacks[0], &body, 2, [Region(usize(&ustacks[0][8]), 32, Access.Read)], []) == Err(MapError.OverlapsStack(0)), "a region in the stack")
     assert(create_unprivileged(&r, 0, ustacks[0], &body, 0, [], []) == Err(MapError.Refused(TaskError.Priority)), "the idle task's priority")
@@ -228,7 +228,7 @@ call_frames()
     val stack = usize(&ustacks[0][0])
     assert(!begin_call(&r, usize(&pstacks[0][32]), 32, 32), "a frame outside the stack")
     assert(!begin_call(&r, stack + 64, 32, 32), "room for the call in the reserve")
-    assert(!begin_call(&r, stack + 240, 32, 32), "a frame past the top")
+    assert(!begin_call(&r, stack + 496, 32, 32), "a frame past the top")
     assert(!end_call(&r), "a return with no call")
     val frame: *usize = ptr_cast(stack + 192)
     frame[0] = usize(task_handle(0, 0, 1).bits)
@@ -265,7 +265,7 @@ fault_stops_task()
     val p = privileged_task(&r, 0, 2)
     run_alone(&r, u)
     val before = r.switches
-    assert(stop_running(&r, Violation.Breach) == Some(usize(&ustacks[0][0]) + 256), "the top of its stack")
+    assert(stop_running(&r, Violation.Breach) == Some(usize(&ustacks[0][0]) + 512 - TRACE_WORDS * 4), "the top of its frames, below its trace")
     assert(recorded(&r, "skiff: core 0 stopped a task that broke its memory protection\n"), "the report")
     assert_eq(r.switches, before + 1)
     assert(state(&r, u) == Ok(TaskState.Stopped), "stopped")

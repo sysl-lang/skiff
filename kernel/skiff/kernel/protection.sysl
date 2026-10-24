@@ -196,8 +196,8 @@ running_stack[P: Port](p: *P) -> (usize, usize)
 
 // For a fault handler: stop the running task for good, for having done `why`, and report it on the
 // core's console. A switch away from it is asked for; the task keeps its slot, and its handle answers
-// `Stopped`. Answers the address just past the top of its stack, where the port may lay a frame to
-// return on until the switch, or None when the running task cannot be stopped (the idle task, or no task
+// `Stopped`. Answers the address just past the top of its frames, below its error trace, where the port
+// may lay a frame to return on until the switch, or None when the running task cannot be stopped (the idle task, or no task
 // before the core runs its first): the port then stops the core.
 stop_running[P: Port](p: *P, why: Violation) -> Option[usize]
     val c = here(p)
@@ -214,7 +214,7 @@ stop_running[P: Port](p: *P, why: Violation) -> Option[usize]
     p.write(" stopped a task that ".bytes)
     p.write(violation_text(why).bytes)
     p.write("\n".bytes)
-    Some(c.sched.tasks[i].stack + c.sched.tasks[i].stack_bytes)
+    Some(usize(trace_at(c.sched.tasks[i].stack, c.sched.tasks[i].stack_bytes)))
 
 // What a stopped task did, as its report says it.
 private violation_text(why: Violation) -> string = why match

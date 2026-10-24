@@ -124,7 +124,7 @@ private body() -> never
     loop
         ()
 
-private var stacks: [12][64]u32
+private var stacks: [12][128]u32
 
 // A task at `priority` on core `core`, on stack `n`.
 task_on(m: *Machine, core: u32, n: usize, priority: u8) -> Task = kernel.create(m, core, stacks[n], &body, priority).unwrap()

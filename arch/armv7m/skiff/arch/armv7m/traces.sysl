@@ -1,0 +1,43 @@
+module skiff.arch.armv7m
+
+import sysl.debug.ErrorTraceStore
+import skiff.kernel
+import skiff.kernel.Port
+
+// The error return trace every `?` records into: the port's half of kernel traces.sysl, for the board's
+// `sysl_error_trace_here` hook. Which trace is running is read from the processor itself, never from a
+// word every core and every task would share:
+//
+//   - in handler mode (IPSR not 0), the running core's handlers' trace;
+//   - in privileged thread mode (CONTROL.nPRIV clear), the running task's, or before the core runs its
+//     tasks the core's own, both read from the kernel's data, which privileged code reaches;
+//   - in unprivileged thread mode, the running task's, answered by `svc 3`: the task's code reads no
+//     kernel data, and its trace lies at the top of its own stack, inside its map.
+//
+// IPSR and CONTROL are what an unprivileged MRS reads, on Armv7-M and Armv8-M alike; MSP, PSP, PRIMASK,
+// BASEPRI and FAULTMASK, and Armv8-M's stack limits, read as zero there, and no register a task may read
+// says which task it is. Nothing here fails, allocates or records a failure.
+
+// The SVC that answers the running task's trace in r0 (calls.sysl).
+private[armv7m] const SVC_TRACE: u8 = 3
+
+// The trace of whatever runs on this core now.
+error_trace_here[P: Port](p: *P) -> *ErrorTraceStore
+    var ipsr: u32 = 0
+    var control: u32 = 0
+    asm
+        [thumb]
+            "mrs {ipsr}, ipsr"
+            "mrs {control}, control"
+            out ipsr : reg
+            out control : reg
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+    if (ipsr & 0x1ff) != 0 then return kernel.handler_trace(p)
+    if (control & CONTROL_NPRIV) == 0 then return kernel.running_trace(p)
+    var at: usize = 0
+    asm
+        [thumb]
+            "svc 3"
+            out at : "r0"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+    ptr_cast(at)
