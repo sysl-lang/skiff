@@ -118,14 +118,14 @@ private suspended_waits[P: Port](p: *P, e: *Entries, me: u32)
     val timed = spawn(p, e, me, TIMED, 3)
     val given = spawn(p, e, me, GIVEN, 3)
     val kept = spawn(p, e, me, KEPT, 3)
-    kernel.sleep(p, 1)
-    var waiting = is_in(p, timed, TaskState.Blocked) && is_in(p, given, TaskState.Blocked) && is_in(p, kept, TaskState.Blocked)
+    var waiting = within(p, is_in(p, timed, TaskState.Blocked) && is_in(p, given, TaskState.Blocked) && is_in(p, kept, TaskState.Blocked))
     for t in [timed, given, kept]
         waiting = waiting && kernel.suspend(p, t).is_ok()
     val _ = given_on[me].give(p)
-    kernel.sleep(p, 6)
-    // The timed wait has timed out and the given one was given: both ready, neither run.
-    var held_back = is_in(p, timed, TaskState.Ready) && is_in(p, given, TaskState.Ready) && !ran(me, TIMED) && !ran(me, GIVEN)
+    // The timed wait times out and the given one was given: both ready, neither run.
+    var held_back = within(p, is_in(p, timed, TaskState.Ready)) && is_in(p, given, TaskState.Ready)
+    kernel.sleep(p, 2)
+    held_back = held_back && !ran(me, TIMED) && !ran(me, GIVEN)
     // Resumed while it waits, the third waits on.
     val _ = kernel.resume(p, kept)
     kernel.sleep(p, 2)
@@ -147,10 +147,9 @@ private suspended_waits[P: Port](p: *P, e: *Entries, me: u32)
 
 private priority_resorts[P: Port](p: *P, e: *Entries, me: u32)
     val high = spawn(p, e, me, SORT_HIGH, 2)
-    kernel.sleep(p, 1)
+    var right = within(p, is_in(p, high, TaskState.Blocked))
     val low = spawn(p, e, me, SORT_LOW, 1)
-    kernel.sleep(p, 2)
-    var right = is_in(p, high, TaskState.Blocked) && is_in(p, low, TaskState.Blocked)
+    right = right && within(p, is_in(p, low, TaskState.Blocked))
     right = right && kernel.set_priority(p, low, 3).is_ok()
     val _ = sorted[me].give(p)
     right = right && within(p,first_taker[me].load() != 0) && first_taker[me].load() == u32(SORT_LOW)
@@ -165,8 +164,7 @@ private boost_kept[P: Port](p: *P, e: *Entries, me: u32)
     val holder = spawn(p, e, me, HOLDER, 1)
     var right = within(p,held[me].holder() == holder)
     val _ = spawn(p, e, me, CONTENDER, 3)
-    kernel.sleep(p, 1)
-    right = right && kernel.priority(p, holder) == Ok(3)
+    right = right && within(p, kernel.priority(p, holder) == Ok(3))
     right = right && kernel.set_priority(p, holder, 2).is_ok() && kernel.priority(p, holder) == Ok(3)
     right = right && kernel.set_priority(p, holder, 1).is_ok() && kernel.priority(p, holder) == Ok(3)
     release[me].store(1)
@@ -179,8 +177,7 @@ private boost_kept[P: Port](p: *P, e: *Entries, me: u32)
 
 private stop_waiter[P: Port](p: *P, e: *Entries, me: u32)
     val stoppee = spawn(p, e, me, STOPPEE, 3)
-    kernel.sleep(p, 1)
-    var right = is_in(p, stoppee, TaskState.Blocked)
+    var right = within(p, is_in(p, stoppee, TaskState.Blocked))
     right = right && kernel.stop(p, stoppee).is_ok() && is_in(p, stoppee, TaskState.Stopped)
     val _ = stopped_on[me].give(p)
     kernel.sleep(p, 2)
@@ -252,7 +249,8 @@ subject_task[P: Port](p: *P) -> never
             kernel.sleep(p, 1)
     var given = false
     if role == TIMED
-        given = timed_on[me].take(p, 3)
+        // Long enough that R has suspended it first, however late its ticks come.
+        given = timed_on[me].take(p, 10)
     elif role == GIVEN
         given = given_on[me].take(p, FOREVER)
     elif role == KEPT
