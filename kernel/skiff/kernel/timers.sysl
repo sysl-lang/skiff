@@ -184,10 +184,10 @@ impl TimerService
     // Add active timer `t`, whose `expiry` is set, as at tick `now`: behind every timer due no later.
     // An expiry before `now` is overdue and comes before any that is not.
     private insert(*self, t: *Timer, now: u32)
-        val due_in = i32(t.expiry - now)
+        val due_in = i32.wrap(t.expiry -% now)
         var before: *Timer = null
         var at = self.head
-        while at != null && i32(at.expiry - now) <= due_in
+        while at != null && i32.wrap(at.expiry -% now) <= due_in
             before = at
             at = at.next
         t.next = at
@@ -216,7 +216,7 @@ impl TimerService
     private[kernel] wait_from(*self, now: u32) -> u32
         if self.head == null then return FOREVER
         val e = self.head.expiry
-        if expired(e, now) then 0 else e - now
+        if expired(e, now) then 0 else e -% now
 
     // Call every timer whose expiry has come at `now`, soonest first. A periodic timer is put back a
     // period after the expiry it is called for, and called again in the same turn if that has come too;
@@ -228,7 +228,7 @@ impl TimerService
             if t == null then return
             val due = t.expiry
             if t.periodic
-                t.expiry = due + t.period
+                t.expiry = due +% t.period
                 self.insert(t, now)
             else
                 t.active = false
@@ -244,6 +244,6 @@ impl TimerService
             t.active = false
             return
         if c.op == PERIOD then t.period = c.period
-        t.expiry = c.sent + t.period
+        t.expiry = c.sent +% t.period
         t.active = true
         self.insert(t, c.sent)

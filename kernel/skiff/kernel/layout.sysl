@@ -20,7 +20,7 @@ private const BASIS: u32 = 2166136261
 private const PRIME: u32 = 16777619
 
 // The hash `h` with `value` taken into it.
-private const mix(h: u32, value: usize) -> u32 = (h ^ u32(value & 0xffff_ffff)) * PRIME
+private const mix(h: u32, value: usize) -> u32 = (h ^ u32(value & 0xffff_ffff)) *% PRIME
 
 // The layout fingerprint of `T`: its size, then for each field its offset, its size and, for a
 // structure or an array, the fingerprint of what it holds.

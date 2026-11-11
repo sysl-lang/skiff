@@ -10,4 +10,4 @@ ticks() -> u32 = time_base().load(Ordering.Acquire)
 
 // Whether `deadline` has come at `now`. Both are tick counts that wrap, and a deadline is never more than
 // 2^31 ticks away, so their difference read as signed says which side of `now` the deadline is on.
-expired(deadline: u32, now: u32) -> bool = i32(deadline - now) <= 0
+expired(deadline: u32, now: u32) -> bool = i32.wrap(deadline -% now) <= 0

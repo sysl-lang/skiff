@@ -49,7 +49,7 @@ sleep(count: u32)
 
 // Sleep until tick `tick`; not at all if it has come.
 sleep_until(tick: u32)
-    val left = i32(tick - ticks())
+    val left = i32.wrap(tick -% ticks())
     if left > 0 then sleep(u32(left))
 
 // The time base.

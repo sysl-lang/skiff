@@ -282,7 +282,7 @@ impl Scheduler
         self.unlink(i)
         self.tasks[i].state = TaskState.Blocked
         self.tasks[i].on = Some(on)
-        if timeout == FOREVER then self.tasks[i].later = NONE else self.add_timeout(i, now + timeout)
+        if timeout == FOREVER then self.tasks[i].later = NONE else self.add_timeout(i, now +% timeout)
 
     // A wait of task `i` has ended: make it ready, out of the timeout list. Answers whether it outranks
     // the running task.
@@ -466,7 +466,7 @@ exit[P: Port](p: *P) -> never
 sleep[P: Port](p: *P, count: u32)
     val c = running_core(p)
     val state = p.mask()
-    if count == FOREVER then c.sched.sleep_forever() else c.sched.sleep(ticks() + count)
+    if count == FOREVER then c.sched.sleep_forever() else c.sched.sleep(ticks() +% count)
     p.request_switch()
     p.restore(state)
 

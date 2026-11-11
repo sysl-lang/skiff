@@ -39,7 +39,7 @@ struct CoreStats derives Eq
 private[kernel] charge[P: Port](p: *P, c: *Core)
     if !c.sched.started() then return
     val now = p.run_count()
-    val spent = u64(now - c.counted_at)
+    val spent = u64(now -% c.counted_at)
     c.counted_at = now
     c.elapsed += spent
     val i = usize(c.sched.running)

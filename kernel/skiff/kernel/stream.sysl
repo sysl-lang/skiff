@@ -37,7 +37,7 @@ const MESSAGE_PREFIX: usize = 4
 private[kernel] ticks_left(timeout: u32, deadline: u32) -> u32
     if timeout == FOREVER then return FOREVER
     val now = ticks()
-    if expired(deadline, now) then 0 else deadline - now
+    if expired(deadline, now) then 0 else deadline -% now
 
 // A ring of up to `N` bytes. `N` is at least 1.
 struct StreamBuffer[const N: usize]
@@ -58,7 +58,7 @@ impl[const N: usize] StreamBuffer[N]
     // many bytes were written, from 0 to all of them. Only a task may wait; with a timeout of 0 nothing
     // waits.
     send[P: Port](*self, p: *P, data: []const u8, timeout: u32) -> usize
-        val deadline = ticks() + timeout
+        val deadline = ticks() +% timeout
         var sent: usize = 0
         var last = false
         loop
@@ -87,7 +87,7 @@ impl[const N: usize] StreamBuffer[N]
     // waits, and whatever is there is read whatever the level.
     receive[P: Port](*self, p: *P, buf: []u8, timeout: u32) -> usize
         if buf.len == 0 then return 0
-        val deadline = ticks() + timeout
+        val deadline = ticks() +% timeout
         var last = false
         loop
             var l = self.w.lock.on(p)
@@ -214,7 +214,7 @@ impl[const N: usize] MessageBuffer[N]
     send[P: Port](*self, p: *P, message: []const u8, timeout: u32) -> bool
         val need = message.len + MESSAGE_PREFIX
         if message.len == 0 || need > N then return false
-        val deadline = ticks() + timeout
+        val deadline = ticks() +% timeout
         var last = false
         loop
             var l = self.s.w.lock.on(p)
@@ -243,7 +243,7 @@ impl[const N: usize] MessageBuffer[N]
     // or 0 if the timeout came first or `buf` is too short for it, which leaves it to be received. Only
     // a task may wait; with a timeout of 0 nothing waits.
     receive[P: Port](*self, p: *P, buf: []u8, timeout: u32) -> usize
-        val deadline = ticks() + timeout
+        val deadline = ticks() +% timeout
         var last = false
         loop
             var l = self.s.w.lock.on(p)

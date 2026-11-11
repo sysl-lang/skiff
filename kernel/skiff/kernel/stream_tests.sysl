@@ -25,12 +25,12 @@ private record_of(t: Task) -> *Waiter = waiter(waiter_index(t.core(), t.slot()))
 // Bytes `from`, `from + 1`, … into `buf`.
 private count_into(buf: []u8, from: u8)
     for i in 0..<buf.len
-        buf[i] = from + u8(i)
+        buf[i] = from +% u8.wrap(i)
 
 // Whether `buf` holds `from`, `from + 1`, ….
 private counts(buf: []const u8, from: u8) -> bool
     for i in 0..<buf.len
-        if buf[i] != from + u8(i) then return false
+        if buf[i] != from +% u8.wrap(i) then return false
     true
 
 // ---- stream buffers ----
@@ -68,12 +68,12 @@ stream_many_wraps()
     for round in 0..<200
         count_into(chunk[..], next)
         val n = s.try_send(&r, chunk[..<1 +round % 5])
-        next += u8(n)
+        next +%= u8.wrap(n)
         val m = s.try_receive(&r, got[..<1 +round % 3])
         if !counts(got[..<m], expect) then ok = false
-        expect += u8(m)
+        expect +%= u8.wrap(m)
     assert(ok, "in order")
-    assert_eq(usize(next - expect), s.available(&r))
+    assert_eq(usize(next -% expect), s.available(&r))
 
 @test("zero bytes are sent and received at once, with nothing waiting")
 stream_zero_length()

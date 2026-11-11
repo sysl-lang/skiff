@@ -22,8 +22,8 @@ struct Core
 impl Core
     // Take one tick: count it, and on core 0 advance the time base `time` that every core reads.
     tick(*self, time: *Atomic[u32])
-        self.ticks.store(self.ticks.load(Ordering.Relaxed) + 1, Ordering.Relaxed)
-        if self.keeps_time() then time.store(time.load(Ordering.Relaxed) + 1, Ordering.Release)
+        self.ticks.store(self.ticks.load(Ordering.Relaxed) +% 1, Ordering.Relaxed)
+        if self.keeps_time() then time.store(time.load(Ordering.Relaxed) +% 1, Ordering.Release)
 
     // Whether this core advances the time base: core 0 alone, so that one tick is one period on every
     // core however many of them tick.
