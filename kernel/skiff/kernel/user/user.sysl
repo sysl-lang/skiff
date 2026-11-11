@@ -1,6 +1,7 @@
 module skiff.kernel.user
 
 import sysl.encoding.Plain
+import sysl.raw.ptr_cast
 import skiff.kernel
 import skiff.kernel.{Action, Buffer, Task}
 

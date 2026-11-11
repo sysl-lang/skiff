@@ -1,6 +1,7 @@
 module skiff.kernel.user
 @tests
 
+import sysl.raw.ptr_cast
 import sysl.sync.Atomic
 import skiff.kernel
 import skiff.kernel.{Access, Cache, Channel, Doorbell, Grant, Isolation, Pool, Port, Protection, Queue, Region, RegionError, RunCounter, Semaphore, Slot}
@@ -89,7 +90,7 @@ private body() -> never
 
 @test("each user function makes its call and reads its answer; a refusal is an Err naming why")
 user_calls()
-    var s = Semaphore.new("s", 0, 1)
+    s = Semaphore.new("s", 0, 1)
     val t = kernel.create_unprivileged(&desk, 0, stack, &body, 2, [Region(usize(&said[0]), 32, Access.Read)], [Grant.Units(&s)]).unwrap()
     val _ = kernel.here(&desk).sched.first()
     assert(current() == t, "its own handle")
@@ -124,14 +125,16 @@ private host_stack(local: usize) -> Region
     val base = (local & ~usize(0xfff)) - 0x4000
     Region(base, 0x8000, Access.ReadWrite)
 
-// A pool off the host's stack, which plays the task's.
+// The objects the tasks are granted, in module storage: a task holds its grants for as long as it lives,
+// and a pool's buffers must lie off the host's stack, which plays the task's.
 private var pool: Pool[2, 32] = Pool.new("pool", 1)
 private var ch: Channel[1] = Channel.new("ch")
+private var q: Queue[Reading, 2] = Queue.new("q")
+private var s: Semaphore
 
 @test("a queue, a pool and a channel granted: messages sent and received, a buffer taken, passed, collected and given back")
 user_grants()
-    var q: Queue[Reading, 2] = Queue.new("q")
-    var s = Semaphore.new("s", 0, 1)
+    s = Semaphore.new("s", 0, 1)
     var here_now: u32 = 0
     val _ = kernel.create_unprivileged(&desk, 0, stack, &body, 2, [host_stack(usize(&here_now))], [Grant.Messages(&q), Grant.Buffers(&pool), Grant.Carries(&ch, &pool), Grant.Units(&s)]).unwrap()
     val _ = kernel.here(&desk).sched.first()

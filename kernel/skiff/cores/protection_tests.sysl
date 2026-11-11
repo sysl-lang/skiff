@@ -1,6 +1,7 @@
 module skiff.cores
 @tests
 
+import sysl.raw.ptr_cast
 import skiff.kernel
 import skiff.kernel.{Access, Action, Grant, Region, Semaphore, TaskState}
 
@@ -16,6 +17,9 @@ private body() -> never
 private var ustacks: [2][128]u32
 @align(32)
 private var code: [64]u8
+
+// The object the task is granted, in module storage: a task holds its grants for as long as it lives.
+private var s: Semaphore
 
 // Make call `number` as the running task of the acting core, through the frame a trap would leave.
 private call(m: *Machine, n: usize, number: usize, a0: usize, a1: usize) -> usize
@@ -34,7 +38,7 @@ private call(m: *Machine, n: usize, number: usize, a0: usize, a1: usize) -> usiz
 @test("a task on core 1 waits on an object core 0 gives, through its own grant and core 1's inbox")
 grant_across()
     var m = machine()
-    var s = Semaphore.new("s", 0, 1)
+    s = Semaphore.new("s", 0, 1)
     val u = kernel.create_unprivileged(&m, 1, ustacks[0], &body, 2, [Region(usize(&code[0]), 64, Access.Execute)], [Grant.Units(&s)]).unwrap()
     val _ = task_on(&m, 1, 1, 1)
     val _ = task_on(&m, 0, 2, 1)

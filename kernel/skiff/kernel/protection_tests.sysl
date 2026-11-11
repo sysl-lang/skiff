@@ -1,6 +1,8 @@
 module skiff.kernel
 @tests
 
+import sysl.raw.ptr_cast
+
 // Protection on the host: maps checked at creation, the guard and the map on every switch, the buffer
 // check, the calls and their refusals, and a task stopped by a fault, over the recording port
 // (kernel_tests.sysl), whose unit holds 32-byte-granular regions as PMSAv8 does.
@@ -23,7 +25,12 @@ private var code: [64]u8
 @align(32)
 private var device: [32]u8
 
-private region(bytes: []u8, access: Access) -> Region = Region(usize(&bytes[0]), bytes.len, access)
+// The objects the tests grant, in module storage: a task holds its grants for as long as it lives, so a
+// granted object must outlive the test that grants it.
+private var s: Semaphore
+private var f: Flags
+
+private region(bytes: []u8, access: Access) -> Region =Region(usize(&bytes[0]), bytes.len, access)
 
 // An unprivileged task on stack `n`, at `priority`, granted the page read-write, the notice read-only,
 // the code and the device, and `grants`.
@@ -53,7 +60,7 @@ private addr(bytes: []u8) -> usize = usize(&bytes[0])
 @test("an unprivileged task's map holds its stack first, then its regions, encoded by the unit")
 map_built()
     var r = recorder(1, 0)
-    var s = Semaphore.new("s", 0, 1)
+    s = Semaphore.new("s", 0, 1)
     val t = user_task(&r, 0, 2, [Grant.Units(&s)])
     val m = &here(&r).maps[t.slot()]
     assert(m.user && !m.calling, "unprivileged, outside a call")
@@ -81,7 +88,7 @@ map_refused()
     assert(create_unprivileged(&r, 0, ustacks[0], &body, 2, [region(page, Access.Read), Region(addr(page) + 32, 32, Access.ReadWrite)], []) == Err(MapError.Overlap(0, 1)), "two regions sharing bytes")
     assert(create_unprivileged(&r, 0, ustacks[0], &body, 2, [Region(usize(&ustacks[0][8]), 32, Access.Read)], []) == Err(MapError.OverlapsStack(0)), "a region in the stack")
     assert(create_unprivileged(&r, 0, ustacks[0], &body, 0, [], []) == Err(MapError.Refused(TaskError.Priority)), "the idle task's priority")
-    var s = Semaphore.new("s", 0, 1)
+    s = Semaphore.new("s", 0, 1)
     val too_many = [Grant.Units(&s); option_grants + 1]
     assert(create_unprivileged(&r, 0, ustacks[0], &body, 2, [], too_many) == Err(MapError.TooManyGrants), "more grants than a task holds")
     assert(here(&r).sched.free_slot() == before, "nothing created")
@@ -149,8 +156,8 @@ buffers_checked()
 @test("calls on granted objects act; a grant of another kind, or past the list, is refused")
 grants_used()
     var r = recorder(1, 0)
-    var s = Semaphore.new("s", 0, 2)
-    var f = Flags.new("f", 0)
+    s = Semaphore.new("s", 0, 2)
+    f = Flags.new("f", 0)
     val u = user_task(&r, 0, 2, [Grant.Units(&s), Grant.Bits(&f)])
     run_alone(&r, u)
     assert_eq(call(&r, CALL_GIVE, 0, 0, 0, 0), 1)

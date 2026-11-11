@@ -23,8 +23,9 @@ module skiff.kernel
 // command from another core is refused as `Remote` (DESIGN "Software timers"). An interrupt handler of
 // the owner core commands with a timeout of 0.
 
-// What a timer calls when it expires: a function given the timer and the tick it was due on.
-type TimerCallback = *extern(*Timer, u32) -> unit
+// What a timer calls when it expires: a function given the timer and the tick it was due on. The kernel
+// holds a timer from `create_timer` on, and the callback may keep it too, as a command it sends does.
+type TimerCallback = *extern(@keeps *Timer, u32) -> unit
 
 struct Timer
     name: string

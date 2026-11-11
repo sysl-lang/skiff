@@ -12,6 +12,7 @@
 // include the floating-point ones. From there the run is the one image's.
 
 import sysl.debug.ErrorTraceStore
+import sysl.raw.ptr_cast
 import sysl.sync.Atomic
 import skiff.arch.armv7m
 import skiff.arch.armv8m

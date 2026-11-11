@@ -273,7 +273,10 @@ impl Scheduler
         if i != NONE then self.expiring = self.tasks[usize(i)].later
         i
 
-    // The running task blocks on `on` until `deadline`, or for as long as it takes with `FOREVER`.
+    // The running task blocks on `on` until `deadline`, or for as long as it takes with `FOREVER`. The
+    // task's record holds `on` only while the task waits: the wake, the timeout or the withdrawal that
+    // ends the wait clears it before the blocked call returns, so the object may be the caller's own.
+    @scoped(on)
     block(*self, on: *Waitable, timeout: u32, now: u32)
         val i = usize(self.running)
         self.unlink(i)

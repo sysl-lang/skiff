@@ -1,5 +1,6 @@
 module skiff.arch.armv7m
 
+import sysl.raw.ptr_cast
 import skiff.kernel
 import skiff.kernel.{Port, Violation}
 

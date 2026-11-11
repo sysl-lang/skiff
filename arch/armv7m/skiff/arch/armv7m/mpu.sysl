@@ -1,5 +1,6 @@
 module skiff.arch.armv7m
 
+import sysl.raw.ptr_cast
 import sysl.slices.align_up
 import skiff.arch.pmsa
 import skiff.arch.pmsa.{MpuCtrl, MpuType, V7Rasr, V7Rbar}

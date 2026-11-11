@@ -1,5 +1,7 @@
 module skiff.kernel
 
+import sysl.raw.ptr_cast
+
 // Run-time statistics and stack high-water marks (DESIGN "Statistics").
 //
 // **Run time.** Each core charges its tasks in its own counter, the port's `RunCounter`. At every switch,

@@ -1,5 +1,7 @@
 module skiff.arch.armv7m
 
+import sysl.raw.ptr_cast
+
 // The running core's NVIC: the chip's interrupts, numbered from 0 after the sixteen system exceptions.
 // Each core of a multi-core chip has its own.
 

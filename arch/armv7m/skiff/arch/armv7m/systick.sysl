@@ -1,5 +1,7 @@
 module skiff.arch.armv7m
 
+import sysl.raw.ptr_cast
+
 // The tick on an Armv7-M core: SysTick, counting down on the processor clock and interrupting each time it
 // reaches zero. Each core has its own. Its exception goes to `skiff_systick` (vectors.sysl).
 

@@ -1,5 +1,7 @@
 module skiff.kernel
 
+import sysl.raw.ptr_cast
+
 // Kernel calls from unprivileged tasks (DESIGN "Kernel calls").
 //
 // An unprivileged task cannot run kernel code itself: the code would run under the task's map, and the

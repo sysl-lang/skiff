@@ -1,5 +1,6 @@
 module skiff.board.scenarios
 
+import sysl.raw.ptr_cast
 import skiff.kernel
 import skiff.kernel.{Access, Action, FOREVER, Flags, Grant, MapError, Port, Region, RegionError, Semaphore, Task, TaskState}
 import skiff.kernel.user

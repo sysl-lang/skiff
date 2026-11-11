@@ -16,8 +16,10 @@ private[kernel] struct Recorder
     masked: u32         // how deep the kernel's masking is nested
     cleans: u32         // how many cleans the kernel asked for
     invalidates: u32    // how many invalidates
-    cleaned: []const u8         // the bytes of the last clean
-    invalidated: []const u8     // the bytes of the last invalidate
+    cleaned_at: usize           // the address of the last clean's bytes
+    cleaned_len: usize          // how many there were
+    invalidated_at: usize       // the address of the last invalidate's bytes
+    invalidated_len: usize      // how many there were
     pool: *Pool[2, 32]          // a pool to look at on each clean and invalidate (null: none)
     channel: *Channel[1]        // a channel to look at likewise (null: none)
     free_then: u32      // what `pool` had available at the last clean or invalidate
@@ -62,15 +64,18 @@ impl Isolation for Recorder
 
 // A data cache that records what it is asked and, at that step, how full the watched pool and channel
 // are: what tells whether a buffer was cleaned before it could be seen and invalidated after it was taken.
+// It keeps where the bytes were and how many, not the view: a port is lent the bytes for the call only.
 impl Cache for Recorder
     clean(*self, bytes: []const u8)
         self.cleans += 1
-        self.cleaned = bytes
+        self.cleaned_at = usize(&bytes[0])
+        self.cleaned_len = bytes.len
         self.look()
 
     invalidate(*self, bytes: []u8)
         self.invalidates += 1
-        self.invalidated = bytes
+        self.invalidated_at = usize(&bytes[0])
+        self.invalidated_len = bytes.len
         self.look()
 
 impl Recorder
@@ -122,7 +127,7 @@ impl Doorbell for Recorder
     ring(*self, core: u32) = panic("one core never rings")
     clear(*self) = panic("one core never rings")
 
-private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, [], [], null, null, 0, 0, 0, 0, 0, 0, false, 8, 0, 0, 0)
+private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, 0, 0, 0, 0, null, null, 0, 0, 0, 0, 0, 0, false, 8, 0, 0, 0)
 
 // Whether `r` recorded exactly `want`.
 private[kernel] recorded(r: *Recorder, want: string) -> bool

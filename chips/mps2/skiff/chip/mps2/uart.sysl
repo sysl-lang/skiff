@@ -1,5 +1,7 @@
 module skiff.chip.mps2
 
+import sysl.raw.ptr_cast
+
 // The first of the MPS2's CMSDK UARTs, at 0x4000_4000 on the AN500 and the AN386 alike (QEMU's
 // `info mtree -f`). It transmits nothing until `bauddiv` and the transmit enable in `ctrl` are set.
 

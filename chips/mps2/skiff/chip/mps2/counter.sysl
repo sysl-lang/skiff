@@ -1,5 +1,7 @@
 module skiff.chip.mps2
 
+import sysl.raw.ptr_cast
+
 // CMSDK APB timer 1, at 0x4000_1000, as a free-running counter for the kernel's run-time statistics (QEMU
 // models no DWT, so there is no cycle counter). It counts down from 2^32 - 1 on the 25 MHz clock with its
 // interrupt off and reloads at zero, so the counts since it started are its value's complement, wrapping

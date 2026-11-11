@@ -1,6 +1,7 @@
 module skiff.kernel
 
 import sysl.debug.ErrorTraceStore
+import sysl.raw.ptr_cast
 
 // Error return traces (DESIGN "Error traces"). Every `?` whose failure arm is taken records its site in
 // the trace of whatever is running, which the port's hook (`sysl_error_trace_here`) answers. So every

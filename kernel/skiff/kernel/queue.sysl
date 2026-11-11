@@ -139,12 +139,10 @@ trait Mailbox
 
     // Send the message `m` holds, waiting up to `timeout` ticks for room: Some(whether it was sent), or
     // None, sending nothing, when its first `message_bytes` bytes are no message.
-    @borrows(m)
     send_bytes(*self, p: *Port, m: []const u8, timeout: u32) -> Option[bool]
 
     // Receive the oldest message into `into`, which holds `message_bytes` at least, waiting up to
     // `timeout` ticks for one. Answers whether one came.
-    @borrows(into)
     receive_bytes(*self, p: *Port, into: []u8, timeout: u32) -> bool
 
 impl[T: Plain, const N: usize] Mailbox for Queue[T, N]

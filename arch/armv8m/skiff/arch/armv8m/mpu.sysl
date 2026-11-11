@@ -1,5 +1,6 @@
 module skiff.arch.armv8m
 
+import sysl.raw.ptr_cast
 import skiff.arch.pmsa
 import skiff.arch.pmsa.{MpuCtrl, MpuType}
 import skiff.kernel.{Access, Region, RegionError, Slot}

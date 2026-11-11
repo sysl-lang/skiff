@@ -1,5 +1,6 @@
 module skiff.kernel
 
+import sysl.raw.ptr_cast
 import sysl.sync.{Lock, Ordering}
 
 // Inboxes: how one core asks another to change something of its own. A core never edits another core's
