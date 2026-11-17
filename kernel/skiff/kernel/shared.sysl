@@ -41,7 +41,8 @@ struct Ring
 const INBOX_CORES: usize = if option_cores > 1 then option_cores else 0
 
 // The `.shared` structure.
-//   - `time` is the time base, advanced by core 0's tick alone.
+//   - `time` is the time base, advanced once a period by whichever core's tick comes first (`Core.tick`),
+//     holding the spin word `time_lock` (several cores only).
 //   - `states` holds each core's state as the others see it: offline, ready or stopped.
 //   - `inboxes[to][from]` is the ring core `from` posts to core `to` through.
 //   - `waiters[core][slot]` is the wait record of that task (waits.sysl): a task waits on one thing at
@@ -51,6 +52,7 @@ const INBOX_CORES: usize = if option_cores > 1 then option_cores else 0
 //     check that an object two cores use lies inside them.
 struct Shared
     time: Atomic[u32]
+    time_lock: Atomic[u32]
     states: [option_cores]Atomic[u32]
     inboxes: [INBOX_CORES][INBOX_CORES]Ring
     waiters: [option_cores][option_tasks]Waiter
@@ -83,6 +85,9 @@ private[kernel] core_state(n: u32) -> u32 = shared.states[n].load(Ordering.Acqui
 
 // The time base's counter.
 private[kernel] time_base() -> *Atomic[u32] = &shared.time
+
+// The spin word a core holds while it reads and advances the time base.
+private[kernel] time_lock() -> *Atomic[u32] = &shared.time_lock
 
 // Whether everything another core can reach lies in [start, end): the bounds the link script gives
 // `.shared`, which the board reads from `__shared_start` and `__shared_end`. The inboxes, the wait

@@ -1,0 +1,51 @@
+module skiff.board.scenarios
+
+import skiff.kernel
+import skiff.kernel.Port
+
+// The time base without core 0 (DESIGN "Time"). With several cores, core 0 masks its interrupts, so it
+// takes no tick, and spins until core 1 says it is done. Core 1 sleeps `STALL_TICKS` ticks of the time
+// base from where core 0 masked it, which only core 1's ticks can now advance, and says so. Core 0 then
+// checks it took no tick of its own while the time base moved on at least as far. Nothing here waits for
+// a tick count assumed in advance: each step waits for the other core's, and a time base that stands
+// still is a hang the boot test's watchdog ends.
+
+// How far core 1 moves the time base alone.
+private const STALL_TICKS: u32 = 5
+
+// The steps, in `Across.time_stage`.
+private const TIME_READY: u32 = 1  // core 1 is waiting for core 0 to mask
+private const TIME_MASKED: u32 = 2 // core 0 is masked; `time_from` is the time base when it masked
+private const TIME_DONE: u32 = 3   // core 1 has slept its ticks
+
+// R's part, on the running core.
+time_alone[P: Port](p: *P)
+    if kernel.CORES == 1 then return
+    if kernel.here_id(p) == 0 then masked_while_time_goes_on(p) else keep_time_alone(p)
+
+private masked_while_time_goes_on[P: Port](p: *P)
+    while common.time_stage.load() != TIME_READY do kernel.sleep(p, 1)
+    val state = p.mask()
+    val own = kernel.here(p).own_ticks()
+    val from = kernel.ticks()
+    common.time_from.store(from)
+    common.time_stage.store(TIME_MASKED)
+    while common.time_stage.load() != TIME_DONE do ()
+    val moved = kernel.ticks() -% from
+    val took = kernel.here(p).own_ticks() -% own
+    p.restore(state)
+    if took == 0 && moved >= STALL_TICKS
+        say(p, "took no tick while masked, and the time base moved on without it\n")
+    else
+        say(p, "took ")
+        kernel.write_dec(p, took)
+        p.write(" ticks while masked, and the time base moved ".bytes)
+        kernel.write_dec(p, moved)
+        p.write("\n".bytes)
+
+private keep_time_alone[P: Port](p: *P)
+    common.time_stage.store(TIME_READY)
+    while common.time_stage.load() != TIME_MASKED do kernel.sleep(p, 1)
+    kernel.sleep_until(p, common.time_from.load() +% STALL_TICKS)
+    say(p, "kept the time base moving while core 0 took no tick\n")
+    common.time_stage.store(TIME_DONE)

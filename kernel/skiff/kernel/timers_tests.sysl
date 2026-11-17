@@ -167,6 +167,8 @@ late_turn_interleaves()
 across_the_wrap()
     var r = recorder(1, 0)
     time_base().store(0xffff_fffe, Ordering.Relaxed)
+    // The core saw it there, so its next tick advances it rather than taking it as another core's.
+    here(&r).time_seen = 0xffff_fffe
     val y = make(&r, 0, 3, true)
     val x = make(&r, 1, 1, false)
     assert(y.start(&r, 0).is_ok(), "y, due on 1 after the wrap")
