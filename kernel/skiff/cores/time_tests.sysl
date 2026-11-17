@@ -1,0 +1,114 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+import skiff.kernel.{Core, Task, TaskState}
+
+// The time base on several cores: any core's tick may advance it, cores ticking together advance it once
+// a period, and a deadline means the same instant on every core (DESIGN "Time").
+
+// One tick on core `core`.
+private tick_on(m: *Machine, core: u32)
+    on(m, core)
+    kernel.tick(m)
+
+// Bring every core's view of the time base to the time base, so what follows starts from one known
+// point: core 0's second tick in a row advances it (no core has since its first), and every other core's
+// next tick then only records it.
+private settle(m: *Machine)
+    tick_on(m, 0)
+    tick_on(m, 0)
+    for core in 1u32..<u32(kernel.CORES) do tick_on(m, core)
+    for core in 0u32..<u32(kernel.CORES)
+        assert_eq(core_of(m, core).time_seen, kernel.ticks())
+
+// Core `core`'s `Core`, read as that core.
+private core_of(m: *Machine, core: u32) -> *Core
+    on(m, core)
+    kernel.here(m)
+
+// `t`'s state, asked on its own core.
+private state_of(m: *Machine, t: Task) -> TaskState
+    on(m, t.core())
+    kernel.state(m, t).unwrap()
+
+@test("cores ticking together advance the time base once a period, in whatever order their ticks land")
+lockstep_ticks_once()
+    var m = machine()
+    settle(&m)
+    val from = kernel.ticks()
+    for _ in 0..<10
+        tick_on(&m, 0)
+        tick_on(&m, 1)
+        tick_on(&m, 2)
+    assert_eq(kernel.ticks() -% from, 10)
+    // The cores' ticks land in another order each period.
+    for _ in 0..<5
+        tick_on(&m, 2)
+        tick_on(&m, 0)
+        tick_on(&m, 1)
+        tick_on(&m, 1)
+        tick_on(&m, 2)
+        tick_on(&m, 0)
+    assert_eq(kernel.ticks() -% from, 20)
+
+@test("with core 0 stalled, the other cores' ticks still advance the time base")
+time_without_core_0()
+    var m = machine()
+    settle(&m)
+    val from = kernel.ticks()
+    for _ in 0..<10
+        tick_on(&m, 1)
+        tick_on(&m, 2)
+    assert_eq(kernel.ticks() -% from, 10)
+    // Core 2 alone.
+    for _ in 0..<5 do tick_on(&m, 2)
+    assert_eq(kernel.ticks() -% from, 15)
+    // Core 0 comes back: its first tick only records where time went without it.
+    tick_on(&m, 0)
+    assert_eq(kernel.ticks() -% from, 15)
+    tick_on(&m, 0)
+    assert_eq(kernel.ticks() -% from, 16)
+
+@test("a core far ahead in its own ticks neither pulls the time base back nor double counts it")
+one_core_far_ahead()
+    var m = machine()
+    settle(&m)
+    val from = kernel.ticks()
+    var last = from
+    for _ in 0..<100
+        tick_on(&m, 1)
+        assert(kernel.ticks() -% last <= 1, "one period a tick at most")
+        last = kernel.ticks()
+    assert_eq(kernel.ticks() -% from, 100)
+    // The others' own counts are far behind core 1's; time follows the periods, not any core's count.
+    for _ in 0..<5
+        tick_on(&m, 0)
+        tick_on(&m, 1)
+        tick_on(&m, 2)
+        assert(kernel.ticks() -% last <= 1, "never back, never two at once")
+        last = kernel.ticks()
+    assert_eq(kernel.ticks() -% from, 105)
+    assert(core_of(&m, 1).own_ticks() -% core_of(&m, 0).own_ticks() >= 99, "core 1's own count far ahead")
+
+@test("a deadline set on core 1 expires on core 2 at the same instant, though only core 2 ticks")
+deadline_across_cores()
+    var m = machine()
+    val sleeper = task_on(&m, 2, 0, 2)
+    // Something for core 2 to run while the sleeper sleeps.
+    val _ = task_on(&m, 2, 1, 1)
+    begin(&m)
+    settle(&m)
+    on(&m, 1)
+    val deadline = kernel.ticks() +% 5
+    // Core 2's task sleeps until the deadline core 1 computed.
+    on(&m, 2)
+    kernel.sleep_until(&m, deadline)
+    switch_now(&m)
+    assert(state_of(&m, sleeper) == TaskState.Sleeping, "asleep")
+    for _ in 0..<4 do tick_on(&m, 2)
+    assert(!kernel.expired(deadline, kernel.ticks()), "four periods: not yet, on either core")
+    assert(state_of(&m, sleeper) == TaskState.Sleeping, "still asleep")
+    tick_on(&m, 2)
+    assert(kernel.expired(deadline, kernel.ticks()), "the fifth period")
+    assert(state_of(&m, sleeper) == TaskState.Ready, "woken on core 2's tick that brought it")

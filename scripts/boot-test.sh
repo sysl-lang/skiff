@@ -178,10 +178,11 @@ $(grants_expected 0)"
 # through the boost core 1's inbox carries, which the owner gives up with the mutex. Each core runs its own
 # software timers and deferred work, and core 0 may not command a timer of core 1's nor post its work. Core 0 suspends, resumes, re-prioritizes
 # and stops a task of core 1 through core 1's inbox, and core 1 checks each step. Each core measures its
-# own tasks on its own counter, and core 0 is refused core 1's. Core 1 then faults
-# on purpose: it
+# own tasks on its own counter, and core 0 is refused core 1's. Core 0 then masks its interrupts, taking
+# no tick, while core 1 alone moves the time base on and sleeps on it. Core 1 then faults on purpose: it
 # reports the fault on its own console and stops. Core 0 sees it stopped, takes more ticks, finds that
-# the time base counted its own ticks and none of core 1's, and stops the machine with status 0.
+# the time base moves a period for each of its own ticks without core 1, and stops the machine with
+# status 0.
 an521_core0_greeting="skiff: hello from core 0
 skiff: .shared holds the shared state"
 an521_core0_run="skiff: core 0 tick 1
@@ -210,9 +211,10 @@ $(protection_expected 0)
 skiff: core 0 an unprivileged task on core 1 took a unit core 0 gave and set flags core 0 waited on, through its grants
 $(grants_expected 0)
 skiff: core 0 had the pool buffer an unprivileged task sent core 1 through granted objects back
+skiff: core 0 took no tick while masked, and the time base moved on without it
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
-skiff: core 0 time base agrees"
+skiff: core 0 keeps the time base alone"
 an521_core0_expected="$an521_core0_greeting
 $an521_core0_run"
 an521_core1_ticks="skiff: core 1 tick 1
@@ -243,6 +245,7 @@ $(protection_expected 1)
 skiff: core 1 an unprivileged task took a unit core 0 gave, through its grant
 $(grants_expected 1)
 skiff: core 1 an unprivileged task received notes and a filled buffer an unprivileged task of core 0 sent, through its grants
+skiff: core 1 kept the time base moving while core 0 took no tick
 skiff: core 1 fault BusFault"
 an521_core1_expected="skiff: hello from core 1
 $an521_core1_ticks

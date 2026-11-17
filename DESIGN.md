@@ -480,9 +480,34 @@ handing over a buffer, never by copying it. A **pool** holds the buffers; a **ch
 
 ## Time
 
-- **One time base**: `ticks()` is a single counter in `.shared`, advanced by core 0's tick. Every core
-  ticks its own scheduler at the same rate (time slices, its timeout list) and compares deadlines with
-  that one counter, so a timeout means the same on every core.
+- **One time base**: `ticks()` is a single counter in `.shared`. Every core ticks its own scheduler at
+  the same rate (time slices, its timeout list) and compares deadlines with that one counter, so a
+  timeout means the same on every core: a deadline computed on one core and checked on another is the
+  same instant, and every core reads the same `ticks()` at once.
+- **Any core's tick may advance it; no core's tick must.** A core remembers the time base as its last
+  tick left it (`Core.time_seen`). On a tick, if the time base still reads that, no core has advanced it
+  since, and this tick is the period's first: the core advances it by one. If the time base has moved,
+  another core took this period, and the core only records what it now reads. With several cores the
+  read and the advance are made holding a spin word beside the counter in `.shared`, taken with the
+  port's `spin_try_lock`, not a compare-and-swap: a thumbv6m core has none, and a port that has only
+  a hardware lock (the RP2040's SIO) supplies the try. A core that finds the word held only counts
+  its tick: the holder is taking the period. So:
+  - time advances while any core ticks: a core alone advances it on every tick after its first;
+  - cores ticking together advance it once a period, not once each, in whatever order their ticks land;
+  - it only ever moves forward by one, so it is monotonic, and every core reads the one counter;
+  - a tick does one try, one load and at most one store, and never waits for another core.
+- **What it costs**: time runs at the rate of the fastest-ticking live core, which is the tick rate,
+  since every core ticks at `tick_hz`. A core stopped, masked, or stalled for a while takes nothing
+  from it; its first tick after resynchronizes. On hardware a tick held off is merged into the one
+  pending bit, never delivered late, so a lagging core's count is lost, not owed, and resynchronizing is
+  right. Under QEMU's multi-threaded TCG a core's ticks can come late and in a bunch; the bunch then
+  advances time by up to its length minus one ahead of the clock, never backwards.
+- **Why not the alternatives.** *Core 0 alone* (the rule before) stops time for every core when core 0
+  stops, stalls or masks for long. *The largest of the cores' own counts* never double counts, but a core
+  that lost ticks lags for good, so once the leader stops, time stands still for as long as the survivor
+  is behind, and that lag grows with every masked stretch. *A counter every core reads* needs one on
+  every chip (the AN521's timers are per core; `RunCounter` is per core by design), its rate, and the
+  register in the chip, and is what tickless idle brings anyway.
 - A deadline is `i32(deadline - now) <= 0`, so the counter may wrap.
 - Tickless idle (milestone 10) replaces the periodic tick with a one-shot wake at the next deadline; the
   counter then comes from a hardware timer every core can read.
@@ -818,5 +843,5 @@ them. `grants` (usize, default 4, [0, 32]): objects one task may be granted.
   control data that must not be cached where two cores use them; its buffers may be. With `.shared`
   uncached they share it; a board that caches the buffers will need the pool's storage in a region of
   its own. Settled with the H747I (milestone 9).
-- **The H7's time base** in a two-image build: core 0's tick counter in `.shared` works; a shared
-  hardware timer may be better.
+- **The H7's time base** in a two-image build: the shared tick counter in `.shared` works (either core
+  advances it, "Time"); a shared hardware timer may be better.

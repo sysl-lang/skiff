@@ -55,6 +55,10 @@ struct Across
     far_task: Atomic[u32]
     control_stage: Atomic[u32]
     far_verdict: Atomic[u32]
+    // Core 0 masked while core 1 keeps time: the step the two are at, and the time base when core 0
+    // masked (time.sysl).
+    time_stage: Atomic[u32]
+    time_from: Atomic[u32]
 
 // The board's `Across`, in `.shared`.
 private[scenarios] var common: *Across

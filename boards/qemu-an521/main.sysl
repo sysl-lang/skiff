@@ -2,8 +2,8 @@
 // both enter `_start` (skiff.chip.an521) and then `skiff_main`, and tell themselves apart by core number.
 // Core 0 creates both cores' tasks and releases core 1; each core greets, watches three of its own ticks
 // and runs its own tasks (skiff.board.scenarios) at once with the other. Then core 1 takes a fault on
-// purpose, which stops it alone. Core 0 sees it stopped, ticks on, checks that the time base counted its
-// ticks and no others, and stops the machine with status 0.
+// purpose, which stops it alone. Core 0 sees it stopped, ticks on, checks that the time base still moves
+// a period for each of its own ticks with core 1 gone, and stops the machine with status 0.
 //
 // Built as two images (the `core0` and `core1` features), each core runs its own, and the system
 // description (system.sysl) is what the two share: each core takes the peripherals and interrupts it
@@ -277,15 +277,22 @@ private task_r() -> never
     scenarios.traces(&board, &entries, code)
     scenarios.protection(&board, &entries, code, Region(an521.uart_base(me), an521.UART_STRIDE, Access.Device))
     scenarios.grants(&board, code)
+    scenarios.time_alone(&board)
     if me == 1
         val nothing: *Word = ptr_cast(NOWHERE)
         kernel.write_hex(&board, nothing.v)
     while !kernel.stopped(1) do kernel.sleep(&board, 1)
     board.write("skiff: core 0 sees core 1 stopped\n".bytes)
+    // With core 1 stopped, core 0's ticks alone move the time base: one period each, but for its first,
+    // which may find core 1 took the period before it stopped.
+    val from = kernel.ticks()
+    val own = kernel.here(&board).own_ticks()
     kernel.sleep(&board, 3)
     board.write("skiff: core 0 ticks on\n".bytes)
-    if kernel.ticks() == kernel.here(&board).own_ticks()
-        board.write("skiff: core 0 time base agrees\n".bytes)
+    val moved = kernel.ticks() -% from
+    val took = kernel.here(&board).own_ticks() -% own
+    if moved >= 3 && took >= moved && took <= moved + 1
+        board.write("skiff: core 0 keeps the time base alone\n".bytes)
     armv7m.halt(status)
 
 // MHU0's doorbell, on either core: that core's kernel clears it and drains its inboxes.

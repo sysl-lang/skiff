@@ -11,7 +11,8 @@ import sysl.sync.{Atomic, Ordering}
 struct Core
     id: u32                 // the core's number, from 0
     ticks: Atomic[u32]      // the ticks this core has taken, counted by its own tick interrupt
-    stopped: bool           // a fault has stopped the core
+    time_seen: u32          // the time base as this core's last tick left it
+    stopped: bool          // a fault has stopped the core
     sched: Scheduler        // its tasks and the choices made over them (tasks.sysl)
     maps: [option_tasks]Map // each task's map, by slot: empty for a privileged task (protection.sysl)
     mapped: bool            // the core's protection unit holds an unprivileged task's map
@@ -20,14 +21,23 @@ struct Core
     idle_time: u64          // of them, the counts the idle task ran
 
 impl Core
-    // Take one tick: count it, and on core 0 advance the time base `time` that every core reads.
+    // Take one tick: count it, and advance the time base `time` that every core reads if no core has
+    // advanced it since this core's last tick. Otherwise another core took this period, and the core only
+    // records where the time base now is. So cores ticking together advance it once a period, and a core
+    // ticking alone advances it on every tick but its first (DESIGN "Time"). With several cores the
+    // caller holds the time base's spin word, so no other core reads and writes it in between.
     tick(*self, time: *Atomic[u32])
-        self.ticks.store(self.ticks.load(Ordering.Relaxed) +% 1, Ordering.Relaxed)
-        if self.keeps_time() then time.store(time.load(Ordering.Relaxed) +% 1, Ordering.Release)
+        self.count_tick()
+        val now = time.load(Ordering.Acquire)
+        if now != self.time_seen
+            self.time_seen = now
+            return
+        time.store(now +% 1, Ordering.Release)
+        self.time_seen = now +% 1
 
-    // Whether this core advances the time base: core 0 alone, so that one tick is one period on every
-    // core however many of them tick.
-    keeps_time(*self) -> bool = self.id == 0
+    // Count one tick and leave the time base alone: another core holds it, so it is taking this period.
+    count_tick(*self)
+        self.ticks.store(self.ticks.load(Ordering.Relaxed) +% 1, Ordering.Relaxed)
 
     // How many ticks this core has taken.
     own_ticks(*self) -> u32 = self.ticks.load(Ordering.Relaxed)
@@ -38,7 +48,7 @@ const CORES: usize = option_cores
 // How many tasks each core's table holds: its `tasks` option, for a port keeping something per task.
 const TASKS: usize = option_tasks
 
-private var cores_here:[option_cores]Core = [Core(0, Atomic(0), false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false, 0, 0, 0); option_cores]
+private var cores_here:[option_cores]Core = [Core(0, Atomic(0), 0, false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false, 0, 0, 0); option_cores]
 
 // The running core's `Core`. With one core it is a constant, and the port is not asked.
 here[P: Port](p: *P) -> *Core = if option_cores == 1 then &cores_here[0] else &cores_here[p.core_id()]
@@ -66,7 +76,15 @@ start[P: Port](p: *P)
 tick[P: Port](p: *P)
     val c = here(p)
     val state = p.mask()
-    c.tick(time_base())
+    // The time base's word is only tried: a core that finds it held leaves the period to its holder, so
+    // no tick waits for another core.
+    if option_cores == 1
+        c.tick(time_base())
+    elif p.spin_try_lock(time_lock())
+        c.tick(time_base())
+        p.spin_unlock(time_lock())
+    else
+        c.count_tick()
     // Charged on every tick, so a task running alone for a long time is charged before the counter wraps.
     charge(p, c)
     if c.sched.started() && c.sched.tick(ticks()) then p.request_switch()
