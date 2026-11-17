@@ -375,8 +375,9 @@ fi
 verdict "mps2-an521 two images that disagree" 3
 
 # The Raspberry Pi Pico 2 on benchtop: the image built for the board itself, both of the RP2350's cores
-# running it, each with an FPU, so core 0's floating-point tasks run too. benchtop enters core 0 at the
-# image's entry as a debug probe does, and core 1 waits in Raspberry Pi's boot ROM until core 0 launches
+# running it, each with an FPU, so core 0's floating-point tasks run too. It boots twice: once entered at
+# the image's entry as a debug probe enters it, and once from reset through Raspberry Pi's boot ROM, which
+# runs the image only for its IMAGE_DEF block. Either way core 1 waits in the ROM until core 0 launches
 # it. `--deterministic` runs the cores in reproducible turns, and the limit is the board's own time, not
 # the host's: benchtop ends a run that is not over by then with status 124. benchtop copies UART0 alone to
 # its output, so core 0's console is the one checked.
@@ -388,13 +389,15 @@ if [ ! -x "$benchtop" ]; then
     echo "FAIL pico2: no benchtop at $benchtop (set SKIFF_BENCHTOP)"
     failed=1
 else
-    start=$(date +%s)
-    "$benchtop" run --board pico2 --deterministic --timeout "$board_time" "$pico2_image" \
-        > "$scratch/pico2-core0.log" 2>&1 < /dev/null
-    code=$?
-    took=$(( $(date +%s) - start ))
-    check "pico2 core 0" "$scratch/pico2-core0.log" "$pico2_core0_expected"
-    verdict pico2 0
+    for entry in debugger rom; do
+        start=$(date +%s)
+        "$benchtop" run --board pico2 --boot "$entry" --deterministic --timeout "$board_time" "$pico2_image" \
+            > "$scratch/pico2-$entry-core0.log" 2>&1 < /dev/null
+        code=$?
+        took=$(( $(date +%s) - start ))
+        check "pico2 ($entry entry) core 0" "$scratch/pico2-$entry-core0.log" "$pico2_core0_expected"
+        verdict "pico2 ($entry entry)" 0
+    done
 fi
 
 exit $failed
