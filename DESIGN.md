@@ -450,6 +450,22 @@ A software timer calls a function once a period has passed (one-shot), or every 
   running task being the one that called the callback; an interrupt handler arriving during the callback
   is indistinguishable from it and is carried out at once too, which is safe because the list is settled
   while a callback runs. One arriving while the service carries out a command of its own is queued.
+- **Carrying out a command costs the same however many timers are active; only the service task walks
+  the list, unmasked.** The list is linked both ways, so a stop or a restart takes the timer out in
+  constant time, and a started timer is appended to the service's *pending* timers with the tick its
+  expiry counts from. The service moves the pending timers into the list, oldest first, before each
+  timer due is taken (`settle`): so equal expiries still keep the order they were started in, and a
+  callback's start is in the list before the next timer due is taken. This matters because a command
+  carried out at once may be an interrupt handler's arriving during a callback: before, its sorted
+  insert walked the list inside the handler, which grows with the timers. Now, in a handler, under the
+  mask or under a lock, a command costs one queue operation and at most `timer_commands + 1` constant
+  carries-out (the queued ones, then its own), whatever the number of timers. The sorted insert is
+  O(active timers), in the service task, unmasked and preemptible by every interrupt and higher task,
+  holding no lock; a turn that expires k timers is O(k) callbacks and O(k × active) insert steps, which
+  only the service's own priority pays for. A timing wheel would make the insert constant too, but costs
+  a bucket array per core and a scan or spurious wakes to find the soonest expiry, and an overdue start
+  (a command taken after its expiry) would still need a sorted place; the walk is not where a bound
+  matters, since nothing waits on it but the service.
 - **The service waits through the one `WaitQueue`**: it receives on its command queue with a timeout of
   the ticks to the soonest expiry (`FOREVER` with none active), so a command wakes it as any send wakes
   a receiver, and the expiry is the wait's timeout ending on the owner's tick. A turn is: carry out every
