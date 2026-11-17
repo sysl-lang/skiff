@@ -40,10 +40,29 @@ struct Flags
     again: bool         // a set came during the walk: walk once more when it ends
     seen: u32           // what the walk under way judges by: the bits as the set that began it left them
     kept: u32           // bits set during the walk and not cleared since, which its clearing leaves
+    link: SetLink       // the queue set it has joined, if any
 
 impl Flags
     // Flags called `name`, starting as `bits`.
-    const new(name: string, bits: u32) -> Flags = Flags(Waitable.new(name), bits, false, 0, false, 0, 0)
+    const new(name: string, bits: u32) -> Flags = Flags(Waitable.new(name), bits, false, 0, false, 0, 0, SetLink.none())
+
+    // Join queue set `set`: from now on the set hears of the flags whenever a set names bits, and at once
+    // if any bit is set now. Answers its index in the set. Refused if they are in a set already, if the
+    // set is full, or if they lie in `.shared` and the set does not.
+    join[P: Port](*self, p: *P, set: *QueueSet) -> Result[u8, SetError]
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val joined = self.link.join(p, set, usize(self), sizeof(Flags), self.bits != 0)
+        l.release()
+        joined
+
+    // Leave the queue set they joined, withdrawing their notice there. Refused if they are in none.
+    leave[P: Port](*self, p: *P) -> Result[unit, SetError]
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val left = self.link.leave(p)
+        l.release()
+        left
 
     // Set `bits`, ending every wait that is now satisfied. Answers the bits as they are afterwards. An
     // interrupt handler may call it.
@@ -110,6 +129,7 @@ impl Flags
         var l = self.w.lock.on(p)
         l.acquire()
         self.bits |= bits
+        if bits != 0 then self.link.notify(p)
         var walk = true
         if self.walking
             self.kept |= bits

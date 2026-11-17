@@ -17,10 +17,11 @@ struct Semaphore
     w: Waitable
     count: u32
     max: u32
+    link: SetLink       // the queue set it has joined, if any
 
 impl Semaphore
     // A semaphore called `name` holding `count` of at most `max`.
-    const new(name: string, count: u32, max: u32) -> Semaphore = Semaphore(Waitable.new(name), count, max)
+    const new(name: string, count: u32, max: u32) -> Semaphore = Semaphore(Waitable.new(name), count, max, SetLink.none())
 
     // Take one, waiting up to `timeout` ticks for one to be given. Answers whether it was taken. Only a
     // task may wait; with a timeout of 0 nothing waits.
@@ -32,6 +33,7 @@ impl Semaphore
         l.acquire()
         if self.count > 0
             self.count -= 1
+            if self.count > 0 then self.link.notify(p)
             l.release()
             return true
         if timeout == 0
@@ -60,7 +62,12 @@ impl Semaphore
         var given = true
         wake_first(p, &self.w, Outcome.Given) match
             Some(_) -> ()
-            None -> if self.count < self.max then self.count += 1 else given = false
+            None ->
+                if self.count < self.max
+                    self.count += 1
+                    self.link.notify(p)
+                else
+                    given = false
         l.release()
         given
 
@@ -71,6 +78,24 @@ impl Semaphore
         val n = self.count
         l.release()
         n
+
+    // Join queue set `set`: from now on the set hears of the semaphore whenever it holds a unit, at once
+    // if it holds one now. Answers its index in the set. Refused if it is in a set already, if the set is
+    // full, or if it lies in `.shared` and the set does not.
+    join[P: Port](*self, p: *P, set: *QueueSet) -> Result[u8, SetError]
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val joined = self.link.join(p, set, usize(self), sizeof(Semaphore), self.count > 0)
+        l.release()
+        joined
+
+    // Leave the queue set it joined, withdrawing its notice there. Refused if it is in none.
+    leave[P: Port](*self, p: *P) -> Result[unit, SetError]
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val left = self.link.leave(p)
+        l.release()
+        left
 
 // A mutex with priority inheritance, owned by a task handle. While a task waits on it, the owner runs at
 // the waiter's priority at least, so a task of middling priority cannot keep the owner, and with it the

@@ -1,0 +1,171 @@
+module skiff.board.scenarios
+
+import sysl.sync.Atomic
+import skiff.kernel
+import skiff.kernel.{Channel, FOREVER, Flags, MessageBuffer, Pool, Port, QueueSet, Queue, Semaphore, SetError, StreamBuffer}
+
+// Queue sets, on every core once the mutex options are done. R (priority 4) joins one member of each
+// kind to the core's set, then creates the selector (3), which waits on the set alone and, for each
+// notice, tries the member it names without waiting. R makes one member available at a time and waits,
+// a tick at a time and for a bounded while, for the selector to have heard it:
+//
+//   - a semaphore given before it joined, heard at the join;
+//   - a message sent to a queue; a bit set in event flags;
+//   - a stream of trigger level 2, written a byte at a time: not heard at the first byte, heard at the
+//     second, and read whole;
+//   - a message sent to a message buffer; a buffer sent through a channel, which the selector gives back.
+//
+// Then the hint: R, which outranks the selector, gives the semaphore and takes the unit back before the
+// selector runs. The selector, handed the notice, finds nothing and waits again. R judges by what the
+// selector heard and in which order, never by a tick.
+//
+// With several cores, core 0's R then waits on a set in `.shared` that a semaphore and a queue in
+// `.shared` have joined, and core 1's R gives the one and sends to the other: core 0 is woken through its
+// inbox and hears both, in the order they came.
+
+// Each member's index in its set: the order R joins them in.
+private const UNITS: u8 = 0
+private const MAIL: u8 = 1
+private const EVENTS: u8 = 2
+private const TRICKLE: u8 = 3
+private const LETTERS: u8 = 4
+private const PAGES: u8 = 5
+private const KINDS: usize = 6
+
+// What R sends: the queue's message and the message buffer's.
+private const POSTED: u32 = 0x5e7
+private const LETTER_BYTES: usize = 3
+
+// 4 KiB, plenty for a try at -O0.
+private const SELECTOR_WORDS: usize = 1024
+
+// How long R gives the selector to hear a member, and core 1 core 0 to reach the set across cores: a
+// core's ticks may come late under QEMU's multi-threaded TCG, and the cores reach this at different times.
+private const HEARD_TICKS: u32 = 50
+private const SET_STEP_TICKS: u32 = 500
+
+private var gathered = [QueueSet.new("gathered"); kernel.CORES]
+private var elsewhere = [QueueSet.new("elsewhere"); kernel.CORES]
+private var set_units = [Semaphore.new("set units", 0, 1); kernel.CORES]
+private var set_mail: [kernel.CORES]Queue[u32, 2] = [Queue.new("set mail"); kernel.CORES]
+private var set_events = [Flags.new("set events", 0); kernel.CORES]
+private var set_trickle: [kernel.CORES]StreamBuffer[8] = [StreamBuffer.new("set trickle", 2); kernel.CORES]
+private var set_letters: [kernel.CORES]MessageBuffer[16] = [MessageBuffer.new("set letters"); kernel.CORES]
+private var set_pool: [kernel.CORES]Pool[1, 32] = [Pool.new("set pool", 7); kernel.CORES]
+private var set_pages: [kernel.CORES]Channel[1] = [Channel.new("set pages"); kernel.CORES]
+private var selector_stacks: [kernel.CORES][SELECTOR_WORDS]u32
+private var heard: [kernel.CORES][KINDS]u8      // the members the selector took something from, in order
+private var heard_count: [kernel.CORES]Atomic[u32]
+private var missed: [kernel.CORES]Atomic[u32]  // notices whose member had nothing left
+private var trickled_read: [kernel.CORES]usize  // how many bytes the selector read from the stream
+
+// What core 0 fills into `.shared` for the set across cores.
+fill_shared_sets()
+    common.gathering = QueueSet.new("gathering")
+    common.far_units = Semaphore.new("far units", 0, 1)
+    common.far_mail = Queue.new("far mail")
+
+// R's part, on the running core.
+sets[P: Port](p: *P, e: *Entries)
+    val me = kernel.here_id(p)
+    if heard_on_core(p, e, me)
+        say(p, "a task waiting on a queue set heard a semaphore, a queue, event flags, a stream at its trigger level, a message buffer and a channel in turn, and a notice another task beat it to left it waiting again\n")
+    else
+        say(p, "a task waiting on a queue set missed a member, heard one out of turn, or took what another had taken\n")
+    if kernel.CORES > 1
+        if me == 0 then gather_core_1(p) else fill_core_0(p)
+
+// Sleep a tick at a time, up to `ticks`, until `done` holds; answer whether it did.
+private heard_within[P: Port](p: *P, ticks: u32, done: -> bool) -> bool
+    for _ in 0..<ticks
+        if done then return true
+        kernel.sleep(p, 1)
+    done
+
+private heard_on_core[P: Port](p: *P, e: *Entries, me: u32) -> bool
+    val set = &gathered[me]
+    var right = set_units[me].give(p)
+    right = right && set_units[me].join(p, set) == Ok(UNITS) && set_mail[me].join(p, set) == Ok(MAIL)
+    right = right && set_events[me].join(p, set) == Ok(EVENTS) && set_trickle[me].join(p, set) == Ok(TRICKLE)
+    right = right && set_letters[me].join(p, set) == Ok(LETTERS) && set_pages[me].join(p, set) == Ok(PAGES)
+    right = right && set_units[me].join(p, &elsewhere[me]) == Err(SetError.Joined)
+    val selector = created(kernel.create(p, me, selector_stacks[me], e.selector, 3))
+    right = right && heard_within(p, HEARD_TICKS, heard_count[me].load() == 1)
+    right = right && set_mail[me].try_send(p, POSTED) && heard_within(p, HEARD_TICKS, heard_count[me].load() == 2)
+    val _ = set_events[me].set(p, 0x1)
+    right = right && heard_within(p, HEARD_TICKS, heard_count[me].load() == 3)
+    val one: [1]u8 = [0x31]
+    right = right && set_trickle[me].try_send(p, one[..]) == 1
+    kernel.sleep(p, 1)
+    right = right && heard_count[me].load() == 3 && set_trickle[me].try_send(p, one[..]) == 1
+    right = right && heard_within(p, HEARD_TICKS, heard_count[me].load() == 4) && trickled_read[me] == 2
+    val letter: [LETTER_BYTES]u8 = [1, 2, 3]
+    right = right && set_letters[me].try_send(p, letter[..]) && heard_within(p, HEARD_TICKS, heard_count[me].load() == 5)
+    set_pool[me].try_take(p) match
+        Some(b) -> right = right && set_pages[me].try_send(p, &set_pool[me], b).is_ok()
+        None -> right = false
+    right = right && heard_within(p, HEARD_TICKS, heard_count[me].load() == 6 && set_pool[me].available(p) == 1)
+    right = right && missed[me].load() == 0 && set_units[me].give(p) && set_units[me].try_take(p)
+    right = right && heard_within(p, HEARD_TICKS, missed[me].load() == 1) && heard_count[me].load() == 6
+    for k in 0..<KINDS
+        right = right && heard[me][k] == u8(k)
+    right = right && kernel.delete(p, selector).is_ok()
+    right = right && set_units[me].leave(p).is_ok() && set_mail[me].leave(p).is_ok() && set_events[me].leave(p).is_ok()
+    right = right && set_trickle[me].leave(p).is_ok() && set_letters[me].leave(p).is_ok() && set_pages[me].leave(p).is_ok()
+    right && set_units[me].leave(p) == Err(SetError.NotJoined) && gathered[me].size(p) == 0
+
+// The selector: wait on the set alone, then try the member each notice names, without waiting.
+selector_task[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    loop
+        gathered[me].select(p, FOREVER) match
+            Some(m) -> try_member(p, me, m)
+            None -> ()
+
+private try_member[P: Port](p: *P, me: u32, m: u8)
+    var got: [16]u8 = [0; 16]
+    var took = false
+    if m == UNITS
+        took = set_units[me].try_take(p)
+    else if m == MAIL
+        took = set_mail[me].try_receive(p) == Some(POSTED)
+    else if m == EVENTS
+        took = set_events[me].wait(p, 0x1, false, true, 0).is_some()
+    else if m == TRICKLE
+        trickled_read[me] = set_trickle[me].try_receive(p, got[..])
+        took = trickled_read[me] > 0
+    else if m == LETTERS
+        took = set_letters[me].try_receive(p, got[..]) == LETTER_BYTES
+    else if m == PAGES
+        set_pages[me].try_receive(p, &set_pool[me]) match
+            Some(b) -> took = set_pool[me].give(p, b).is_ok()
+            None -> ()
+    if !took
+        val _ = missed[me].add(1)
+        return
+    val n = heard_count[me].load()
+    if usize(n) < KINDS then heard[me][usize(n)] = m
+    heard_count[me].store(n + 1)
+
+// Core 0: join core 1's members to the set in `.shared`, then wait on it, blocking, for each.
+private gather_core_1[P: Port](p: *P)
+    val set = &common.gathering
+    var right = common.far_units.join(p, set) == Ok(0) && common.far_mail.join(p, set) == Ok(1)
+    common.set_stage.store(1)
+    right = right && set.select(p, SET_STEP_TICKS) == Some(0) && common.far_units.try_take(p)
+    right = right && set.select(p, SET_STEP_TICKS) == Some(1) && common.far_mail.try_receive(p) == Some(POSTED)
+    common.set_stage.store(2)
+    if right
+        say(p, "heard a semaphore and a queue core 1 filled, through a queue set in .shared, in the order they came\n")
+    else
+        say(p, "missed what core 1 gave a queue set in .shared, or heard it out of order\n")
+
+// Core 1: once core 0 waits, give its semaphore and send to its queue.
+private fill_core_0[P: Port](p: *P)
+    var right = heard_within(p, SET_STEP_TICKS, common.set_stage.load() >= 1)
+    right = right && common.far_units.give(p) && common.far_mail.try_send(p, POSTED)
+    right = right && heard_within(p, SET_STEP_TICKS, common.set_stage.load() >= 2)
+    if right
+        say(p, "gave a semaphore and sent a message that a task of core 0 heard through a queue set in .shared\n")
+    else
+        say(p, "gave a queue set in .shared what core 0 never heard\n")

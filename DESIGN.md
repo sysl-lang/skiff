@@ -242,6 +242,68 @@ finds the outcome settled and does nothing.
 Deleting a waiting task first withdraws its wait under the object's lock (`outcome = Idle`), so no
 wake can find it.
 
+### Waiting on several objects: queue sets
+
+A task still waits on one thing at a time. To wait on several, it waits on a **`QueueSet`**, which the
+objects it cares about have joined: a bounded queue of **notices**, each naming one member that has
+become available. The task takes a notice (`select(p, timeout) -> Option[u8]`, `try_select`), then
+tries the member it names without waiting (`try_take`, `try_receive`, `wait(…, 0)`). A notice is a
+**hint**: another task, an interrupt handler or another core may have got there first, and then the
+try fails and the task selects again.
+
+- **Members**: semaphores, queues (their receive side: a notice means a message to receive), event
+  flags, stream buffers, message buffers and channels (through the queue under a channel). Not mutexes:
+  availability there is ownership, and a hint cannot carry the inheritance a waiter lends the owner, so
+  a task wanting a mutex waits on it. Not task notifications: a note is one task's own, which only that
+  task waits on, and it already can.
+- **An object joins at most one set** (`join(p, &set) -> Result[u8, SetError]`), which answers the
+  member's **index**, 0 to 31, the lowest free one; a notice names the member by it. A second join is
+  refused with `Joined`, a 33rd member with `Full`; nothing panics. **`leave(p)`** (`NotJoined` if in
+  none) frees the index, withdrawing the member's notice if one is queued. A notice the set already
+  handed to a woken selector stays with it, and a later join may take the freed index, so that notice
+  may name the newcomer: a hint like any other.
+- **When a member posts**: under its own lock, after any change that leaves it **available**, that is,
+  with something a try would take now: a semaphore's count above 0; a queue's messages not kept for a
+  woken receiver; a stream buffer's bytes at its trigger level (a message buffer's: a whole message,
+  posted once its length and its bytes are both in, so a message is one notice and its reader never
+  wakes to half of one); a channel's buffers. So a give, a send or a write posts, and so does a take or a receive that leaves
+  more, which is what keeps a member of count 3 from being heard once. A hand-over posts nothing: a
+  give to a task waiting on the semaphore itself, or a message kept for a woken receiver, is not
+  available to anyone else. **Event flags post on a set that names bits**, and nowhere else: their
+  bits may stay up while nobody wants them, so posting on whatever leaves them up would hand a selector
+  the same notice for ever.
+- **At most one notice per member is queued**: the set keeps a `pending` bitmap, and a post finding its
+  member's bit set does nothing. So a set of 32 members can never hold more than 32 notices, and the
+  queue cannot overflow **by construction**: nothing is refused and nothing is lost, since a member
+  with a notice queued has said all a hint can say. The bit clears when the notice is taken, and the
+  next change that leaves the member available posts again.
+- **The notices are a FIFO linked through the members' indexes**, as a wait queue is through its
+  records: `head`, and `prev`/`next` per index, circular. Posting appends, selecting takes the head,
+  and a leave unlinks its member wherever it is: each a few steps. The order is the order members
+  became available, so a member that is always available is served in turn with the others, never
+  ahead of them.
+- **A post with a task waiting on the set hands the notice over**: the best waiter's wait ends `Given`
+  with the index in its record's `value`, as a semaphore hands a unit, and nothing is queued. So the
+  queue holds a notice only while nobody waits on the set, a woken selector always has one, and the
+  wake reaches a selector of another core through its inbox, as every object's does.
+- **Joining an object that is already available posts its notice at once.** FreeRTOS refuses to add a
+  queue that is not empty, which leaves the application to drain it first; across cores that is a race
+  (a give from the other core between the check and the join is never heard). Posting at the join
+  costs nothing, since a duplicate is impossible, and nothing that happened before the join is missed.
+- **Two locks, in one order: the member's, then its set's.** The post happens inside the member's
+  masked section, under the lock the member's operation already holds, and takes the set's lock for a
+  constant number of steps (test the bit, append or hand over). A set's own code never takes a
+  member's lock, and a member never holds two sets' locks, so no cycle exists. A join and a leave take
+  the two in the same order. The masked time of every member operation grows by one constant hold of
+  the set's lock, plus, with several cores, the ticket wait for it.
+- **Nothing in `.shared` holds a pointer**, so a member names its set by its **place**, the set's
+  distance from the section's start (`place_of`, computed modulo the word so a set outside `.shared` has
+  one too), with the index and whether it has joined: zero is no set, so a zeroed member in `.shared`
+  is in none. **A member in `.shared` may join only a set in `.shared`** (`Placement` otherwise): the
+  other core would follow the place into its own image's memory. A set in `.shared` may gather members
+  of both cores; its selector, on either, is woken as any waiter is.
+- **Sets are for privileged tasks**: there is no kernel call for them, and no grant names one.
+
 ## Locks
 
 - **Each object holds its own lock**: a `KernelLock`, chosen by the build. With one core it masks the
@@ -281,8 +343,10 @@ wake can find it.
   the mask and the spin are the port's, and `Lock`'s members take no port, so the pair is what is
   locked. The holder's mask state is kept in the lock, written once the spin is held and read before it
   is let go.
-- **A lock is never held across a block or a switch**, and never more than one object's lock at a time.
-  The order, where two are needed, is: object lock, then the core's own ready set (mask only).
+- **A lock is never held across a block or a switch**, and never more than one object's lock at a time
+  but in one case: a queue set's member posting its notice holds its own lock, then its set's ("Waiting
+  on several objects: queue sets"). The order, where two are needed, is: object lock (a member's, then
+  its set's), then the core's own ready set (mask only).
 - **An interrupt handler takes the same lock** a task does; the mask makes that safe on its own core and
   the spin makes it safe against the others. Kernel interrupts sit below the mask (BASEPRI on Arm), so
   interrupts above it never call the kernel.

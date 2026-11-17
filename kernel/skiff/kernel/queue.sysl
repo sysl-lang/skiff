@@ -30,12 +30,31 @@ struct Queue[T, const N: usize]
     count: u32          // the messages in the slots, those kept for woken receivers among them
     kept_messages: u32  // messages kept for receivers already woken
     kept_slots: u32     // free slots kept for senders already woken
+    link: SetLink       // the queue set it has joined, if any
 
 impl[T, const N: usize] Queue[T, N]
     // An empty queue called `name`.
     const new(name: string) -> Queue[T, N]
         var slots: [N]T
-        Queue(Waitable.new(name), slots, 0, 0, 0, 0)
+        Queue(Waitable.new(name), slots, 0, 0, 0, 0, SetLink.none())
+
+    // Join queue set `set`: from now on the set hears of the queue whenever it holds a message a receive
+    // may take, at once if it holds one now. Answers its index in the set. Refused if it is in a set
+    // already, if the set is full, or if it lies in `.shared` and the set does not.
+    join[P: Port](*self, p: *P, set: *QueueSet) -> Result[u8, SetError]
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val joined = self.link.join(p, set, usize(self), sizeof(Queue[T, N]), self.count > self.kept_messages)
+        l.release()
+        joined
+
+    // Leave the queue set it joined, withdrawing its notice there. Refused if it is in none.
+    leave[P: Port](*self, p: *P) -> Result[unit, SetError]
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val left = self.link.leave(p)
+        l.release()
+        left
 
     // Send `m`, waiting up to `timeout` ticks for room. Answers whether it was sent. Only a task may
     // wait; with a timeout of 0 nothing waits.
@@ -130,6 +149,7 @@ impl[T, const N: usize] Queue[T, N]
         if r != NONE
             self.kept_messages += 1
             val _ = wake_at(p, &self.w, r, Outcome.Given)
+        if self.count > self.kept_messages then self.link.notify(p)
 
     // Under the lock: take the oldest message out, and keep its slot for the best waiting sender.
     private take_oldest[P: Port](*self, p: *P) -> T
@@ -140,6 +160,7 @@ impl[T, const N: usize] Queue[T, N]
         if s != NONE
             self.kept_slots += 1
             val _ = wake_at(p, &self.w, s, Outcome.Given)
+        if self.count > self.kept_messages then self.link.notify(p)
         m
 
 // A queue whatever its message type and size, as an unprivileged task's grant reaches it: a message

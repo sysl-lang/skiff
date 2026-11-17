@@ -46,13 +46,32 @@ struct StreamBuffer[const N: usize]
     head: usize         // the oldest byte's index
     len: usize          // the bytes there
     trigger: usize      // the bytes a waiting reader needs; 0 reads as 1
+    link: SetLink       // the queue set it has joined, if any
 
 impl[const N: usize] StreamBuffer[N]
     // An empty stream called `name`, whose readers wait for `trigger` bytes (0 means 1, and a level
     // above `N` means `N`).
     const new(name: string, trigger: usize) -> StreamBuffer[N]
         var bytes: [N]u8
-        StreamBuffer(Waitable.new(name), bytes, 0, 0, trigger)
+        StreamBuffer(Waitable.new(name), bytes, 0, 0, trigger, SetLink.none())
+
+    // Join queue set `set`: from now on the set hears of the stream whenever it holds its trigger level
+    // of bytes, at once if it does now. Answers its index in the set. Refused if it is in a set already,
+    // if the set is full, or if it lies in `.shared` and the set does not.
+    join[P: Port](*self, p: *P, set: *QueueSet) -> Result[u8, SetError]
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val joined = self.link.join(p, set, usize(self), sizeof(StreamBuffer[N]), self.len >= self.level())
+        l.release()
+        joined
+
+    // Leave the queue set it joined, withdrawing its notice there. Refused if it is in none.
+    leave[P: Port](*self, p: *P) -> Result[unit, SetError]
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val left = self.link.leave(p)
+        l.release()
+        left
 
     // Write as much of `data` as fits, waiting up to `timeout` ticks for room for the rest. Answers how
     // many bytes were written, from 0 to all of them. Only a task may wait; with a timeout of 0 nothing
@@ -167,12 +186,20 @@ impl[const N: usize] StreamBuffer[N]
     // trigger level is met. Answers how many bytes. `data` is never the ring's own storage.
     @disjoint(data)
     private[kernel] fill[P: Port](*self, p: *P, data: []const u8) -> usize
+        val n = self.copy_in(data)
+        if n > 0 then self.wake_reader(p)
+        n
+
+    // Under the lock: copy what fits of `data` behind the newest byte, waking nobody. Answers how many
+    // bytes. A message buffer writes a message's prefix and bytes this way, then wakes once, so its set
+    // hears of the message once and its reader never wakes to half of one.
+    @disjoint(data)
+    private[kernel] copy_in(*self, data: []const u8) -> usize
         val room = N - self.len
         val n = if data.len < room then data.len else room
         for i in 0..<n
             self.bytes[self.at(self.head + self.len + i)] = data[i]
         self.len += n
-        if n > 0 then self.wake_reader(p)
         n
 
     // Under the lock: move what fits of the oldest bytes into `buf`, and wake the writers the freed room
@@ -190,16 +217,20 @@ impl[const N: usize] StreamBuffer[N]
     private[kernel] skip[P: Port](*self, p: *P, count: usize)
         self.head = self.at(self.head + count)
         self.len -= count
-        if count > 0 then self.wake_writers(p)
+        if count > 0
+            self.wake_writers(p)
+            if self.len >= self.level() then self.link.notify(p)
 
     // Byte `k` from the oldest, which is there.
     private[kernel] peek(*self, k: usize) -> u8 = self.bytes[self.at(self.head + k)]
 
-    // Under the lock: wake the best reader if the trigger level is met.
+    // Under the lock: wake the best reader if the trigger level is met, and tell the set it joined.
     private wake_reader[P: Port](*self, p: *P)
+        if self.len < self.level() then return
         val r = self.w.queue.first_of(READING)
-        if r != NONE && self.len >= self.level()
+        if r != NONE
             val _ = wake_at(p, &self.w, r, Outcome.Woken)
+        self.link.notify(p)
 
     // Under the lock: wake the best writers, in order, while the room each needs is there.
     private wake_writers[P: Port](*self, p: *P)
@@ -306,12 +337,20 @@ impl[const N: usize] MessageBuffer[N]
     // Empty the buffer. Answers false, changing nothing, while a task waits to send or receive.
     reset[P: Port](*self, p: *P) -> bool = self.s.reset(p)
 
+    // Join queue set `set`, as the stream under it does: the set hears of the buffer whenever it holds a
+    // message. Answers its index in the set.
+    join[P: Port](*self, p: *P, set: *QueueSet) -> Result[u8, SetError] = self.s.join(p, set)
+
+    // Leave the queue set it joined. Refused if it is in none.
+    leave[P: Port](*self, p: *P) -> Result[unit, SetError] = self.s.leave(p)
+
     // Under the lock: write `message` behind its length, the room checked, and wake the reader.
     private put[P: Port](*self, p: *P, message: []const u8)
         val n = message.len
         val prefix: [MESSAGE_PREFIX]u8 = [u8(n & 0xff), u8((n >> 8) & 0xff), u8((n >> 16) & 0xff), u8((n >> 24) & 0xff)]
-        val _ = self.s.fill(p, prefix[..])
-        val _ = self.s.fill(p, message)
+        val _ = self.s.copy_in(prefix[..])
+        val _ = self.s.copy_in(message)
+        self.s.wake_reader(p)
 
     // Under the lock: the oldest message's length, from its prefix; 0 if there is none.
     private length(*self) -> usize

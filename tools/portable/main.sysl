@@ -66,6 +66,7 @@ private var blocks: Pool[2, 48] = Pool.new("blocks", 1)
 private var carried: Channel[2] = Channel.new("carried")
 private var bytes: StreamBuffer[8] = StreamBuffer.new("bytes", 1)
 private var framed: MessageBuffer[12] = MessageBuffer.new("framed")
+private var gathered = kernel.QueueSet.new("gathered")
 private var traced: kernel.TraceRing[8] = kernel.TraceRing.new()
 
 // A trace ring between a board's reports of an interrupt: whatever the kernel emitted in between, the
@@ -128,7 +129,17 @@ private streams(m: *Nothing) -> bool
     if bytes.available(m) != 0 || bytes.space(m) != bytes.capacity() then return false
     if !framed.send(m, data[..], 1) || framed.try_send(m, data[..]) || framed.next_length(m) != 6 then return false
     if framed.space(m) == 0 || framed.receive(m, got[..], 1) != 6 || framed.try_receive(m, got[..]) != 0 then return false
-    framed.reset(m)
+    framed.reset(m) && sets(m)
+
+// A queue set gathering one member of every kind, over the port.
+private sets(m: *Nothing) -> bool
+    if units.join(m, &gathered).is_err() || mail.join(m, &gathered).is_err() || events.join(m, &gathered).is_err() then return false
+    if carried.join(m, &gathered).is_err() || bytes.join(m, &gathered).is_err() || framed.join(m, &gathered).is_err() then return false
+    if gathered.size(m) != 6 || gathered.notices(m) != 0 || gathered.try_select(m).is_some() then return false
+    val picked = gathered.select(m, 1)
+    if units.leave(m).is_err() || mail.leave(m).is_err() || events.leave(m).is_err() then return false
+    if carried.leave(m).is_err() || bytes.leave(m).is_err() || framed.leave(m).is_err() then return false
+    picked.is_none()
 
 private body() -> never
     loop

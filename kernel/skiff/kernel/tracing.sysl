@@ -49,6 +49,7 @@ enum TraceObject: u8
     Note
     Stream
     Pool
+    Set
 
 // One event, the same size whatever it says. `task` is the task it is about, or the running one (the
 // handle of no task, `NO_TASK`, before the core runs its tasks); `at` is the address of the object's

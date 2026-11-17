@@ -1,0 +1,71 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+import skiff.kernel.{FOREVER, QueueSet, Queue, Semaphore, Task, TaskState}
+
+// Queue sets between cores, on the host machine of three cores (machine.sysl), where everything lies in
+// `.shared`: a member of one core posts to a set another core's task selects from, and a selector of
+// another core than the poster's is woken through its inbox.
+
+// `t`'s state, asked on its own core.
+private qs_state(m: *Machine, t: Task) -> TaskState
+    on(m, t.core())
+    kernel.state(m, t).unwrap()
+
+@test("a member given on one core hands its notice to a selector waiting on another, woken through its inbox")
+qs_across_wake()
+    var m = machine()
+    val selector = task_on(&m, 1, 0, 2)
+    val _ = task_on(&m, 1, 1, 1)
+    val _ = task_on(&m, 0, 2, 1)
+    begin(&m)
+    var set = QueueSet.new("set")
+    var s = Semaphore.new("s", 0, 2)
+    on(&m, 0)
+    assert(s.join(&m, &set) == Ok(0), "joined on core 0")
+    on(&m, 1)
+    assert(set.select(&m, FOREVER) == None, "the selector waits")
+    switch_now(&m)
+    on(&m, 0)
+    assert(s.give(&m), "given on core 0")
+    assert_eq(m.rung[1], 1)
+    assert_eq(m.rung[0], 0)
+    assert_eq(m.rung[2], 0)
+    assert_eq(set.notices(&m), 0)
+    assert(qs_state(&m, selector) == TaskState.Blocked, "blocked until its own core answers")
+    kernel.answer_doorbell(&m)
+    assert(qs_state(&m, selector) == TaskState.Ready, "ready")
+    switch_now(&m)
+    assert(kernel.current(&m) == selector, "the selector runs")
+    assert(s.try_take(&m), "and finds the unit")
+    on(&m, 0)
+    assert(s.give(&m), "given again, with nobody selecting")
+    assert_eq(m.rung[1], 1)
+    on(&m, 1)
+    assert(set.try_select(&m) == Some(0), "queued for the next select")
+    assert_eq(m.masked, 0)
+
+@test("members of two cores post into one set, and a third core takes their notices in order")
+qs_across_gather()
+    var m = machine()
+    begin(&m)
+    var set = QueueSet.new("set")
+    var s = Semaphore.new("s", 0, 1)
+    var q: Queue[u32, 2] = Queue.new("q")
+    on(&m, 1)
+    assert(s.join(&m, &set) == Ok(0), "joined on core 1")
+    on(&m, 2)
+    assert(q.join(&m, &set) == Ok(1), "joined on core 2")
+    assert(q.try_send(&m, 9), "sent on core 2")
+    on(&m, 1)
+    assert(s.give(&m), "given on core 1")
+    on(&m, 0)
+    assert_eq(set.notices(&m), 2)
+    assert(set.try_select(&m) == Some(1), "core 2's first")
+    assert(q.try_receive(&m) == Some(9), "the message")
+    assert(set.try_select(&m) == Some(0), "then core 1's")
+    assert(s.try_take(&m), "the unit")
+    assert(set.try_select(&m) == None, "and no more")
+    assert_eq(m.rung[0], 0)
+    assert_eq(m.masked, 0)
