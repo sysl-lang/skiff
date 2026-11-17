@@ -107,8 +107,9 @@ waiter.
   come within a priority, among waiters of every core alike. A head is read only when its bit is set,
   so a zeroed queue is empty. The price is size: a queue is 140 bytes (two bitmaps, 64 heads of 16
   bits, a count), in every object and in every task's note, so `.shared` holds
-  `option_cores * option_tasks` of them besides the application's objects. One walk is left: a flags
-  set looks at every waiter, in order, since one set may satisfy several.
+  `option_cores * option_tasks` of them besides the application's objects. One walk is left, a flags
+  set's, since one set may satisfy every waiter; it takes the lock once per waiter (below, "Event flags:
+  a set walks in steps").
 - An object holds a `Waitable`: its `KernelLock` and its `WaitQueue`. A blocked task's private `Tcb.on`
   names it, which is how a timeout, a priority change or a delete reaches the queue under the lock.
 - A change of a waiter's priority while it waits (inheritance, `set_priority`) re-inserts it, under the
@@ -147,7 +148,8 @@ the object hands itself over, as a semaphore or a mutex does), and releases the 
   every other send and receive, so a woken receiver always has a message and a woken sender always has
   room. Messages leave in the order they came, whichever receiver takes them.
 - **Event flags**: a set ends every wait it satisfies (`Woken`, the bits as the set left them in the
-  record's `value`), and clears the bits the woken waits asked to clear once all have been seen.
+  record's `value`), and clears the bits the woken waits asked to clear once all have been seen. It
+  looks at them one per hold of the lock ("Event flags: a set walks in steps").
 - **Task notifications**: each task's note (value, pending mark, `Waitable`) is in `.shared` at
   `notes[core][slot]`, so any core may send to any task. The note names its task by handle: it is
   renewed when a task is created in its slot (before the task can run) and cleared when the task is
@@ -164,6 +166,53 @@ the object hands itself over, as a semaphore or a mutex does), and releases the 
   stream send writes what fits and waits for room for the rest; a receive whose timeout comes first
   takes whatever is there. A message goes in whole or not at all, and one longer than `N - 4`, or
   empty, is refused at once.
+
+### Event flags: a set walks in steps
+
+A flags set is the one wake that cannot be found in a fixed number of steps: one set may satisfy any
+number of waiters, each on its own terms (any or all of the bits it names, clearing them or not), so
+every waiter has to be looked at. **No bound on a set's whole length that does not grow with the waiters
+exists without changing what a set means**, so the bound is put on what matters, the time the core is
+masked: **a set masks its core for one waiter's worth of work at a time, and takes interrupts between.**
+
+- **How the others do it.** Zephyr's `k_event_post` walks every waiter under its spinlock, masked
+  throughout. FreeRTOS's `xEventGroupSetBits` walks with the scheduler suspended and interrupts open,
+  and defers a set from an interrupt to its timer task. ThreadX's `tx_event_flags_set` walks with
+  preemption off, opening interrupts between waiters, restarts the search when a handler set bits
+  meanwhile, and delays a clear that comes during the search. skiff has no scheduler suspension, and on
+  several cores another core may act on the object at any moment, so it takes ThreadX's shape, with the
+  object's lock in place of the open window.
+- **The set, masked once**: under the lock it ORs its bits in and, if anyone waits, begins a walk: it
+  records the bits as they now are as what the walk judges by (`seen`) and flips the side waits join.
+- **A step, masked once each**: under the lock, the best waiter on the side the walk has not passed
+  (`first_of`, the queue's own order) has its wait ended with `Woken` and `seen` if `seen` satisfies it,
+  its clear-on-exit bits noted, or is moved to the other side. With none left the walk ends: the noted
+  bits are cleared, then. A step is a lock acquisition, a count-leading-zeros, and either a wake (with a
+  post to another core's inbox) or an unlink and a link; it does not depend on how many wait.
+- **The sides swap with every walk.** Flags use only one side of their `WaitQueue` at a time; the walk
+  moves the waiters it passes to the other, and a wait begun during a walk joins that other side. So a
+  walk needs no cursor that a timeout, a stop or a priority change could pull out from under it (they
+  unlink a waiter wherever it is), it looks only at the waiters that were waiting when its set came, and
+  it ends.
+- **Whoever sets, walks.** The set's caller steps until no walk is under way. A set that finds a walk
+  under way ORs its bits in, keeps them from that walk's clearing (`kept`), asks for another walk (begun
+  as this one ends, over every waiter then waiting, judged by the bits then), and steps too: the walk is
+  the object's, and any caller may take the next step. So a set returns only once every wait it
+  satisfies has ended, a set from a higher task or another core is never left behind a walker that was
+  preempted, and a set from an interrupt handler finishes the walk itself.
+- **What another caller sees during a walk.** A read, a clear or a wait sees the bits as they stand,
+  with the walk's clear-on-exit bits still in them until the walk ends: the one thing a set is no longer
+  atomic in. A clear during a walk takes effect after the set: the walk still judges by `seen`, and wakes
+  the waiters the set satisfied. A wait during a walk that is satisfied at once is answered at once; one
+  that waits is not looked at by that walk.
+- **Order.** Within one walk the waiters are taken best first, as from any queue. A waiter the walk
+  passes goes to the tail of its priority on the other side, behind any of its priority that began
+  waiting during the walk; since a set wakes every waiter it satisfies whatever their order, this changes
+  only which of one set's wakes is made first.
+- **The bound.** Masked, per lock acquisition: a constant number of instructions plus the chip lock's
+  wait, at most `cores - 1` holders ahead, each also holding for a constant (every other user of the
+  object's lock holds it for a constant now too). Unmasked, a set's whole length is one step per waiter
+  per walk, and one walk more for each set made during it.
 
 ### Timeouts race with wakes, and the outcome decides
 
