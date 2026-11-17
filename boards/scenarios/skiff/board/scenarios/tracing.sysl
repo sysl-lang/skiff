@@ -1,0 +1,116 @@
+module skiff.board.scenarios
+
+import sysl.sync.Atomic
+import skiff.kernel
+import skiff.kernel.{FOREVER, NO_TASK, Port, Semaphore, Task, TraceEvent, TraceKind, TraceRing}
+
+// The kernel's trace (DESIGN "Tracing"), on every core once the mutex options are done. Each board's
+// port hands every event to `keep_event`, which records it in the core's own ring while R has it on.
+//
+// R starts its core's ring, then creates `traced_task` above itself, which runs at once and waits on
+// `signal`; R gives it, and the task runs again and waits on `signal` once more, for 3 ticks, which nobody
+// gives; R waits on `done`, which the task gives once its wait has timed out. R then stops the ring and
+// finds, in order, every step of that: each switch, the take and the block, the give and the ready, the
+// tick that brought the deadline, the timeout and the ready, the last give. Other events may come between
+// two steps (another task's switch, a tick, an interrupt), so it is judged by order alone, never by a
+// tick; and every interrupt the board reported entering it reported leaving before the next.
+
+private const RING_EVENTS: usize = 128
+private const TRACED_PRIORITY: u8 = 5
+private const TRACED_WORDS: usize = 1024
+
+private var rings: [kernel.CORES]TraceRing[RING_EVENTS] = [TraceRing.new(); kernel.CORES]
+private var signal = [Semaphore.new("signal", 0, 1); kernel.CORES]
+private var done = [Semaphore.new("done", 0, 1); kernel.CORES]
+private var traced_stacks: [kernel.CORES][TRACED_WORDS]u32
+private var timed_out: [kernel.CORES]Atomic[u32]     // 1 once the traced task's second wait timed out, 2 if not
+
+// The board's `Port.trace`: keep the event in its core's ring, if that ring records.
+keep_event[P: Port](p: *P, event: TraceEvent)
+    rings[usize(event.core)].record_masked(p, event)
+
+// A step R looks for: an event of `kind` about `task` (any task: `NO_TASK`) and the object whose waitable
+// is at `at` (any: 0).
+private struct Step
+    kind: TraceKind
+    task: Task
+    at: usize
+
+// R's part, on the running core.
+tracing[P: Port](p: *P, e: *Entries)
+    val me = kernel.here_id(p)
+    val ring = &rings[me]
+    val r = kernel.current(p)
+    ring.start()
+    val t = created(kernel.create(p, me, traced_stacks[me], e.traced, TRACED_PRIORITY))
+    // The task outranks R, so it has run and waits on `signal` by now.
+    val _ = signal[me].give(p)
+    val _ = done[me].take(p, FOREVER)
+    ring.stop()
+    val _ = kernel.delete(p, t)
+    val sig = usize(&signal[me].w)
+    val fin = usize(&done[me].w)
+    val steps = [
+        Step(TraceKind.SwitchOut, r, 0), Step(TraceKind.SwitchIn, t, 0),
+        Step(TraceKind.Take, t, sig), Step(TraceKind.Blocked, t, sig), Step(TraceKind.SwitchOut, t, 0), Step(TraceKind.SwitchIn, r, 0),
+        Step(TraceKind.Give, r, sig), Step(TraceKind.Ready, t, sig), Step(TraceKind.SwitchOut, r, 0), Step(TraceKind.SwitchIn, t, 0),
+        Step(TraceKind.Take, t, sig), Step(TraceKind.Blocked, t, sig), Step(TraceKind.SwitchOut, t, 0), Step(TraceKind.SwitchIn, r, 0),
+        Step(TraceKind.Take, r, fin), Step(TraceKind.Blocked, r, fin), Step(TraceKind.SwitchOut, r, 0),
+        Step(TraceKind.Tick, NO_TASK, 0), Step(TraceKind.TimedOut, t, sig), Step(TraceKind.Ready, t, sig), Step(TraceKind.SwitchIn, t, 0),
+        Step(TraceKind.Give, t, fin), Step(TraceKind.Ready, r, fin), Step(TraceKind.SwitchOut, t, 0), Step(TraceKind.SwitchIn, r, 0),
+    ]
+    val missing = first_missing(ring, steps)
+    val paired = interrupts_paired(ring)
+    if missing == steps.len && paired && ring.lost() == 0 && timed_out[me].load() == 1
+        say(p, "traced a task blocking, woken by a give, timing out and switching back, every step in order\n")
+    else
+        say(p, "the trace missed step ")
+        kernel.write_dec(p, u32(missing))
+        p.write(" of ".bytes)
+        kernel.write_dec(p, u32(steps.len))
+        p.write(" (".bytes)
+        kernel.write_dec(p, u32(ring.count()))
+        p.write(" events, ".bytes)
+        kernel.write_dec(p, ring.lost())
+        p.write(" lost, interrupts ".bytes)
+        p.write((if paired then "paired" else "unpaired").bytes)
+        p.write(")\n".bytes)
+
+// The first of `steps` not found in `ring` after the one before it, or `steps.len` when every one is.
+private first_missing(ring: *TraceRing[RING_EVENTS], steps: []const Step) -> usize
+    var n: usize = 0
+    for s in 0..<steps.len
+        loop
+            if n == ring.count() then return s
+            val e = ring.event(n)
+            n += 1
+            if e.kind == steps[s].kind && (steps[s].task == NO_TASK || e.task == steps[s].task) && (steps[s].at == 0 || e.at == steps[s].at)
+                break
+    steps.len
+
+// Whether each interrupt the board reported entering it reported leaving, with the same number, before
+// it reported entering another.
+private interrupts_paired(ring: *TraceRing[RING_EVENTS]) -> bool
+    var inside = false
+    var irq: u32 = 0
+    for n in 0..<ring.count()
+        val e = ring.event(n)
+        if e.kind == TraceKind.InterruptEnter
+            if inside then return false
+            inside = true
+            irq = e.value
+        elif e.kind == TraceKind.InterruptExit
+            if !inside || e.value != irq then return false
+            inside = false
+    !inside
+
+// The traced task: wait for R's give, then wait 3 ticks for a give that never comes, then give R `done`
+// and sleep until R deletes it.
+traced_task[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    val given = signal[me].take(p, FOREVER)
+    val second = signal[me].take(p, 3)
+    timed_out[me].store(if given && !second then 1 else 2)
+    val _ = done[me].give(p)
+    loop
+        kernel.sleep(p, FOREVER)

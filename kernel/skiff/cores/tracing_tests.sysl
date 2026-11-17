@@ -1,0 +1,49 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+import skiff.kernel.{FOREVER, Semaphore, Task, TraceEvent, TraceKind, TraceObject}
+
+// Tracing between cores, on the host machine of three cores (machine.sysl), whose one ring keeps every
+// core's events in the order the test acted as each core. Built with `--option trace=true` beside
+// `--option cores=3`, the test checks the events; without it, that nothing was emitted.
+
+// The events `m` kept are exactly `want`, by kind and core, oldest first.
+private events_are(m: *Machine, want: []const TraceKind, cores: []const u8)
+    val n = if m.events.count() < want.len then m.events.count() else want.len
+    for i in 0..<n
+        assert_eq(u8(m.events.event(i).kind), u8(want[i]))
+        assert_eq(m.events.event(i).core, cores[i])
+    assert_eq(m.events.count(), want.len)
+
+@test("a give on one core that wakes another core's task traces the give and the post there, then the drain's ready and switch on the waiter's core")
+trace_wake_across()
+    var m = machine()
+    val w = task_on(&m, 1, 0, 2)
+    val low = task_on(&m, 1, 1, 1)
+    val giver = task_on(&m, 0, 2, 1)
+    begin(&m)
+    var s = Semaphore.new("s", 0, 1)
+    on(&m, 1)
+    val _ = s.take(&m, FOREVER)
+    switch_now(&m)
+    m.events.start()
+    on(&m, 0)
+    assert(s.give(&m), "given")
+    on(&m, 1)
+    kernel.answer_doorbell(&m)
+    switch_now(&m)
+    assert(kernel.current(&m) == w, "the woken task runs")
+#if option_trace
+    events_are(&m, [TraceKind.Give, TraceKind.Post, TraceKind.Ready, TraceKind.Drain, TraceKind.SwitchOut, TraceKind.SwitchIn], [0, 0, 1, 1, 1, 1])
+    val give = m.events.event(0)
+    assert(give.task == giver && give.object == TraceObject.Semaphore && give.at == usize(&s.w), "core 0's task gives the semaphore")
+    val post = m.events.event(1)
+    assert(post.task == w && post.value == 1, "a wake is posted for the waiter")
+    assert(m.events.event(2).task == w, "core 1 makes the waiter ready")
+    assert_eq(m.events.event(3).value, 1)
+    assert(m.events.event(4).task == low, "core 1's low task leaves")
+    assert(m.events.event(5).task == w, "for the waiter")
+#else
+    assert_eq(m.events.count(), 0)
+#endif

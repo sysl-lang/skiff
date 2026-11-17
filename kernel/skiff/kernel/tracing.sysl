@@ -1,0 +1,146 @@
+module skiff.kernel
+
+// Tracing (DESIGN "Tracing"): the kernel tells the port what it does, one fixed-size `TraceEvent` at a
+// time, through `Port.trace`, which a board or a tool implements to keep, count or send the events on.
+//
+// **A build without the `trace` option has none of it.** Every place that emits an event is inside
+// `#if option_trace`, so with the option off no event is built and no call is made; the port's `trace`
+// keeps its default, which does nothing, and nothing calls it. The two functions a board calls from its
+// interrupt handlers, `interrupt_entered` and `interrupt_exited`, are empty then.
+//
+// An event is emitted wherever the kernel happens to be: inside a masked region, under an object's lock,
+// in an interrupt handler or in a task. So emitting one allocates nothing, waits for nothing and takes no
+// lock beyond what its caller already holds; the cost is building the event, reading the core's run
+// counter and the port's `trace`, which must keep to the same rules.
+
+// What happened. An object's event (`Give` to `Set`) marks the call as it starts, before any waiter it
+// wakes; how the call ends shows in the events that follow it: `Blocked`, `Ready`, `TimedOut`.
+enum TraceKind: u8
+    Nothing = 0
+    SwitchIn            // `task` runs from now on this core
+    SwitchOut           // `task` stops running, for the task of the `SwitchIn` that follows
+    Ready               // `task` was made ready by the end of its wait on `at`
+    Blocked             // `task` waits on `at`, for `value` ticks or `FOREVER`
+    TimedOut            // `task`'s wait on `at` ended at its deadline; `Ready` follows
+    Give                // a give of a semaphore, an unlock of a mutex, a notification (`value`: the note's value)
+    Take                // a take of a semaphore or a note, a lock of a mutex (`value`: the timeout)
+    Send                // a send to a queue or a stream buffer (`value`: the timeout)
+    Receive             // a receive from a queue or a stream buffer (`value`: the timeout)
+    Set                 // a set of event flags (`value`: the bits)
+    InterruptEnter      // the board's handler of interrupt `value` started
+    InterruptExit       // the board's handler of interrupt `value` ends
+    Tick                // the core took `value` ticks: 1, or every tick a sleep with the tick stopped spanned
+    Sleep               // the idle task stops the core's tick to sleep through up to `value` ticks
+    Wake                // the core woke from that sleep after `value` tick periods
+    Post                // a message of kind `value` about `task` was posted to `task`'s core's inbox
+    Drain               // the core's doorbell applied `value` messages from its inboxes
+    Fault               // the core reported a fault and stops
+    Stop                // `task` was stopped, by its own fault (`value` 1) or by `stop` (`value` 0)
+
+// The kind of object an event names at `at`. A channel's events are its queue's; a message buffer's are
+// its stream buffer's. `Nothing` where the event's place does not know the kind: a `Ready` or `TimedOut`
+// names the object's address alone, which the `Blocked` before it named with its kind.
+enum TraceObject: u8
+    Nothing = 0
+    Semaphore
+    Mutex
+    Queue
+    Flags
+    Note
+    Stream
+    Pool
+
+// One event, the same size whatever it says. `task` is the task it is about, or the running one (the
+// handle of no task, `NO_TASK`, before the core runs its tasks); `at` is the address of the object's
+// `Waitable` (the same for every event about one object), or 0; `stamp` is the core's run counter when
+// it was emitted (`Port.run_count`).
+struct TraceEvent
+    kind: TraceKind
+    object: TraceObject
+    core: u8
+    task: Task
+    value: u32
+    stamp: u32
+    at: usize
+
+// The event that says nothing: what an unwritten record holds.
+val NO_EVENT: TraceEvent = TraceEvent(TraceKind.Nothing, TraceObject.Nothing, 0, Task(0), 0, 0, 0)
+
+// A ring of the last `N` events one core emitted, for a port's `trace` to keep them in: a recorder in the
+// manner of a trace tool's, read back once tracing is stopped. Recording is on only between `start` and
+// `stop`; once `N` are kept, each new event takes the place of the oldest, and `lost` counts those. One
+// core writes it: a port whose core's handlers emit too records through `record_masked`.
+struct TraceRing[const N: usize]
+    events: [N]TraceEvent
+    next: usize     // where the next event goes
+    written: u32    // how many were recorded since `start`
+    on: bool
+
+impl[const N: usize] TraceRing[N]
+    // An empty ring, not recording.
+    const new() -> TraceRing[N] = TraceRing([NO_EVENT; N], 0, 0, false)
+
+    // Empty it and record from now on.
+    start(*self)
+        self.next = 0
+        self.written = 0
+        self.on = true
+
+    // Record nothing more; what is kept stays to be read.
+    stop(*self)
+        self.on = false
+
+    // Keep `e` if recording, in place of the oldest if the ring is full.
+    record(*self, e: TraceEvent)
+        if !self.on then return
+        self.events[self.next] = e
+        self.next = if self.next + 1 == N then 0 else self.next + 1
+        self.written +%= 1
+
+    // `record`, with the running core's kernel interrupts masked, so that a handler's event cannot land
+    // in the middle of a task's.
+    record_masked[P: Port](*self, p: *P, e: TraceEvent)
+        val state = p.mask()
+        self.record(e)
+        p.restore(state)
+
+    // How many events it keeps: those recorded, up to `N`.
+    count(*self) -> usize = if usize(self.written) < N then usize(self.written) else N
+
+    // How many recorded events a later one has taken the place of.
+    lost(*self) -> u32 = if usize(self.written) < N then 0 else self.written - u32(N)
+
+    // The `n`th oldest event it keeps, from 0; `n` is below `count()`.
+    event(*self, n: usize) -> TraceEvent
+        val first = if usize(self.written) < N then 0 else self.next
+        val at = first + n
+        self.events[if at >= N then at - N else at]
+
+// The running core's board reports that its handler of interrupt `irq` has started. A board calls it
+// first thing in every handler it wants seen; without the `trace` option it does nothing.
+interrupt_entered[P: Port](p: *P, irq: u32)
+#if option_trace
+    trace_running(p, TraceKind.InterruptEnter, TraceObject.Nothing, 0, irq)
+#else
+    ()
+#endif
+
+// The running core's board reports that its handler of interrupt `irq` ends: last thing in the handler.
+interrupt_exited[P: Port](p: *P, irq: u32)
+#if option_trace
+    trace_running(p, TraceKind.InterruptExit, TraceObject.Nothing, 0, irq)
+#else
+    ()
+#endif
+
+#if option_trace
+// Emit an event about task `t` on the running core.
+private[kernel] trace_task[P: Port](p: *P, kind: TraceKind, object: TraceObject, at: usize, t: Task, value: u32)
+    p.trace(TraceEvent(kind, object, u8(here_id(p)), t, value, p.run_count(), at))
+
+// Emit an event about the running core's running task, or about no task before the core runs its tasks.
+private[kernel] trace_running[P: Port](p: *P, kind: TraceKind, object: TraceObject, at: usize, value: u32)
+    val c = here(p)
+    val t = if c.sched.started() then c.sched.handle(here_id(p), usize(c.sched.running)) else NO_TASK
+    trace_task(p, kind, object, at, t, value)
+#endif

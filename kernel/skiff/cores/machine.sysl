@@ -3,7 +3,7 @@ module skiff.cores
 
 import sysl.sync.{Atomic, Ordering}
 import skiff.kernel
-import skiff.kernel.{Cache, Doorbell, Isolation, Port, Protection, Region, RegionError, RunCounter, Semaphore, Slot, Task, Watchdog}
+import skiff.kernel.{Cache, Doorbell, Isolation, Port, Protection, Region, RegionError, RunCounter, Semaphore, Slot, Task, TraceEvent, TraceRing, Watchdog}
 
 // A machine of `kernel.CORES` cores on the host, played one core at a time: `me` says which core is
 // running, and a test changes it to act as another. Its doorbell rings nothing; it counts the rings each
@@ -29,6 +29,7 @@ struct Machine
     inside: [kernel.CORES]u32      // the cores whose idle step is taken while the sleeping core sleeps, in turn
     inside_count: usize             // how many of them there are
     inside_next: usize              // the next to take
+    events: TraceRing[64]          // every core's events, in the order the cores emitted them, once started
 
 // Each core reads its own counter.
 impl RunCounter for Machine
@@ -102,6 +103,9 @@ impl Port for Machine
         self.me = sleeper
         slept
 
+    // Every core's events go to the one ring, so a test reads the order across cores too.
+    override trace(*self, event: TraceEvent) = self.events.record(event)
+
 impl Doorbell for Machine
     ring(*self, core: u32)
         self.rung[core] += 1
@@ -139,7 +143,7 @@ impl Isolation for Machine
 // every one of them may be used by two cores, so the whole address space counts as `.shared`.
 machine() -> Machine
     kernel.shared_bounds(0, 0xffff_ffff_ffff_ffff)
-    Machine(0, [0; kernel.CORES], [0; kernel.CORES], 0, [false; kernel.CORES], null, [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], 0, kernel.FOREVER, 0, 0, [0; kernel.CORES], 0, 0)
+    Machine(0, [0; kernel.CORES], [0; kernel.CORES], 0, [false; kernel.CORES], null, [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], 0, kernel.FOREVER, 0, 0, [0; kernel.CORES], 0, 0, TraceRing.new())
 
 // Act as core `core` from now on.
 on(m: *Machine, core: u32)

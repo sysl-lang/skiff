@@ -22,7 +22,8 @@ import skiff.kernel.{Port, Task, TaskError, TaskState}
 //     on core 1, which runs. Then it waits for the waits (waits.sysl), the messages (messages.sysl) and,
 //     on several cores, the waits across cores (crossing.sysl). Then it runs the software timers
 //     (timers.sysl), deferred work (deferred.sysl), task control (control.sysl), the statistics
-//     (stats.sysl), the mutex options (mutexes.sysl), the protection scenarios (protection.sysl),
+//     (stats.sysl), the mutex options (mutexes.sysl), the kernel's trace (tracing.sysl), the error
+//     traces (traces.sysl), the protection scenarios (protection.sysl),
 //     the grants (grants.sysl), a sleep with the tick stopped (tickless.sysl) and the watchdog
 //     (watchdog.sysl), whose hang ends the core it is run with.
 
@@ -71,6 +72,7 @@ struct Entries
     worked: kernel.WorkCallback
     beat: *extern() -> never        // the watchdog's watched task (watchdog.sysl)
     hang: *extern() -> never        // the task that hangs its core (watchdog.sysl)
+    traced: *extern() -> never      // the task whose waits and switches the trace follows (tracing.sysl)
 
 private var stacks: [kernel.CORES][STACKS][STACK_WORDS]u32
 

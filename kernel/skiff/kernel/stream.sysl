@@ -58,6 +58,9 @@ impl[const N: usize] StreamBuffer[N]
     // many bytes were written, from 0 to all of them. Only a task may wait; with a timeout of 0 nothing
     // waits.
     send[P: Port](*self, p: *P, data: []const u8, timeout: u32) -> usize
+#if option_trace
+        trace_running(p, TraceKind.Send, TraceObject.Stream, usize(&self.w), timeout)
+#endif
         val deadline = ticks() +% timeout
         var sent: usize = 0
         var last = false
@@ -71,6 +74,9 @@ impl[const N: usize] StreamBuffer[N]
                 return sent
             val c = running_core(p)
             enqueue_running(c, &self.w, left, WRITING, 0, 1)
+#if option_trace
+            trace_running(p, TraceKind.Blocked, TraceObject.Stream, usize(&self.w), left)
+#endif
             p.request_switch()
             l.release()
             wait_outcome(c) match
@@ -87,6 +93,9 @@ impl[const N: usize] StreamBuffer[N]
     // waits, and whatever is there is read whatever the level.
     receive[P: Port](*self, p: *P, buf: []u8, timeout: u32) -> usize
         if buf.len == 0 then return 0
+#if option_trace
+        trace_running(p, TraceKind.Receive, TraceObject.Stream, usize(&self.w), timeout)
+#endif
         val deadline = ticks() +% timeout
         var last = false
         loop
@@ -99,6 +108,9 @@ impl[const N: usize] StreamBuffer[N]
                 return n
             val c = running_core(p)
             enqueue_running(c, &self.w, left, READING, 0, 0)
+#if option_trace
+            trace_running(p, TraceKind.Blocked, TraceObject.Stream, usize(&self.w), left)
+#endif
             p.request_switch()
             l.release()
             wait_outcome(c) match
@@ -214,6 +226,9 @@ impl[const N: usize] MessageBuffer[N]
     send[P: Port](*self, p: *P, message: []const u8, timeout: u32) -> bool
         val need = message.len + MESSAGE_PREFIX
         if message.len == 0 || need > N then return false
+#if option_trace
+        trace_running(p, TraceKind.Send, TraceObject.Stream, usize(&self.s.w), timeout)
+#endif
         val deadline = ticks() +% timeout
         var last = false
         loop
@@ -229,6 +244,9 @@ impl[const N: usize] MessageBuffer[N]
                 return false
             val c = running_core(p)
             enqueue_running(c, &self.s.w, left, WRITING, 0, u32(need))
+#if option_trace
+            trace_running(p, TraceKind.Blocked, TraceObject.Stream, usize(&self.s.w), left)
+#endif
             p.request_switch()
             l.release()
             wait_outcome(c) match
@@ -243,6 +261,9 @@ impl[const N: usize] MessageBuffer[N]
     // or 0 if the timeout came first or `buf` is too short for it, which leaves it to be received. Only
     // a task may wait; with a timeout of 0 nothing waits.
     receive[P: Port](*self, p: *P, buf: []u8, timeout: u32) -> usize
+#if option_trace
+        trace_running(p, TraceKind.Receive, TraceObject.Stream, usize(&self.s.w), timeout)
+#endif
         val deadline = ticks() +% timeout
         var last = false
         loop
@@ -255,6 +276,9 @@ impl[const N: usize] MessageBuffer[N]
                 return n
             val c = running_core(p)
             enqueue_running(c, &self.s.w, left, READING, 0, 0)
+#if option_trace
+            trace_running(p, TraceKind.Blocked, TraceObject.Stream, usize(&self.s.w), left)
+#endif
             p.request_switch()
             l.release()
             wait_outcome(c) match

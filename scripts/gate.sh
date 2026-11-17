@@ -3,11 +3,13 @@
 #
 #   1. the kernel's tests on the host, which work only because the kernel has no hardware in it: its own,
 #      with one core, and skiff.cores, which builds the kernel for three and plays each core in turn;
-#      then the MPU region encodings (arch/pmsa), which are arithmetic, and the ticket lock (arch/ticket);
+#      both again with the `trace` option on, where the kernel emits its events (DESIGN "Tracing") and
+#      the tests of them check what it emits, as without it they check that it emits nothing; then the
+#      MPU region encodings (arch/pmsa), which are arithmetic, and the ticket lock (arch/ticket);
 #   2. the kernel built for every CPU family skiff may ever run on, ported or not, through
 #      tools/portable, which instantiates its generic parts: anything chip- or architecture-specific in
 #      kernel/ fails here on the first target that cannot have it;
-#   3. the boot test, at the default optimisation and at -O0.
+#   3. the boot test, at the default optimisation and at -O0. The boards build the kernel with `trace`.
 
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -24,6 +26,8 @@ step() {
 
 step "$compiler" test "$root/kernel" --filter skiff.kernel
 step "$compiler" test "$root/kernel" --option cores=3 --filter skiff.cores
+step "$compiler" test "$root/kernel" --option trace=true --filter skiff.kernel
+step "$compiler" test "$root/kernel" --option cores=3 --option trace=true --filter skiff.cores
 step "$compiler" test "$root/arch/pmsa"
 step "$compiler" test "$root/arch/ticket"
 mkdir -p "$root/scratch"

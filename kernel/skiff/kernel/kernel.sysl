@@ -136,6 +136,12 @@ trait Port: Doorbell + Cache + Protection + Isolation + RunCounter + Watchdog
     // `tickless_limit()`.
     sleep_ticks(*self, count: u32) -> u32 = 0
 
+    // Take one event the kernel emits (DESIGN "Tracing"), on the core it happened on: from a task, from
+    // an interrupt handler, inside a masked region or under an object's lock. So it allocates nothing,
+    // waits for nothing and takes no lock, and its cost is bounded. Only a kernel built with the `trace`
+    // option emits any; a port that keeps this default drops them.
+    trace(*self, event: TraceEvent) = ()
+
 // Bring the kernel up on `p`: greet on this core's console. On a machine with more than one core the
 // greeting names the core. Answers the status the machine should stop with: 0 for success.
 boot[P: Port](p: *P) -> i32

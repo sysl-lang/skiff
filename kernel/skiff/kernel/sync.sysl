@@ -25,6 +25,9 @@ impl Semaphore
     // Take one, waiting up to `timeout` ticks for one to be given. Answers whether it was taken. Only a
     // task may wait; with a timeout of 0 nothing waits.
     take[P: Port](*self, p: *P, timeout: u32) -> bool
+#if option_trace
+        trace_running(p, TraceKind.Take, TraceObject.Semaphore, usize(&self.w), timeout)
+#endif
         var l = self.w.lock.on(p)
         l.acquire()
         if self.count > 0
@@ -36,6 +39,9 @@ impl Semaphore
             return false
         val c = running_core(p)
         enqueue_running(c, &self.w, timeout, 0, 0, 0)
+#if option_trace
+        trace_running(p, TraceKind.Blocked, TraceObject.Semaphore, usize(&self.w), timeout)
+#endif
         p.request_switch()
         l.release()
         wait_outcome(c) == Outcome.Given
@@ -46,6 +52,9 @@ impl Semaphore
     // Give one: to the best waiting task if there is one, else to the count. Answers false, giving
     // nothing, when the count is already at `max`. An interrupt handler may call it.
     give[P: Port](*self, p: *P) -> bool
+#if option_trace
+        trace_running(p, TraceKind.Give, TraceObject.Semaphore, usize(&self.w), 0)
+#endif
         var l = self.w.lock.on(p)
         l.acquire()
         var given = true
@@ -123,6 +132,9 @@ impl Mutex
     // Lock it, waiting up to `timeout` ticks, or say why it was not had. A task may lock a mutex it
     // already holds only if the mutex is recursive.
     enter[P: Port](*self, p: *P, timeout: u32) -> Result[unit, MutexError]
+#if option_trace
+        trace_running(p, TraceKind.Take, TraceObject.Mutex, usize(&self.w), timeout)
+#endif
         val c = running_core(p)
         val i = usize(c.sched.running)
         val me = c.sched.handle(c.id, i)
@@ -156,6 +168,9 @@ impl Mutex
         val owner = self.owner
         val mine = c.sched.tasks[i].priority
         enqueue_running(c, &self.w, timeout, 0, 0, 0)
+#if option_trace
+        trace_running(p, TraceKind.Blocked, TraceObject.Mutex, usize(&self.w), timeout)
+#endif
         p.request_switch()
         l.release()
         // The core stays masked until the owner has inherited, or been asked to, so nothing runs in
@@ -172,6 +187,9 @@ impl Mutex
     // takes up its ceiling. The running task lets go of its ceiling, and drops any priority it inherited
     // once it holds no mutex. Only the owner may.
     unlock[P: Port](*self, p: *P)
+#if option_trace
+        trace_running(p, TraceKind.Give, TraceObject.Mutex, usize(&self.w), 0)
+#endif
         val c = running_core(p)
         val i = usize(c.sched.running)
         val outer = p.mask()

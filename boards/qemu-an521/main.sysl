@@ -77,6 +77,7 @@ impl Port for Board
     spin_unlock(*self, word: *Atomic[u32]) = armv7m.spin_unlock(word)
     override tickless_limit(*self) -> u32 = armv7m.systick_limit()
     override sleep_ticks(*self, count: u32) -> u32 = armv7m.systick_sleep(count)
+    override trace(*self, event: kernel.TraceEvent) = scenarios.keep_event(self, event)
 
 // The doorbells are MHU0's, one each way.
 impl Doorbell for Board
@@ -120,7 +121,7 @@ extern __code_end: u8
 // The status `boot` answered on core 0, which core 0's last task stops the machine with.
 private var status: i32 = 0
 
-private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject, &task_measured, &task_locker, &task_work, &worked, &task_beat, &task_hang)
+private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject, &task_measured, &task_locker, &task_work, &worked, &task_beat, &task_hang, &task_traced)
 
 @export("skiff_main")
 skiff_main() -> never
@@ -253,6 +254,7 @@ private task_measured() -> never = scenarios.measured_task(&Board())
 private task_locker() -> never = scenarios.locker_task(&Board())
 private task_beat() -> never = scenarios.beat_task(&Board())
 private task_hang() -> never = scenarios.hang_task(&Board(), false)
+private task_traced() -> never = scenarios.traced_task(&Board())
 
 // Raise the running core's timer interrupt from software; the timer itself never runs.
 private raise() = armv7m.pend_irq(TIMER_IRQ)
@@ -270,7 +272,7 @@ private task_idle() -> never
         kernel.rest(&board)
 
 // R: the handle checks, then the waits, the timers, deferred work, task control, the statistics, the
-// mutex options, the protection, the grants, the time base without core 0, a sleep with the tick
+// mutex options, the kernel's trace, the error traces, the protection, the grants, the time base without core 0, a sleep with the tick
 // stopped and the watchdog, then the
 // end of the run. Core 1 hangs, and its watchdog stops it; core 0, its own watch still fed, waits until
 // it sees core 1 stopped, ticks on, and stops the machine.
@@ -283,6 +285,7 @@ private task_r() -> never
     scenarios.control(&board, &entries)
     scenarios.stats(&board, &entries)
     scenarios.mutexes(&board, &entries)
+    scenarios.tracing(&board, &entries)
     val me = an521.core_id()
     val code = Region(usize(&__code_start), usize(&__code_end) - usize(&__code_start), Access.Execute)
     scenarios.traces(&board, &entries, code)
@@ -312,12 +315,15 @@ board_doorbell()
     kernel.answer_doorbell(&board)
 
 // SysTick, on either core: one tick for the kernel on that core, then its supervision. A bite stops that
-// core alone, as a fault does.
+// core alone, as a fault does. Its entry and exit are reported to the kernel's trace, by the exception's
+// number.
 @export("skiff_systick")
 board_tick()
     var board = Board()
+    kernel.interrupt_entered(&board, armv7m.SYSTICK_EXCEPTION)
     kernel.tick(&board)
     if kernel.supervise(&board) then armv7m.stop_core()
+    kernel.interrupt_exited(&board, armv7m.SYSTICK_EXCEPTION)
 
 // The NMI, which only core 0 takes, from a watchdog no core arms: the kernel's verdict all the same.
 @export("skiff_nmi")

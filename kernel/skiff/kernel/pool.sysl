@@ -76,6 +76,9 @@ impl[const N: usize, const SIZE: usize] Pool[N, SIZE]
     // Its contents are whatever its last owner left. Only a task may wait; with a timeout of 0 nothing
     // waits, and an interrupt handler may call it.
     take[P: Port](*self, p: *P, timeout: u32) -> Option[Buffer]
+#if option_trace
+        trace_running(p, TraceKind.Take, TraceObject.Pool, usize(&self.w), timeout)
+#endif
         var l = self.w.lock.on(p)
         l.acquire()
         if self.free() > self.kept
@@ -87,6 +90,9 @@ impl[const N: usize, const SIZE: usize] Pool[N, SIZE]
             return None
         val c = running_core(p)
         enqueue_running(c, &self.w, timeout, 0, 0, 0)
+#if option_trace
+        trace_running(p, TraceKind.Blocked, TraceObject.Pool, usize(&self.w), timeout)
+#endif
         p.request_switch()
         l.release()
         if wait_outcome(c) != Outcome.Given then return None
@@ -100,6 +106,9 @@ impl[const N: usize, const SIZE: usize] Pool[N, SIZE]
     give[P: Port](*self, p: *P, b: Buffer) -> Result[unit, BufferError]
         val gone = self.reissue(p, b)?
         p.clean(self.storage(gone))
+#if option_trace
+        trace_running(p, TraceKind.Give, TraceObject.Pool, usize(&self.w), 0)
+#endif
         var l = self.w.lock.on(p)
         l.acquire()
         self.held[gone.index()] = false

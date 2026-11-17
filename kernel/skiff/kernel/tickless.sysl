@@ -21,7 +21,13 @@ rest[P: Port](p: *P)
         p.idle()
         return
     val from = c.own_ticks()
+#if option_trace
+    trace_running(p, TraceKind.Sleep, TraceObject.Nothing, 0, count)
+#endif
     val slept = p.sleep_ticks(count)
+#if option_trace
+    trace_running(p, TraceKind.Wake, TraceObject.Nothing, 0, slept)
+#endif
     if slept > 0
         take_ticks(p, c, slept)
         c.skipped = c.skipped +% slept

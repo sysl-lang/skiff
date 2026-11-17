@@ -986,6 +986,66 @@ on, as after a fault. `kernel/skiff/kernel/watchdog.sysl` is the kernel's side.
   its watch bites from its tick; core 0's watch stays fed while it waits to see core 1 stopped. This
   replaces the BusFault that ended core 1 before.
 
+## Tracing
+
+The kernel tells the port what it does, one event at a time, in the spirit of FreeRTOS's trace macros,
+Zephyr's tracing subsystem and SystemView's events: what a board or a tool needs to show which task ran
+when, what each waited on, and who woke it.
+
+- **An event is one fixed-size `TraceEvent`**: its kind, the kind of object, the core, a task handle, a
+  value, the core's run counter (`Port.run_count`) and the address of the object's `Waitable`, which is
+  the same for every event about one object, so a tool names an object by its address and finds its name
+  in the lock at that address.
+- **The port takes it**: `Port.trace(event)`, a member with a default that does nothing. The kernel
+  names no register, buffer or wire; a board keeps the events, counts them, or sends them out as it
+  likes. The kernel provides one keeper, `TraceRing[N]`: a ring of the last N events of one core,
+  recording between `start` and `stop`, each new event taking the oldest's place once full (`lost`
+  counts those), read oldest first with `event(n)`. `record_masked` masks the core's kernel interrupts
+  around the write, for a port whose handlers emit too.
+- **Off costs nothing.** The kernel option `trace` (a `bool`, off by default) is an `#if` symbol,
+  `option_trace`, and every place that emits an event is inside `#if option_trace`: with it off no event
+  is built, nothing is read for it, and nothing is called; the kernel's code is what it was without
+  tracing. The two calls a board makes from its handlers, `interrupt_entered(p, irq)` and
+  `interrupt_exited(p, irq)`, are empty functions then. The gate runs the host tests with the option off
+  and on; off, every tracing test checks that nothing reached the port.
+- **Safe anywhere, bounded.** An event is emitted wherever the kernel is: inside a masked region, under
+  an object's lock, in an interrupt handler, in a task. Emitting one allocates nothing, waits for
+  nothing and takes no lock beyond what its caller already holds: it builds the event, reads the core's
+  run counter and calls `Port.trace` once. A port's `trace` keeps to the same rules: no allocation, no
+  wait, no lock, a bounded cost (the ring's is a store and two adds). It is called on the core the event
+  happened on; events of one core come in the order they happened on it, and nothing orders two cores'
+  events but a common clock the board may have.
+- **An object's event marks the call as it starts**, before any waiter it wakes; how the call ends is
+  in the events that follow. So a give that wakes a task is `Give`, then `Ready` of the waiter, then, if
+  it outranks the giver, `SwitchOut` and `SwitchIn`.
+
+| event | emitted | task | value |
+|---|---|---|---|
+| `SwitchIn`, `SwitchOut` | the switch, when the running task changes; `SwitchIn` also as the core runs its first task | the task coming in / leaving | |
+| `Ready` | a wait ended and its task made ready: on the waker's core, or on the waiter's when the inbox applies a wake or a hand-over | the waiter | |
+| `Blocked` | a task queued on an object's wait | the waiter | its timeout |
+| `TimedOut` | a wait ended at its deadline (`Ready` follows) | the waiter | |
+| `Give`, `Take` | a semaphore's give and take, a mutex's unlock and lock, a notification's give and a task's wait for one, a pool's give back and take, a flags wait (`Take`) | the caller | the timeout; a notification's value |
+| `Send`, `Receive` | a queue's or a stream or message buffer's (a channel's are its queue's) | the caller | the timeout |
+| `Set` | event flags set | the caller | the bits |
+| `InterruptEnter`, `InterruptExit` | the board's report, first and last thing in a handler | the running task | the interrupt's number |
+| `Tick` | ticks taken: one, or every period a tickless sleep spanned | the running task | how many |
+| `Sleep`, `Wake` | the idle task stops the tick, and wakes | the idle task | ticks asked / periods slept |
+| `Post` | a message posted to another core's inbox | the task it is about | the message's kind |
+| `Drain` | the doorbell's drain ends | the running task | messages applied |
+| `Fault` | the core reports a fault | the running task | |
+| `Stop` | a task stopped by its own fault (1) or by `stop` (0) | the task | 1 or 0 |
+
+  `Ready` and `TimedOut` name the object's address with no kind (the `Blocked` before them gave it); a
+  `Ready` the inbox applies for a wake names no object at all, since the message carries none. A sleeper
+  made ready by a tick has no `Ready`: the tick's `Tick` says it came.
+- **The boards build with `trace` on** and keep the events in a `TraceRing[128]` per core
+  (`boards/scenarios/.../tracing.sysl`), and report SysTick's entry and exit. R's scenario, after the mutex
+  options, starts its core's ring, creates a task above itself that blocks on a semaphore, gives it,
+  lets its second, timed take time out, waits for its give, stops the ring and finds 25 steps in order:
+  every switch, take, block, give, ready, the tick, the timeout. Other events may lie between two steps,
+  so it is judged by order alone, never by a tick; every interrupt entered must be left before the next.
+
 ## Open questions
 
 - **32 priorities, settled with no option.** The bitmap is one `u32` and the FIFOs cost two `u16` a

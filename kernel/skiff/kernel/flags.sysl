@@ -48,6 +48,9 @@ impl Flags
     // Set `bits`, ending every wait that is now satisfied. Answers the bits as they are afterwards. An
     // interrupt handler may call it.
     set[P: Port](*self, p: *P, bits: u32) -> u32
+#if option_trace
+        trace_running(p, TraceKind.Set, TraceObject.Flags, usize(&self.w), bits)
+#endif
         self.start_set(p, bits) match
             Some(now) -> now
             None -> self.finish(p)
@@ -76,6 +79,9 @@ impl Flags
     // Only a task may wait; with a timeout of 0 nothing waits.
     wait[P: Port](*self, p: *P, wanted: u32, all: bool, clear: bool, timeout: u32) -> Option[u32]
         if wanted == 0 then return None
+#if option_trace
+        trace_running(p, TraceKind.Take, TraceObject.Flags, usize(&self.w), timeout)
+#endif
         val mode = (if all then WAIT_ALL else 0) | (if clear then CLEAR_ON_EXIT else 0)
         var l = self.w.lock.on(p)
         l.acquire()
@@ -91,6 +97,9 @@ impl Flags
             return None
         val c = running_core(p)
         enqueue_running(c, &self.w, timeout, self.joining, mode, wanted)
+#if option_trace
+        trace_running(p, TraceKind.Blocked, TraceObject.Flags, usize(&self.w), timeout)
+#endif
         p.request_switch()
         l.release()
         if wait_outcome(c) == Outcome.Woken then Some(wait_value(c)) else None
