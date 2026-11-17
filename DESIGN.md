@@ -413,7 +413,7 @@ handing over a buffer, never by copying it. A **pool** holds the buffers; a **ch
 - **One time base**: `ticks()` is a single counter in `.shared`, advanced by core 0's tick. Every core
   ticks its own scheduler at the same rate (time slices, its timeout list) and compares deadlines with
   that one counter, so a timeout means the same on every core.
-- A deadline is `i32(deadline - now) <= 0`, so the counter may wrap.
+- A deadline is `i32.wrap(deadline -% now) <= 0`, so the counter may wrap.
 - Tickless idle (milestone 10) replaces the periodic tick with a one-shot wake at the next deadline; the
   counter then comes from a hardware timer every core can read.
 

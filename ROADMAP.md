@@ -108,7 +108,7 @@ A dependency only points down the list. `kernel/` names no register, interrupt n
 | host, `sysl test kernel` | the kernel's decisions over fake ports, with N fake cores | edge cases no boot reaches |
 | QEMU `mps2-an500` / `mps2-an386` | one core, M7 and M4 | the single-core kernel |
 | QEMU `mps2-an521` | one image on both M33s; two images for the option | cross-core waits, the inbox, locks, the handshake, under multi-threaded TCG |
-| Pico 2 (RP2350) | one image, two M33s | real silicon, the SIO FIFO doorbell, the spinlocks (erratum E2) |
+| Pico 2 (RP2350) | one image, two M33s; on benchtop's emulated Pico 2 first, then the board | real silicon's start-up (the boot ROM's IMAGE_DEF and core 1 launch), the SIO doorbells, exclusives as the lock (erratum E2 rules out the spinlocks) |
 | H747I-DISCO | one image on M7 + M4, then two | HSEM, clocks and power, the M7's caches, uncached shared state |
 
 Every milestone has a test that passes or fails on what the machine prints, and controls: a deliberate
@@ -123,13 +123,14 @@ defect that must make it fail.
 | 2 | Tasks: per-core schedulers, generation handles, tables sized by `options` (sysl 0.3.7) | interleave, preempt and FP-survival scenarios on every core; a stale handle is refused |
 | 3 | Waits and locks: the wait queue, the lock trait, semaphore, mutex with inheritance, queue, flags, notifications | the skiff-old scenarios pass on every core; on the AN521 both cores contend for one object's lock, and one core gives what the other takes without blocking (a blocking take across cores needs milestone 4's wake) |
 | 4 | Cross-core wakes: inboxes and doorbells; channels and the buffer pool | each object is given on one core and taken, blocking, on the other; a priority-inversion scenario across cores completes in bounded time; buffers round-trip without a copy |
-| 5 | Pico 2, the first real silicon: `chips/rp2350`, `boards/pico2` (one image, both M33s), the SIO FIFO doorbell, the lock (spinlocks or exclusives, per erratum E2), UF2 | milestones 1–4's scenarios pass on the board |
+| 5 | Pico 2, the first real silicon: `chips/rp2350`, `boards/pico2` (one image, both M33s), the SIO doorbells, the lock (exclusives, per erratum E2), the image the boot ROM runs | milestones 1–4's scenarios pass on benchtop's emulated Pico 2, from the image built for the board, then on the board. **The port runs on benchtop**: core 0 passes milestones 1–4 and 7 (the boot test's `pico2`); the protection scenarios wait on two benchtop fixes |
 | 6 | Protection: stack and null guards, unprivileged tasks with their own maps and kernel calls | the skiff-old protection scenarios, on every core, the Pico 2 included. **Done on every QEMU core** (AN500, AN386, both AN521 cores, at both optimisations); the Pico 2 waits on milestone 5. Queues, channels and pool buffers are granted too, a held buffer lent to its holder's map |
 | 7 | The rest of the kernel on the wait queue: software timers, stream and message buffers, task control, statistics and stack high-water marks | skiff-old's scenarios for each. **Software timers done** on every QEMU core (a service task per core, commands through its queue; another core's commands refused, DESIGN "Software timers"). **Task control done** on every QEMU core, both optimisations: suspend, resume, `set_priority` (a boost kept apart from the base), stop (wait withdrawn, slot reused), another core's task through its inbox (DESIGN "Task control"). **Stream and message buffers done** on every QEMU core (an interrupt's bytes at the trigger level, partial writes and reads, whole messages, timeouts), and across the AN521's cores, both blocking. **Statistics and stack high-water marks done** on every QEMU core, both optimisations: run time charged in each core's own counter (a chip `RunCounter`) at every switch and tick, idle time, a reused slot counting from 0, painted stacks scanned above the reserve, another core's task refused `Remote` (DESIGN "Statistics"). **Milestone 7 is done on QEMU** |
 | 8 | Two images, the option: board features (`split`, one per image) with `#if feature_…` choosing each image's tasks, a link script per image with `.shared` at one address, the system description, ownership checked at build, the fingerprint handshake | the AN521 boots two images from one board program; mismatched layouts stop at the handshake. First check that a link script can differ by feature; if not, that is a sysl finding. **Done on the AN521** (both optimisations; core 1's image uses its FPU): DESIGN "Two images"; the H747I's two images are milestone 9's |
 | 9 | The H747I-DISCO (needs the board): clocks and power, HSEM, one image on both cores with shared state uncached on the M7, then the two-image build with the cache trait | milestone 4's scenarios on the board in both builds, caches on |
 | 10 | Supervision and power: a watchdog per core, faults forwarded, one console, tickless idle, coordinated stop | a hung core is noticed; both cores enter Stop and wake |
 
-skiff needs sysl 0.3.9 or later: milestone 1 on uses `options` and an `if` as a constant, 3 a `const new`
-as data and an enum's zero, and 8 uses the
-explicit type-argument fix and a link script per feature.
+skiff needs sysl 0.9.20 or later: milestone 1 on uses `options` and an `if` as a constant, 3 a `const new`
+as data and an enum's zero, 8 the explicit type-argument fix and a link script per feature, and the
+timers `@keeps` on a function-pointer type's parameter (0.9.20); since 0.8 a debug build traps on
+integer overflow, so tick arithmetic wraps explicitly.
