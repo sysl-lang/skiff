@@ -36,6 +36,7 @@ private[kernel] struct Recorder
     watchdog_ticks: u32     // what the hardware watchdog was last started at (0: never)
     feeds: u32              // how many times it was fed
     watchdog_stops: u32     // how many times it was stopped
+    masks: u32              // how many times the kernel masked, nested ones among them
     skip_limit: u32         // the most ticks a sleep with the tick stopped may span (0: the tick never stops)
     wake_after: u32         // how many ticks such a sleep lasts before an interrupt ends it (FOREVER: none comes)
     asked: u32              // the ticks the last such sleep was asked to span (0: none was)
@@ -129,6 +130,7 @@ impl Port for Recorder
 
     mask(*self) -> u32
         self.masked += 1
+        self.masks += 1
         self.masked - 1
 
     restore(*self, state: u32)
@@ -152,7 +154,7 @@ impl Doorbell for Recorder
     ring(*self, core: u32) = panic("one core never rings")
     clear(*self) = panic("one core never rings")
 
-private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, 0, 0, 0, 0, null, null, 0, 0, 0, 0, 0, 0, false, 8, 0, 0, 0, 0, 0, 0, 0, FOREVER, 0)
+private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, 0, 0, 0, 0, null, null, 0, 0, 0, 0, 0, 0, false, 8, 0, 0, 0, 0, 0, 0, 0, 0, FOREVER, 0)
 
 // Whether `r` recorded exactly `want`.
 private[kernel] recorded(r: *Recorder, want: string) -> bool
