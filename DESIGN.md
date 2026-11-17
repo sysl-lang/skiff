@@ -264,8 +264,9 @@ try fails and the task selects again.
   may name the newcomer: a hint like any other.
 - **When a member posts**: under its own lock, after any change that leaves it **available**, that is,
   with something a try would take now: a semaphore's count above 0; a queue's messages not kept for a
-  woken receiver; a stream buffer's bytes at its trigger level (a message buffer's: a whole message);
-  a channel's buffers. So a give, a send or a write posts, and so does a take or a receive that leaves
+  woken receiver; a stream buffer's bytes at its trigger level (a message buffer's: a whole message,
+  posted once its length and its bytes are both in, so a message is one notice and its reader never
+  wakes to half of one); a channel's buffers. So a give, a send or a write posts, and so does a take or a receive that leaves
   more, which is what keeps a member of count 3 from being heard once. A hand-over posts nothing: a
   give to a task waiting on the semaphore itself, or a message kept for a woken receiver, is not
   available to anyone else. **Event flags post on a set that names bits**, and nowhere else: their

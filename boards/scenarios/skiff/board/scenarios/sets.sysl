@@ -105,7 +105,7 @@ private heard_on_core[P: Port](p: *P, e: *Entries, me: u32) -> bool
         Some(b) -> right = right && set_pages[me].try_send(p, &set_pool[me], b).is_ok()
         None -> right = false
     right = right && heard_within(p, HEARD_TICKS, heard_count[me].load() == 6 && set_pool[me].available(p) == 1)
-    right = right && set_units[me].give(p) && set_units[me].try_take(p)
+    right = right && missed[me].load() == 0 && set_units[me].give(p) && set_units[me].try_take(p)
     right = right && heard_within(p, HEARD_TICKS, missed[me].load() == 1) && heard_count[me].load() == 6
     for k in 0..<KINDS
         right = right && heard[me][k] == u8(k)
