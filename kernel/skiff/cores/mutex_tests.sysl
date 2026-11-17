@@ -1,0 +1,68 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+import skiff.kernel.{FOREVER, Mutex, Task, TaskState}
+
+// The mutex options across cores, on the host machine of three cores (machine.sysl): a recursive mutex
+// with a ceiling handed whole to a waiter of another core.
+
+// `t`'s effective priority, read from its core's table.
+private priority_of(m: *Machine, t: Task) -> u8
+    on(m, t.core())
+    kernel.here(m).sched.tasks[t.slot()].priority
+
+// How many mutexes `t` holds.
+private held_by(m: *Machine, t: Task) -> u8
+    on(m, t.core())
+    kernel.here(m).sched.tasks[t.slot()].held
+
+@test("a recursive mutex with a ceiling goes to a waiter of another core only at its last unlock, locked once, and the heir's core takes up the ceiling")
+recursive_hand_across()
+    var m = machine()
+    val o = task_on(&m, 1, 0, 1)
+    val h = task_on(&m, 0, 1, 2)
+    val _ = task_on(&m, 0, 2, 1)
+    begin(&m)
+    var x = Mutex.recursive_with_ceiling("x", 4)
+    on(&m, 1)
+    assert(x.lock(&m, FOREVER), "the owner locks it")
+    assert(x.lock(&m, FOREVER), "and again")
+    assert_eq(priority_of(&m, o), 4)
+    on(&m, 0)
+    assert(!x.lock(&m, FOREVER), "the waiter of another core blocks")
+    switch_now(&m)
+    assert_eq(priority_of(&m, h), 2)
+    on(&m, 1)
+    kernel.answer_doorbell(&m)
+    assert_eq(priority_of(&m, o), 4)
+    on(&m, 1)
+    x.unlock(&m)
+    assert(x.holder() == o, "one unlock of two keeps it")
+    assert_eq(x.depth(), 1)
+    assert_eq(m.rung[0], 0)
+    assert_eq(priority_of(&m, o), 4)
+    on(&m, 1)
+    x.unlock(&m)
+    assert(x.holder() == h, "handed over at the last unlock")
+    assert_eq(x.depth(), 1)
+    assert_eq(priority_of(&m, o), 1)
+    assert_eq(held_by(&m, o), 0)
+    assert_eq(m.rung[0], 1)
+    on(&m, 0)
+    kernel.answer_doorbell(&m)
+    on(&m, 0)
+    assert(kernel.state(&m, h).unwrap() == TaskState.Ready, "ready")
+    assert_eq(held_by(&m, h), 1)
+    assert_eq(priority_of(&m, h), 4)
+    on(&m, 0)
+    switch_now(&m)
+    assert(kernel.current(&m) == h, "the heir runs, holding the mutex")
+    assert(x.lock(&m, FOREVER), "and may lock it again")
+    assert_eq(x.depth(), 2)
+    x.unlock(&m)
+    x.unlock(&m)
+    assert(x.holder() == kernel.NO_TASK, "free")
+    assert_eq(priority_of(&m, h), 2)
+    assert_eq(held_by(&m, h), 0)
+    assert_eq(m.masked, 0)

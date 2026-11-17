@@ -1,0 +1,91 @@
+module skiff.board.scenarios
+
+import sysl.sync.Atomic
+import skiff.kernel
+import skiff.kernel.{FOREVER, Mutex, MutexError, NO_TASK, Port, Task}
+
+// The two mutex options, on every core, once the statistics are done. R (priority 4) creates each task
+// in turn; every one runs `locker_task`, which reads its role as it starts.
+//
+//   - Recursive: R locks a recursive mutex 3 times, then creates a waiter (5) that preempts it and
+//     waits on the mutex. R's first two unlocks keep the mutex; the waiter, which outranks R, has it at
+//     the third, locked once, and says so before R goes on.
+//   - Ceiling: R locks a mutex of ceiling 6 and runs at 6, so a task of priority 5 it creates does not
+//     run until R unlocks; R is then back at 4. A mutex of ceiling 3 refuses R, of priority 4.
+
+// The roles a locker plays.
+private const NESTED_WAITER: u8 = 1
+private const OUTRANKED: u8 = 2
+private const LOCKER_ROLES: usize = 3
+
+// 4 KiB each, plenty for a lock at -O0.
+private const LOCKER_WORDS: usize = 1024
+
+private var nested = [Mutex.recursive("nested"); kernel.CORES]
+private var ceiled = [Mutex.with_ceiling("ceiled", 6); kernel.CORES]
+private var below = [Mutex.with_ceiling("below", 3); kernel.CORES]
+private var locker_role: [kernel.CORES]u8
+private var locker_stacks: [kernel.CORES][LOCKER_ROLES][LOCKER_WORDS]u32
+private var had: [kernel.CORES]Atomic[u32]     // 1 once the waiter held `nested` locked once, 2 if not once
+private var ran: [kernel.CORES]Atomic[u32]     // 1 once the outranked task ran
+
+// R's part, on the running core.
+mutexes[P: Port](p: *P, e: *Entries)
+    val me = kernel.here_id(p)
+    recursive_part(p, e, me)
+    ceiling_part(p, e, me)
+
+// Create the task of role `role` at `priority` on the running core. The waiter outranks R and runs at
+// once, so the role is left where the new task reads it first; R creates the next only after.
+private spawn_locker[P: Port](p: *P, e: *Entries, me: u32, role: u8, priority: u8) -> Task
+    locker_role[me] = role
+    created(kernel.create(p, me, locker_stacks[me][usize(role)], e.locker, priority))
+
+private recursive_part[P: Port](p: *P, e: *Entries, me: u32)
+    val m = &nested[me]
+    var right = true
+    for _ in 0..<3
+        right = right && m.lock(p, FOREVER)
+    val waiter = spawn_locker(p, e, me, NESTED_WAITER, 5)
+    // The waiter outranks R, so it has run and is waiting by now.
+    for _ in 0..<2
+        m.unlock(p)
+        right = right && had[me].load() == 0 && m.holder() == kernel.current(p)
+    m.unlock(p)
+    right = right && had[me].load() == 1 && m.holder() == NO_TASK
+    right = right && kernel.delete(p, waiter).is_ok()
+    if right
+        say(p, "a recursive mutex locked 3 times went to its waiter only at the third unlock, locked once\n")
+    else
+        say(p, "a recursive mutex went to its waiter before the last unlock, or locked more than once\n")
+
+private ceiling_part[P: Port](p: *P, e: *Entries, me: u32)
+    val r = kernel.current(p)
+    var right = ceiled[me].lock(p, FOREVER) && kernel.priority(p, r) == Ok(6)
+    val outranked = spawn_locker(p, e, me, OUTRANKED, 5)
+    kernel.yield_now(p)
+    right = right && ran[me].load() == 0
+    right = right && below[me].enter(p, FOREVER) == Err(MutexError.Ceiling) && below[me].holder() == NO_TASK
+    ceiled[me].unlock(p)
+    right = right && ran[me].load() == 1 && kernel.priority(p, r) == Ok(4)
+    right = right && kernel.delete(p, outranked).is_ok()
+    if right
+        say(p, "a mutex of ceiling 6 kept a task of priority 5 out until it was unlocked, and one of ceiling 3 refused a task of priority 4\n")
+    else
+        say(p, "a ceiling mutex let a task below its ceiling run, kept its holder raised, or took a lock above it\n")
+
+// A locker: its role, then sleep for good until R deletes it.
+locker_task[P: Port](p: *P) -> never
+    val me = kernel.here_id(p)
+    val role = locker_role[me]
+    if role == NESTED_WAITER
+        val m = &nested[me]
+        if m.lock(p, FOREVER) && m.holder() == kernel.current(p) && m.depth() == 1
+            had[me].store(1)
+        else
+            had[me].store(2)
+        m.unlock(p)
+    else if role == OUTRANKED
+        ran[me].store(1)
+    loop
+        kernel.sleep(p, FOREVER)

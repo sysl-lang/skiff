@@ -10,14 +10,14 @@ import sysl.sync.{Atomic, Ordering}
 enum MessageKind: u8
     Empty = 0
     Wake = 1        // a wait of the task has ended: make it ready
-    Hand = 2        // a mutex was handed to the task: it holds one more, runs at `priority` at least, and is made ready
+    Hand = 2        // `mutex` was handed to the task: it holds one more, runs at `priority` and the mutex's ceiling at least, and is made ready
     Boost = 3       // a task waiting on `mutex`, which the task holds, outranks it: it runs at `priority` at least
     Control = 4     // another core asked to suspend, resume, re-prioritize or stop the task in the slot: its request says which
 
 // What one core asks of another through its inbox: a kind, the task it is about, a priority, and for a
-// boost the mutex the waiter waits on, which lies in `.shared` since two cores use it. The mutex is named
+// boost or a hand-over the mutex, which lies in `.shared` since two cores use it. The mutex is named
 // by its place in `.shared` (`place_of`), not by a pointer: nothing in `.shared` holds a pointer
-// (layout.sysl). Only a boost reads `mutex`; the other kinds leave it 0, as a zeroed slot has it.
+// (layout.sysl). Only a boost and a hand-over read `mutex`; the other kinds leave it 0, as a zeroed slot has it.
 struct Message
     kind: MessageKind
     task: Task

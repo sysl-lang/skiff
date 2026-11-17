@@ -52,6 +52,7 @@ private var stack: [64]u32 = [0; 64]
 // entry to fill them in, so this build fails if `new` stops folding.
 private var units = kernel.Semaphore.new("units", 0, 2)
 private var guard = kernel.Mutex.new("guard")
+private var nested = kernel.Mutex.recursive_with_ceiling("nested", 3)
 private var word = kernel.KernelLock.new("word")
 private var mail: Queue[u32, 2] = Queue.new("mail")
 private var events = kernel.Flags.new("events", 0)
@@ -75,6 +76,8 @@ private waits(m: *Nothing) -> bool
     if !units.give(m) || !units.try_take(m) || units.take(m, 1) || units.available(m) != 0 then return false
     if !guard.lock(m, kernel.FOREVER) then return false
     guard.unlock(m)
+    if nested.enter(m, 0).is_err() then return false
+    nested.unlock(m)
     guard.holder() == kernel.NO_TASK && messages(m)
 
 // The queues, the flags and the notifications, over the port.
