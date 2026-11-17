@@ -1,0 +1,95 @@
+module skiff.board.scenarios
+
+import sysl.sync.Atomic
+import skiff.kernel
+import skiff.kernel.{Port, Semaphore, Task, Work, WorkError}
+
+// Deferred work, on every core, run by R after the software timers. R creates the core's work service
+// (priority 6, its body `kernel.serve_work`) and the work `handed`, then raises timer 0's interrupt. The
+// handler posts `handed` once more than the queue holds, with the arguments 1, 2, 3 and on, and returns:
+// every post but the last is accepted, and the last is refused as `Full` and counted. Only then does the
+// service run, above R, and call the work once for each post in the order they were made. Each call
+// checks that it runs on its work's core as that core's service task, records its argument and gives a
+// semaphore R takes once per call, with a bound, never a tick assumed. On a machine of several cores,
+// core 0 may not post core 1's work.
+
+private const SERVICE_PRIORITY: u8 = 6
+// How long R waits for each call, in ticks: generous, since under multi-threaded TCG a core's ticks come
+// late and in bunches.
+private const CALL_TICKS: u32 = 50
+
+private var handed: [kernel.CORES]Work
+private var work_stacks: [kernel.CORES][STACK_WORDS]u32
+private var work_services: [kernel.CORES]Task
+private var deferring: [kernel.CORES]bool
+private var accepted_posts: [kernel.CORES]usize
+private var full_posts: [kernel.CORES]usize
+private var arguments: [kernel.CORES][kernel.WORK_ITEMS]u32
+private var work_calls: [kernel.CORES]Atomic[u32]
+private var work_strays: [kernel.CORES]Atomic[u32]
+private var called = [Semaphore.new("deferred work called", 0, 64); kernel.CORES]
+
+// The work's callback: record the argument, in the service, and tell R.
+worked[P: Port](p: *P, w: *Work, argument: u32)
+    val me = kernel.here_id(p)
+    if w.core() != Some(me) || kernel.current(p) != work_services[me] then val _ = work_strays[me].add(1)
+    val n = usize(work_calls[me].load())
+    if n < kernel.WORK_ITEMS then arguments[me][n] = argument
+    val _ = work_calls[me].add(1)
+    val _ = called[me].give(p)
+
+// Timer 0's interrupt, when R has armed it: post the work once more than the queue holds, and nothing
+// else.
+private[scenarios] work_from_interrupt[P: Port](p: *P, me: u32)
+    if !deferring[me] then return
+    deferring[me] = false
+    for n in 0..<kernel.WORK_ITEMS + 1
+        kernel.defer_work(p, &handed[me], u32(n) + 1) match
+            Ok(_) -> accepted_posts[me] += 1
+            Err(WorkError.Full) -> full_posts[me] += 1
+            Err(_) -> ()
+
+// R's deferred work, on the running core.
+deferred[P: Port](p: *P, e: *Entries)
+    val me = kernel.here_id(p)
+    work_services[me] = created(kernel.create(p, me, work_stacks[me], e.work, SERVICE_PRIORITY))
+    if kernel.create_work(p, &handed[me], "handed", e.worked).is_err() then panic("skiff: the scenario's work was refused")
+    val refused_before = kernel.deferred_refused(p)
+    deferring[me] = true
+    (e.raise)()
+    var taken: usize = 0
+    while taken < kernel.WORK_ITEMS && called[me].take(p, CALL_TICKS)
+        taken += 1
+    var in_order = taken == kernel.WORK_ITEMS && usize(work_calls[me].load()) == kernel.WORK_ITEMS
+    for n in 0..<kernel.WORK_ITEMS
+        if arguments[me][n] != u32(n) + 1 then in_order = false
+    val counted = kernel.deferred_refused(p) - refused_before == 1
+    val posts = accepted_posts[me] == kernel.WORK_ITEMS && full_posts[me] == 1
+    if in_order && counted && posts && work_strays[me].load() == 0
+        say(p, "work an interrupt deferred ran in the core's work service, in the order posted, and a full queue refused one post\n")
+    else
+        say(p, "deferred work went wrong: ")
+        kernel.write_dec(p, work_calls[me].load())
+        p.write(" calls, arguments".bytes)
+        for n in 0..<kernel.WORK_ITEMS
+            p.write(" ".bytes)
+            kernel.write_dec(p, arguments[me][n])
+        p.write(", ".bytes)
+        kernel.write_dec(p, accepted_posts[me])
+        p.write(" accepted, ".bytes)
+        kernel.write_dec(p, full_posts[me])
+        p.write(" full, ".bytes)
+        kernel.write_dec(p, kernel.deferred_refused(p) - refused_before)
+        p.write(" counted, ".bytes)
+        kernel.write_dec(p, work_strays[me].load())
+        p.write(" outside the service\n".bytes)
+    // Core 1's work is its own: in two images, core 0 cannot even name it.
+    if kernel.CORES > 1 && me == 0 && !apart
+        var waited: u32 = 0
+        while handed[1].core() != Some(1) && waited < 200
+            kernel.sleep(p, 1)
+            waited += 1
+        if kernel.defer_work(p, &handed[1], 0) == Err(WorkError.Remote)
+            say(p, "may not post work of core 1\n")
+        else
+            say(p, "posted work of core 1\n")

@@ -145,6 +145,18 @@ private timers(m: *Nothing) -> bool
     if m.cores() > 3 then kernel.serve_timers(m)
     true
 
+private var job: kernel.Work
+
+private done(w: *kernel.Work, argument: u32) = ()
+
+// Deferred work and its service, over the port.
+private deferred(m: *Nothing) -> bool
+    if kernel.create_work(m, &job, "job", &done).is_err() || job.core() != Some(0) then return false
+    if kernel.defer_work(m, &job, 1).is_err() || kernel.deferred_waiting(m) != 1 then return false
+    if kernel.work_turn(m) != 1 || kernel.deferred_refused(m) != 0 then return false
+    if m.cores() > 3 then kernel.serve_work(m)
+    true
+
 private var user_stack: [64]u32 = [0; 64]
 
 // Unprivileged tasks, their calls, and stopping a task, over the port.
@@ -185,7 +197,7 @@ probe() -> i32
     if !kernel.stopped(here.id) || kernel.expired(kernel.ticks(), 0) then return 1
     if t.is_err() || kernel.delete(&m, t.unwrap()).is_ok() then return 1
     if !control(&m, t.unwrap()) then return 1
-    if !protection(&m) || !timers(&m) || !handshake() then return 1
+    if !protection(&m) || !timers(&m) || !deferred(&m) || !handshake() then return 1
     if here.sched.started()
         kernel.sleep(&m, 1)
         kernel.sleep_until(&m, 1)
