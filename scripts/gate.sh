@@ -9,7 +9,9 @@
 #   2. the kernel built for every CPU family skiff may ever run on, ported or not, through
 #      tools/portable, which instantiates its generic parts: anything chip- or architecture-specific in
 #      kernel/ fails here on the first target that cannot have it;
-#   3. the boot test, at the default optimisation and at -O0. The boards build the kernel with `trace`.
+#   3. the boot test, at the default optimisation and at -O0. The boards build the kernel with `trace`;
+#   4. the bound on masked time: the Pico 2 boot on benchtop with its masking report, each core's longest
+#      masked interval and its kernel interrupts' worst latency held to a bound (scripts/masking.sh).
 
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -36,6 +38,7 @@ for target in thumbv6m-freestanding thumbv7em-freestanding thumb-freestanding ri
 done
 step "$root/scripts/boot-test.sh"
 step env SKIFF_OPT=-O0 "$root/scripts/boot-test.sh"
+step "$root/scripts/masking.sh"
 
 if [ "$failed" -eq 0 ]; then echo "GATE: green"; else echo "GATE: red"; fi
 exit $failed
