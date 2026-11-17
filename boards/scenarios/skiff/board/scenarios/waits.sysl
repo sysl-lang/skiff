@@ -35,6 +35,11 @@ private var never_given = [Semaphore.new("never given", 0, 1); kernel.CORES]
 private var from_irq = [Semaphore.new("from an interrupt", 0, 1); kernel.CORES]
 private var middle_done: [kernel.CORES]Atomic[u32]
 private var woke: [kernel.CORES]Atomic[u32]
+private var low_locked: [kernel.CORES]Atomic[u32]
+private var middle_started: [kernel.CORES]Atomic[u32]
+private var high_asking: [kernel.CORES]Atomic[u32]
+private var low_reported: [kernel.CORES]Atomic[u32]
+private var waiting_for_irq: [kernel.CORES]Atomic[u32]
 private[scenarios] var waits_done: [kernel.CORES]Atomic[u32]
 
 // Fill in the objects every core uses, in `.shared` (`Across`), which start-up zeroes. Core 0 calls it
@@ -59,18 +64,29 @@ low_task[P: Port](p: *P) -> never
     val me = kernel.here_id(p)
     kernel.sleep_until(p, epochs[me] + 50)
     val _ = mutexes[me].lock(p, FOREVER)
+    low_locked[me].store(1)
     busy(5)
     mutexes[me].unlock(p)
+    // Sleep until Middle has started, so that Low's next run is the judgment: at its own priority Low runs
+    // only after Middle's 20 ticks are done, and still raised it would run in the middle of them. (Middle
+    // starts a tick late when its ticks are, and Low would otherwise look before it ran at all.)
+    while middle_started[me].load() == 0 && kernel.ticks() - epochs[me] < 120 do kernel.sleep(p, 1)
     if middle_done[me].load() != 0
         say(p, "the low task gave up its inherited priority with the mutex\n")
     else
         say(p, "the low task kept an inherited priority after unlocking\n")
+    low_reported[me].store(1)
     kernel.exit(p)
 
 // Middle: 20 ticks of work from tick 53.
 middle_task[P: Port](p: *P) -> never
     val me = kernel.here_id(p)
     kernel.sleep_until(p, epochs[me] + 53)
+    // Middle starts once High has asked for the mutex Low holds, however late the ticks that would have
+    // woken the three at 50, 52 and 53 come: High outranks Middle, so by the time Middle sees the flag
+    // High is waiting on the mutex.
+    while high_asking[me].load() == 0 && kernel.ticks() - epochs[me] < 120 do kernel.sleep(p, 1)
+    middle_started[me].store(1)
     busy(20)
     middle_done[me].store(1)
     kernel.exit(p)
@@ -79,6 +95,9 @@ middle_task[P: Port](p: *P) -> never
 high_task[P: Port](p: *P) -> never
     val me = kernel.here_id(p)
     kernel.sleep_until(p, epochs[me] + 52)
+    // High asks only once Low holds the mutex (bounded, so a Low that never locks still gets a verdict).
+    while low_locked[me].load() == 0 && kernel.ticks() - epochs[me] < 120 do kernel.sleep(p, 1)
+    high_asking[me].store(1)
     val _ = mutexes[me].lock(p, FOREVER)
     if middle_done[me].load() == 0
         say(p, "the high task had the mutex before the middle task finished\n")
@@ -91,6 +110,8 @@ high_task[P: Port](p: *P) -> never
 timed_task[P: Port](p: *P) -> never
     val me = kernel.here_id(p)
     kernel.sleep_until(p, epochs[me] + 78)
+    // After Low's report, whatever tick Middle's late start put that on (bounded).
+    while low_reported[me].load() == 0 && kernel.ticks() - epochs[me] < 200 do kernel.sleep(p, 1)
     val start = kernel.ticks()
     val taken = never_given[me].take(p, 5)
     val waited = kernel.ticks() - start
@@ -101,6 +122,9 @@ timed_task[P: Port](p: *P) -> never
         kernel.write_dec(p, waited)
         p.write(" ticks\n".bytes)
     kernel.sleep_until(p, epochs[me] + 84)
+    // The raiser outranks nothing here: it runs only once this task has blocked, so seeing this flag set
+    // means the task is waiting, whatever tick the late ticks made it start on.
+    waiting_for_irq[me].store(1)
     if from_irq[me].take(p, 20) then woke[me].store(1)
     kernel.exit(p)
 
@@ -109,6 +133,9 @@ timed_task[P: Port](p: *P) -> never
 raiser_task[P: Port](p: *P, e: *Entries) -> never
     val me = kernel.here_id(p)
     kernel.sleep_until(p, epochs[me] + 85)
+    // Judged by order, not by the tick: ticks delivered late can run the time base past 85 before the
+    // timed task has started waiting. Bounded, so a task that never waits still gets its verdict.
+    while waiting_for_irq[me].load() == 0 && kernel.ticks() - epochs[me] < 120 do kernel.sleep(p, 1)
     (e.raise)()
     if woke[me].load() != 0
         say(p, "an interrupt's give woke a waiting task at once\n")
