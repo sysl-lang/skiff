@@ -259,7 +259,7 @@ wake can find it.
   and applies it to its own scheduler, then asks for one switch if anything now outranks the running
   task. The chip clears the doorbell before the drain, so a message posted while it drains rings again.
   The poster makes its writes visible before it rings (a `dsb` before the AN521's MHU write).
-- Messages: `Wake(task)`, `Hand(task, priority)`, `Boost(task, priority, mutex)`, `Control(slot)`.
+- Messages: `Wake(task)`, `Hand(task, priority, mutex)`, `Boost(task, priority, mutex)`, `Control(slot)`.
 
 ## Mutexes across cores
 
@@ -275,12 +275,52 @@ wake can find it.
 - The locker raises a same-core owner after releasing the mutex's lock but before unmasking its core, so
   the raise never holds two object locks (a blocked owner's re-insertion takes the other object's).
 - An unlock hands the mutex to the best waiter (`Given`), and the new owner inherits at once from the
-  best of those still waiting. A new owner on another core is told by `Hand(task, priority)`: its core
+  best of those still waiting. A new owner on another core is told by `Hand(task, priority, mutex)`: its core
   counts the mutex in `Tcb.held`, raises the task to `priority` if that is higher, and makes it ready.
   The unlocking core never touches the new owner's `Tcb`.
 - **What a task inherits is kept apart from its base**, as its boost: the highest priority a waiter lent
   it while it holds a mutex, recorded whether or not it raises the task (a waiter below a high base
   still lends). The task runs at the higher of base and boost; the boost goes when it holds no mutex.
+
+### Recursive and ceiling mutexes
+
+Two options, fixed at creation: `Mutex.new(name)` (neither), `Mutex.recursive(name)`,
+`Mutex.with_ceiling(name, c)` and `Mutex.recursive_with_ceiling(name, c)`, all `const`. Each is plain
+data (`locks: u16`, `ceiling: u8`, `reentrant: bool` beside the owner), zero is a free plain mutex, and
+none holds a pointer, so any of them may lie in `.shared`. `lock(p, timeout) -> bool` is as before;
+`enter(p, timeout) -> Result[unit, MutexError]` is the same lock saying why it was refused:
+`Unavailable` (timeout 0, timed out, or the wait ended otherwise), `Ceiling`, `Depth`.
+
+- **Recursive.** The holder may lock it again; the mutex counts the locks (`locks`, `depth()`), and the
+  holder keeps it until it has unlocked once for each. A lock past `MAX_LOCKS` (65 535) is refused with
+  `Depth`, the count unchanged: a refusal, not a panic. It counts once in `Tcb.held`, at the first lock
+  and the last unlock, so a boost is dropped only at the last unlock of the last mutex. Unlocking once
+  more than it was locked finds the mutex free or another's, which is an unlock by a non-holder: the
+  same panic as on a plain mutex. A plain mutex locked again by its holder still panics.
+- **Hand-over hands the whole mutex.** The last unlock gives it to the best waiter locked once (`locks`
+  = 1), on its core or another: the count is the mutex's, reset by the unlocker under the mutex's lock,
+  so a `Hand` carries nothing of it.
+- **Immediate priority ceiling** (OSEK/AUTOSAR's resource priority, POSIX `PTHREAD_PRIO_PROTECT`). A
+  mutex of ceiling c raises its holder to c at least from the moment it holds it, by a lock or by a
+  hand-over, until it lets it go. A lock by a task whose **base** priority is above c is refused with
+  `Ceiling`, before anything is touched; so is every lock of a ceiling outside 1 to 31. The check reads
+  the base, not the effective priority: a boost or another ceiling is transient, and a refusal that
+  depends on timing is no configuration check. `set_priority` may raise a holder's base above a ceiling
+  it holds; it then runs at its base, and its next lock of that mutex is refused.
+- **The effective priority is the highest of the base, the boost, and the ceilings of every mutex held.**
+  `Tcb.ceilings[c]` counts the mutexes of ceiling c the task holds and `Tcb.ceiling_bits` has bit c set
+  while that count is not 0, so the top ceiling is one count of leading zeros, and an unlock in any order
+  takes away exactly its own ceiling: a task holding ceilings 5, 3 and 5 runs at 5 until both 5s are
+  gone. A recursive mutex's ceiling counts once. A boost is unchanged by ceilings: kept until the task
+  holds no mutex, as above.
+- **Across cores the ceiling applies on the holder's own core only.** The holder's core counts it, at the
+  lock or, for a hand-over to another core, when it applies the `Hand`, which now names the mutex (as
+  `Boost` does) so that core reads the ceiling, fixed since creation, without the mutex's lock. A waiter
+  of another core blocks and lends by `Boost` as on any mutex. There are no remote ceilings: a task of
+  core 1 holding a mutex does not run at a ceiling on core 0, and the ceiling does not bound how long a
+  task of another core waits (MPCP-style global ceilings, which raise the holder above every local
+  priority, are out of scope). With one core and a holder that never blocks while holding, a task that
+  might lock the mutex never runs while it is held, so no task waits on it.
 
 ## Task control
 

@@ -116,7 +116,7 @@ extern __code_end: u8
 // The status `boot` answered on core 0, which core 0's last task stops the machine with.
 private var status: i32 = 0
 
-private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject, &task_measured)
+private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject, &task_measured, &task_locker)
 
 @export("skiff_main")
 skiff_main() -> never
@@ -244,6 +244,7 @@ private task_hog() -> never = scenarios.hog_task(&Board())
 private fired(t: *kernel.Timer, due: u32) = scenarios.fired(&Board(), t, due)
 private task_subject() -> never = scenarios.subject_task(&Board())
 private task_measured() -> never = scenarios.measured_task(&Board())
+private task_locker() -> never = scenarios.locker_task(&Board())
 
 // Raise the running core's timer interrupt from software; the timer itself never runs.
 private raise() = armv7m.pend_irq(TIMER_IRQ)
@@ -257,8 +258,8 @@ private task_idle() -> never
     loop
         armv7m.wait_for_interrupt()
 
-// R: the handle checks, then the waits, the timers, task control, the statistics, the protection and the
-// grants, then the end of the run. Core 1 faults; core 0 waits until it sees core 1 stopped, ticks on,
+// R: the handle checks, then the waits, the timers, task control, the statistics, the mutex options, the
+// protection and the grants, then the end of the run. Core 1 faults; core 0 waits until it sees core 1 stopped, ticks on,
 // and stops the machine.
 private task_r() -> never
     var board = Board()
@@ -267,6 +268,7 @@ private task_r() -> never
     scenarios.timers(&board, &entries)
     scenarios.control(&board, &entries)
     scenarios.stats(&board, &entries)
+    scenarios.mutexes(&board, &entries)
     val me = an521.core_id()
     val code = Region(usize(&__code_start), usize(&__code_end) - usize(&__code_start), Access.Execute)
     scenarios.traces(&board, &entries, code)

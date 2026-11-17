@@ -74,33 +74,85 @@ impl Semaphore
 // that core applies only while the task still holds the mutex; a waiter on another core than the
 // unlocking owner is handed the mutex by a `Hand` message, which counts it held there and makes the new
 // owner ready (inbox.sysl).
+//
+// Two options, chosen at creation and fixed after (DESIGN "Recursive and ceiling mutexes"):
+//
+//   - Recursive: its holder may lock it again, and holds it until it has unlocked it once for each lock,
+//     at most `MAX_LOCKS` deep. It counts once in `Tcb.held`, so a boost goes only at the last unlock.
+//   - A ceiling c (1 to 31), the immediate priority ceiling: its holder runs at c at least from the
+//     moment it has it until it lets it go, whether locked or handed over. A task whose base priority is
+//     above c may not lock it. The effective priority is the highest of the base, the boost and the
+//     ceilings of every mutex held, counted per ceiling, so unlocking in any order is exact. The ceiling
+//     raises the holder on its own core only: a waiter of another core waits as on any mutex.
+//
+// Every field is plain data and zero is a free plain mutex, so one may lie in `.shared`.
 struct Mutex
     w: Waitable
     owner: Task
+    locks: u16          // how many times its owner has locked it, 0 while free
+    ceiling: u8         // the priority ceiling, or 0 for none
+    reentrant: bool     // whether its owner may lock it again (a recursive mutex)
+
+// The deepest a recursive mutex may be locked; a lock beyond it is refused with `MutexError.Depth`.
+const MAX_LOCKS: u16 = 65535
+
+// Why a lock was refused. Locking a non-recursive mutex its task already holds is a fault, as before:
+// a panic, not an error.
+enum MutexError
+    Unavailable     // not had within the timeout: 0, or the wait timed out or was ended otherwise
+    Ceiling         // the task's base priority is above the mutex's ceiling, or the ceiling is not 1 to 31
+    Depth           // a recursive mutex already locked `MAX_LOCKS` times by its holder
 
 impl Mutex
-    const new(name: string) -> Mutex = Mutex(Waitable.new(name), NO_TASK)
+    // A mutex with priority inheritance and neither option.
+    const new(name: string) -> Mutex = Mutex(Waitable.new(name), NO_TASK, 0, 0, false)
 
-    // Lock it, waiting up to `timeout` ticks. Answers whether the running task now holds it. A task may
-    // not lock a mutex it already holds.
-    lock[P: Port](*self, p: *P, timeout: u32) -> bool
+    // A mutex its holder may lock again, `MAX_LOCKS` deep.
+    const recursive(name: string) -> Mutex = Mutex(Waitable.new(name), NO_TASK, 0, 0, true)
+
+    // A mutex of priority ceiling `ceiling`, 1 to 31: the priority of the highest task that may lock it.
+    const with_ceiling(name: string, ceiling: u8) -> Mutex = Mutex(Waitable.new(name), NO_TASK, 0, ceiling, false)
+
+    // A recursive mutex of priority ceiling `ceiling`.
+    const recursive_with_ceiling(name: string, ceiling: u8) -> Mutex = Mutex(Waitable.new(name), NO_TASK, 0, ceiling, true)
+
+    // Lock it, waiting up to `timeout` ticks. Answers whether the running task now holds it; `enter`
+    // says why not.
+    lock[P: Port](*self, p: *P, timeout: u32) -> bool = self.enter(p, timeout).is_ok()
+
+    // Lock it, waiting up to `timeout` ticks, or say why it was not had. A task may lock a mutex it
+    // already holds only if the mutex is recursive.
+    enter[P: Port](*self, p: *P, timeout: u32) -> Result[unit, MutexError]
         val c = running_core(p)
         val i = usize(c.sched.running)
         val me = c.sched.handle(c.id, i)
+        if self.ceiling != 0 && (usize(self.ceiling) >= PRIORITIES || c.sched.tasks[i].base > self.ceiling)
+            return Err(MutexError.Ceiling)
         val outer = p.mask()
         var l = self.w.lock.on(p)
         l.acquire()
         if self.owner == NO_TASK
             self.owner = me
+            self.locks = 1
             c.sched.tasks[i].held += 1
+            if self.ceiling != 0 then c.sched.hold_ceiling(i, self.ceiling)
+            l.release()
+            // The running task only rises, so nothing it could switch to outranks it.
+            val e = c.sched.effective(i)
+            if e > c.sched.tasks[i].priority then c.sched.set_effective(i, e)
+            p.restore(outer)
+            return Ok(())
+        if self.owner == me
+            if !self.reentrant then panic("skiff: a task locked a mutex it already holds")
+            val deep = self.locks == MAX_LOCKS
+            if !deep then self.locks += 1
             l.release()
             p.restore(outer)
-            return true
-        if self.owner == me then panic("skiff: a task locked a mutex it already holds")
+            return if deep then Err(MutexError.Depth) else Ok(())
         if timeout == 0
             l.release()
             p.restore(outer)
-            return false
+            return Err(MutexError.Unavailable)
         val owner = self.owner
         val mine = c.sched.tasks[i].priority
         enqueue_running(c, &self.w, timeout, 0, 0, 0)
@@ -113,10 +165,12 @@ impl Mutex
         else if c.sched.check(owner).is_ok()
             inherit(p, c, owner.slot(), mine)
         p.restore(outer)
-        wait_outcome(c) == Outcome.Given
+        if wait_outcome(c) == Outcome.Given then Ok(()) else Err(MutexError.Unavailable)
 
-    // Unlock it, handing it to the best waiting task if there is one, which inherits from whoever still
-    // waits. The running task drops any priority it inherited once it holds no mutex. Only the owner may.
+    // Unlock it. A recursive mutex locked more than once only counts down. Otherwise it goes to the best
+    // waiting task if there is one, whole and locked once, which inherits from whoever still waits and
+    // takes up its ceiling. The running task lets go of its ceiling, and drops any priority it inherited
+    // once it holds no mutex. Only the owner may.
     unlock[P: Port](*self, p: *P)
         val c = running_core(p)
         val i = usize(c.sched.running)
@@ -124,31 +178,49 @@ impl Mutex
         var l = self.w.lock.on(p)
         l.acquire()
         if self.owner != c.sched.handle(c.id, i) then panic("skiff: a task unlocked a mutex it does not hold")
+        if self.locks > 1
+            self.locks -= 1
+            l.release()
+            p.restore(outer)
+            return
         c.sched.tasks[i].held -= 1
+        if self.ceiling != 0 then c.sched.drop_ceiling(i, self.ceiling)
         var heir = NONE
         var inherited = IDLE_PRIORITY
         val at = self.w.queue.first()
         if at == NONE
             self.owner = NO_TASK
+            self.locks = 0
         else
             // The best of those left waiting is the one behind the heir.
             if self.w.queue.count > 1 then inherited = waiter(self.w.queue.after(at)).priority
-            val t = end_wait(p, &self.w, at, Outcome.Given, MessageKind.Hand, inherited)
-            self.owner = t
-            if !another_core(t.core(), c.id)
+            val t = waiter(at).task
+            if another_core(t.core(), c.id)
+                // The heir's core counts it held and takes up the ceiling, which the `Hand` reads from
+                // the mutex it names.
+                val _ = self.w.queue.remove(at)
+                waiter(at).outcome = Outcome.Given
+                post(p, MessageKind.Hand, t, inherited, self)
+            else
+                val _ = end_wait(p, &self.w, at, Outcome.Given, MessageKind.Hand, inherited)
                 heir = u16(t.slot())
                 c.sched.tasks[t.slot()].held += 1
+                if self.ceiling != 0 then c.sched.hold_ceiling(t.slot(), self.ceiling)
+            self.owner = t
+            self.locks = 1
         l.release()
-        if heir != NONE && inherited != IDLE_PRIORITY
-            inherit(p, c, usize(heir), inherited)
-        if c.sched.tasks[i].held == 0
-            c.sched.tasks[i].boost = IDLE_PRIORITY
-            if c.sched.tasks[i].priority != c.sched.tasks[i].base then c.sched.set_effective(i, c.sched.tasks[i].base)
+        if heir != NONE then inherit(p, c, usize(heir), inherited)
+        if c.sched.tasks[i].held == 0 then c.sched.tasks[i].boost = IDLE_PRIORITY
+        val e = c.sched.effective(i)
+        if e != c.sched.tasks[i].priority then c.sched.set_effective(i, e)
         if c.sched.preempted() then p.request_switch()
         p.restore(outer)
 
     // The task that holds it, or `NO_TASK`.
     holder(*self) -> Task = self.owner
+
+    // How many times its holder has locked it: 0 while free, 1 for a mutex that is not recursive.
+    depth(*self) -> u16 = self.locks
 
     // Whether task `t` holds it, read under its lock: what a `Boost` checks before it raises `t`.
     private[kernel] owned_by[P: Port](*self, p: *P, t: Task) -> bool
