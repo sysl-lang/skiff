@@ -26,7 +26,7 @@ import sysl.sync.Lock
 // the best writers, in order, while the room each needs is there; a writer behind one that needs more
 // room than there is waits its turn, so a long message is not starved by short ones.
 
-// The side a waiter of a stream is on: its record's mode.
+// The side a waiter of a stream is on: its record's side.
 private const READING: u8 = 0
 private const WRITING: u8 = 1
 
@@ -70,7 +70,7 @@ impl[const N: usize] StreamBuffer[N]
                 l.release()
                 return sent
             val c = running_core(p)
-            enqueue_running(c, &self.w, left, WRITING, 1)
+            enqueue_running(c, &self.w, left, WRITING, 0, 1)
             p.request_switch()
             l.release()
             wait_outcome(c) match
@@ -98,7 +98,7 @@ impl[const N: usize] StreamBuffer[N]
                 l.release()
                 return n
             val c = running_core(p)
-            enqueue_running(c, &self.w, left, READING, 0)
+            enqueue_running(c, &self.w, left, READING, 0, 0)
             p.request_switch()
             l.release()
             wait_outcome(c) match
@@ -228,7 +228,7 @@ impl[const N: usize] MessageBuffer[N]
                 l.release()
                 return false
             val c = running_core(p)
-            enqueue_running(c, &self.s.w, left, WRITING, u32(need))
+            enqueue_running(c, &self.s.w, left, WRITING, 0, u32(need))
             p.request_switch()
             l.release()
             wait_outcome(c) match
@@ -254,7 +254,7 @@ impl[const N: usize] MessageBuffer[N]
                 l.release()
                 return n
             val c = running_core(p)
-            enqueue_running(c, &self.s.w, left, READING, 0)
+            enqueue_running(c, &self.s.w, left, READING, 0, 0)
             p.request_switch()
             l.release()
             wait_outcome(c) match

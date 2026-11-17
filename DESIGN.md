@@ -88,18 +88,26 @@ Core (private, one per core)          .shared
 waiter.
 
 - A task waits on at most one thing at a time, so each task has exactly one **`Waiter`** record, in
-  `.shared` at `waiters[core][slot]`. It holds the handle, the effective priority, a link (the next
-  waiter's index, `core * option_tasks + slot`, not a pointer), the wait's `outcome` (`Idle`,
-  `Waiting`, `Woken`, `Given`, `TimedOut`), its `mode` (what kind of wait it is, as its object reads it:
-  a queue's side, a flags wait's terms) and its `value`: what the wait asks for going in (the bits a
-  flags wait names) and what it carries back (the bits that ended it).
-- A `WaitQueue` is a head index and a count, in the object, ordered by priority and first-come within a
-  priority. Insertion walks the queue (bounded by the number of tasks); waking the best waiter is O(1).
-  The count alone says whether anyone waits, so a zeroed queue is empty. Two objects walk further: a
-  message queue's senders and receivers share its one `WaitQueue`, so a wake takes the best waiter of
-  the side it wants (`first_of(mode)`), walking past the other side, which waits only in the moment
-  between a kept slot or message and its taker running; and a flags set looks at every waiter, since
-  one set may satisfy several.
+  `.shared` at `waiters[core][slot]`. It holds the handle, the effective priority, two links (the
+  previous and next waiter's index, `core * option_tasks + slot`, not a pointer), whether it is queued,
+  the wait's `outcome` (`Idle`, `Waiting`, `Woken`, `Given`, `TimedOut`), its `side` (which of its
+  object's two lists it waits in: a queue's senders or receivers, a stream's writers or readers; every
+  other object uses side 0), its `mode` (the wait's terms as its object reads them: a flags wait's) and
+  its `value`: what the wait asks for going in (the bits a flags wait names) and what it carries back
+  (the bits that ended it).
+- **A `WaitQueue` is built as the ready set is**: for each of two sides, a circular FIFO per priority,
+  linked through the records, and a `u32` bitmap of the priorities whose FIFO has a waiter. A waiter
+  joins at the tail of its side's FIFO for its priority; the best waiter of a side is the head of the
+  FIFO a count-leading-zeros of its bitmap names; a waiter leaves by unlinking itself, clearing its bit
+  if its FIFO empties. **So queueing, waking, a timeout's or a stop's withdrawal and a priority change's
+  re-queueing each take a fixed number of steps under the object's lock, however many tasks wait**, and
+  a two-sided object finds the best waiter of the side it wants (`first_of(side)`) as directly as the
+  best of all (`first`; on a tie of priorities, side 0's). The order is still priority first, first
+  come within a priority, among waiters of every core alike. A head is read only when its bit is set,
+  so a zeroed queue is empty. The price is size: a queue is 140 bytes (two bitmaps, 64 heads of 16
+  bits, a count), in every object and in every task's note, so `.shared` holds
+  `option_cores * option_tasks` of them besides the application's objects. One walk is left: a flags
+  set looks at every waiter, in order, since one set may satisfy several.
 - An object holds a `Waitable`: its `KernelLock` and its `WaitQueue`. A blocked task's private `Tcb.on`
   names it, which is how a timeout, a priority change or a delete reaches the queue under the lock.
 - A change of a waiter's priority while it waits (inheritance, `set_priority`) re-inserts it, under the
@@ -146,7 +154,7 @@ the object hands itself over, as a semaphore or a mutex does), and releases the 
   task waits on its own note; a send wakes it with `Woken`, and it takes the value when it runs.
 - **Stream and message buffers** (`StreamBuffer[N]`, `MessageBuffer[N]`, a byte ring of their own, so
   either in `.shared` carries bytes between cores; a zeroed one is empty with a trigger level of 1):
-  readers and writers share the one `WaitQueue`, marked by mode as a queue's are, and a writer's
+  readers and writers wait on the two sides of the one `WaitQueue`, as a queue's do, and a writer's
   `value` is the room it needs (1 for a stream, the message and its 4-byte length prefix for a
   message). Nothing is kept: a change of bytes wakes the best reader with `Woken` once the trigger
   level is met, and the best writers in order while the room each needs is there (one needing more

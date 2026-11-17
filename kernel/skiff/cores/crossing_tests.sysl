@@ -314,3 +314,48 @@ ring_full()
     var m = machine()
     var x = Mutex.new("x")
     fill_ring(&m, &x, INBOX_MESSAGES + 1)
+
+// The waiters of `s`, best first, each written as two digits: its core, then its slot.
+private waiting_order(s: *Semaphore) -> u32
+    var order: u32 = 0
+    var at = s.w.queue.first()
+    while at != 0xffff
+        order = order * 100 + u32(usize(at) / kernel.TASKS) * 10 + u32(usize(at) % kernel.TASKS)
+        at = s.w.queue.after(at)
+    order
+
+// `t` as `waiting_order` writes it.
+private key(t: Task) -> u32 = t.core() * 10 + u32(t.slot())
+
+@test("waiters of two cores share one queue: priority first, then first come whatever the core, through a priority change, a stop and a wake")
+queue_across_cores()
+    var m = machine()
+    val b1 = task_on(&m, 1, 0, 3)
+    val a1 = task_on(&m, 1, 1, 2)
+    val _ = task_on(&m, 1, 2, 1)
+    val b2 = task_on(&m, 2, 3, 3)
+    val a2 = task_on(&m, 2, 4, 2)
+    val _ = task_on(&m, 2, 5, 1)
+    val _ = task_on(&m, 0, 6, 1)
+    begin(&m)
+    var s = Semaphore.new("s", 0, 4)
+    for core in [1u32, 2, 1, 2]
+        on(&m, core)
+        val _ = s.take(&m, FOREVER)
+        switch_now(&m)
+    assert_eq(waiting_order(&s), ((key(b1) * 100 + key(b2)) * 100 + key(a1)) * 100 + key(a2))
+    on(&m, 2)
+    assert(kernel.set_priority(&m, a2, 4).is_ok(), "raised")
+    assert_eq(waiting_order(&s), ((key(a2) * 100 + key(b1)) * 100 + key(b2)) * 100 + key(a1))
+    on(&m, 1)
+    assert(kernel.stop(&m, b1).is_ok(), "stopped")
+    assert_eq(waiting_order(&s), (key(a2) * 100 + key(b2)) * 100 + key(a1))
+    on(&m, 0)
+    assert(s.give(&m), "given")
+    assert_eq(m.rung[2], 1)
+    assert_eq(waiting_order(&s), key(b2) * 100 + key(a1))
+    on(&m, 1)
+    assert(kernel.set_priority(&m, a1, 3).is_ok(), "raised to b2's priority")
+    assert_eq(waiting_order(&s), key(b2) * 100 + key(a1))
+    assert_eq(s.w.queue.count, 2)
+    assert_eq(m.masked, 0)

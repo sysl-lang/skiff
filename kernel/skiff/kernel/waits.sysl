@@ -6,8 +6,8 @@ import sysl.sync.Lock
 //
 // A task waits on at most one thing at a time, so each task has one `Waiter` record, in `.shared` at
 // `waiters[core][slot]`. An object keeps its waiters in a `WaitQueue`, linked through the records by
-// index, never by pointer: highest priority first, first come first within a priority. Inserting walks
-// the queue; taking the best waiter is its head.
+// index, never by pointer: highest priority first, first come first within a priority. Queueing a
+// waiter, taking the best one and withdrawing any one are each a few steps, however many wait.
 //
 // A wait, under the object's lock: answer at once if the object can, else fill the record (`Waiting`),
 // enqueue it, block the task on its core (and in its timeout list if the wait has a deadline), release
@@ -28,56 +28,95 @@ enum Outcome: u8
     Given = 3       // the object handed itself over: a unit of a semaphore, a mutex
     TimedOut = 4    // the deadline came first
 
-// One task's wait record. `next` links it into an object's queue.
+// One task's wait record. `prev` and `next` link it into the FIFO of its side and priority in an
+// object's queue; `queued` says whether it is in one, so a record of zeros is in none.
 struct Waiter
     task: Task          // whose record it is
+    value: u32          // what the wait asks for, and then what it carries back
+    prev: u16           // the waiter before it in its FIFO, which is circular: the head's is the tail
+    next: u16           // the waiter after it in its FIFO: the tail's is the head
     priority: u8        // the task's effective priority when it was queued
     outcome: Outcome
-    next: u16           // the next waiter's index, or NONE
-    mode: u8            // what kind of wait it is, as its object reads it: a queue's side, a flags wait's terms
-    value: u32          // what the wait asks for, and then what it carries back
+    side: u8            // which of its object's two lists it waits in: a queue's senders or receivers
+    queued: bool        // whether it is in a queue's FIFO
+    mode: u8            // the terms of the wait, as its object reads them: a flags wait's
 
 // The index of task `slot` of core `core`'s record: `core * option_tasks + slot`. At most 8 cores of
 // 4096 slots, so it fits in a `u16` with NONE left over.
 private[kernel] waiter_index(core: u32, slot: usize) -> u16 = u16(usize(core) * option_tasks + slot)
 
-// An object's waiters, best first. `count` says whether there are any, so a queue of zeros is empty.
+// How many sides an object's waiters may wait on. A queue's senders and receivers are its two; most
+// objects use side 0 alone.
+private[kernel] const SIDES: usize = 2
+
+// An object's waiters, as the scheduler keeps its ready tasks: for each side, a FIFO per priority,
+// circular through the records' `prev` and `next`, and a `u32` bitmap of the priorities whose FIFO has
+// a waiter. Queueing, leaving and finding a side's best waiter are each a few steps whatever the number
+// of waiters. A head is read only when its bit is set, so a queue of zeros is empty.
 struct WaitQueue
-    head: u16
+    bits: [SIDES]u32
+    heads: [SIDES][PRIORITIES]u16
     count: u16
 
+// The highest priority set in `bits`, which is not 0.
+private top(bits: u32) -> usize = usize(31 - bits.leading_zeros())
+
 impl WaitQueue
-    // The best waiter, or NONE when nobody waits.
-    first(*self) -> u16 = if self.count == 0 then NONE else self.head
+    // The best waiter, or NONE when nobody waits: the head of the highest priority of either side, the
+    // first side's on a tie. An object whose waiters all wait on one side asks this; one with two asks
+    // `first_of`.
+    first(*self) -> u16
+        if self.bits[1] == 0 || (self.bits[0] != 0 && top(self.bits[0]) >= top(self.bits[1])) then self.first_of(0) else self.first_of(1)
 
-    // The best waiter whose mode is `mode`, or NONE. An object whose waiters are all of one mode finds
-    // it at the head.
-    first_of(*self, mode: u8) -> u16
-        var at = self.first()
-        while at != NONE && waiter(at).mode != mode do at = waiter(at).next
-        at
+    // The best waiter on side `side`, or NONE.
+    first_of(*self, side: u8) -> u16
+        val bits = self.bits[side]
+        if bits == 0 then NONE else self.heads[side][top(bits)]
 
-    // Queue waiter `w` behind every waiter of its priority or higher.
+    // The waiter after `at`, which is queued here, on its side: the next of its priority, else the head
+    // of the next priority down that has a waiter, else NONE. What a walk of the whole queue uses.
+    after(*self, at: u16) -> u16
+        val r = waiter(at)
+        if r.next != self.heads[r.side][r.priority] then return r.next
+        val below = self.bits[r.side] & ((1 << u32(r.priority)) - 1)
+        if below == 0 then NONE else self.heads[r.side][top(below)]
+
+    // Queue waiter `w` at the tail of its side's FIFO for its priority.
     insert(*self, w: u16)
-        val p = waiter(w).priority
-        var before = NONE
-        var at = self.first()
-        while at != NONE && waiter(at).priority >= p
-            before = at
-            at = waiter(at).next
-        waiter(w).next = at
-        if before == NONE then self.head = w else waiter(before).next = w
+        val r = waiter(w)
+        val s = usize(r.side)
+        val p = usize(r.priority)
+        if self.bits[s] & (1 << u32(p)) == 0
+            self.heads[s][p] = w
+            r.prev = w
+            r.next = w
+            self.bits[s] |= 1 << u32(p)
+        else
+            val head = self.heads[s][p]
+            val tail = waiter(head).prev
+            r.prev = tail
+            r.next = head
+            waiter(tail).next = w
+            waiter(head).prev = w
+        r.queued = true
         self.count += 1
 
-    // Take waiter `w` out of the queue, answering whether it was in it.
+    // Take waiter `w`, which is queued here if it is queued at all, out of the queue, answering whether
+    // it was in it.
     remove(*self, w: u16) -> bool
-        var before = NONE
-        var at = self.first()
-        while at != NONE && at != w
-            before = at
-            at = waiter(at).next
-        if at == NONE then return false
-        if before == NONE then self.head = waiter(w).next else waiter(before).next = waiter(w).next
+        val r = waiter(w)
+        if !r.queued then return false
+        val s = usize(r.side)
+        val p = usize(r.priority)
+        if r.next == w
+            self.bits[s] &= ~(1 << u32(p))
+        else
+            waiter(r.prev).next = r.next
+            waiter(r.next).prev = r.prev
+            if self.heads[s][p] == w then self.heads[s][p] = r.next
+        r.prev = NONE
+        r.next = NONE
+        r.queued = false
         self.count -= 1
         true
 
@@ -88,21 +127,22 @@ struct Waitable
     queue: WaitQueue
 
 impl Waitable
-    const new(name: string) -> Waitable = Waitable(KernelLock.new(name), WaitQueue(NONE, 0))
+    const new(name: string) -> Waitable = Waitable(KernelLock.new(name), WaitQueue([0; SIDES], [[NONE; PRIORITIES]; SIDES], 0))
 
 // Whether a task of core `core` is another core's than `me`'s. With one core it never is.
 private[kernel] another_core(core: u32, me: u32) -> bool = option_cores > 1 && core != me
 
 // The running task of core `c` waits on `w`, whose lock the caller holds: fill its record with the
-// wait's `mode` and `value`, queue it and block it, for `timeout` ticks or `FOREVER`. The caller then
-// asks for a switch and releases the lock, which lets the switch happen, and reads the outcome with
+// wait's `side`, `mode` and `value`, queue it and block it, for `timeout` ticks or `FOREVER`. The caller
+// then asks for a switch and releases the lock, which lets the switch happen, and reads the outcome with
 // `wait_outcome` once the task runs again.
-private[kernel] enqueue_running(c: *Core, w: *Waitable, timeout: u32, mode: u8, value: u32)
+private[kernel] enqueue_running(c: *Core, w: *Waitable, timeout: u32, side: u8, mode: u8, value: u32)
     val i = usize(c.sched.running)
     val r = waiter(waiter_index(c.id, i))
     r.task = c.sched.handle(c.id, i)
     r.priority = c.sched.tasks[i].priority
     r.outcome = Outcome.Waiting
+    r.side = side
     r.mode = mode
     r.value = value
     w.queue.insert(waiter_index(c.id, i))
