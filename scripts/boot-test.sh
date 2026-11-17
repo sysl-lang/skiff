@@ -99,6 +99,11 @@ mutexes_expected() {
     echo "skiff: core $1 a recursive mutex locked 3 times went to its waiter only at the third unlock, locked once
 skiff: core $1 a mutex of ceiling 6 kept a task of priority 5 out until it was unlocked, and one of ceiling 3 refused a task of priority 4"
 }
+# The queue sets, every core (boards/scenarios, sets.sysl): a task waiting on a set alone hears one
+# member of each kind in turn, and a notice another task beat it to leaves it waiting again.
+sets_expected() {
+    echo "skiff: core $1 a task waiting on a queue set heard a semaphore, a queue, event flags, a stream at its trigger level, a message buffer and a channel in turn, and a notice another task beat it to left it waiting again"
+}
 # The kernel's trace, every core (boards/scenarios, tracing.sysl): a task's take, block, wake by a give,
 # timeout and switches found in the core's trace ring in order, every reported interrupt entered and left.
 tracing_expected() {
@@ -180,6 +185,7 @@ $(deferred_expected 0)
 $(control_expected 0)
 $(stats_expected 0)
 $(mutexes_expected 0)
+$(sets_expected 0)
 $(tracing_expected 0)
 $(traces_expected 0)
 $(protection_expected 0)
@@ -236,6 +242,8 @@ skiff: core 0 asked core 1 to suspend, resume, re-prioritize and stop a task of 
 $(stats_expected 0)
 skiff: core 0 is refused another core's task statistics and high-water marks
 $(mutexes_expected 0)
+$(sets_expected 0)
+skiff: core 0 heard a semaphore and a queue core 1 filled, through a queue set in .shared, in the order they came
 $(tracing_expected 0)
 $(traces_expected 0)
 $(protection_expected 0)
@@ -275,6 +283,8 @@ $(control_expected 1)
 skiff: core 1 core 0 suspended, resumed, re-prioritized and stopped a task of core 1 through its inbox
 $(stats_expected 1)
 $(mutexes_expected 1)
+$(sets_expected 1)
+skiff: core 1 gave a semaphore and sent a message that a task of core 0 heard through a queue set in .shared
 $(tracing_expected 1)
 $(traces_expected 1)
 $(protection_expected 1)

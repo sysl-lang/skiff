@@ -106,11 +106,13 @@ shared_bounds(start: usize, end: usize)
 private[kernel] in_shared(at: usize, bytes: usize) -> bool = within(at, bytes, shared.start, shared.end)
 
 // The place of address `at` in `.shared`: how far past the section's start it lies. A place names one
-// object in every image that shares the section, which is how `.shared` refers to `.shared`.
-private[kernel] place_of(at: usize) -> usize = at - shared.start
+// object in every image that shares the section, which is how `.shared` refers to `.shared`. It is
+// computed modulo the word, so an address below the section has a place too, which leads back to it in
+// the image that took it (a queue set outside `.shared`, which its members name by place).
+private[kernel] place_of(at: usize) -> usize = at -% shared.start
 
 // The address of place `place` in `.shared`.
-private[kernel] at_place(place: usize) -> usize = shared.start + place
+private[kernel] at_place(place: usize) -> usize = shared.start +% place
 
 // The wait record at `index`: `core * option_tasks + slot`.
 private[kernel] waiter(index: u16) -> *Waiter = &shared.waiters[usize(index) / option_tasks][usize(index) % option_tasks]

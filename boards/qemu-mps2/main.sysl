@@ -84,7 +84,7 @@ private var objects: scenarios.Across
 // The status `boot` answered, which the last task stops the machine with.
 private var status: i32 = 0
 
-private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject, &task_measured, &task_locker, &task_work, &worked, &task_beat, &task_hang, &task_traced)
+private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject, &task_measured, &task_locker, &task_work, &worked, &task_beat, &task_hang, &task_traced, &task_selector)
 
 // Called by the chip's reset handler once there is a stack and `.bss` and `.shared` are zero.
 @export("skiff_main")
@@ -141,6 +141,7 @@ private task_locker() -> never = scenarios.locker_task(&Board())
 private task_beat() -> never = scenarios.beat_task(&Board())
 private task_hang() -> never = scenarios.hang_task(&Board(), true)
 private task_traced() -> never = scenarios.traced_task(&Board())
+private task_selector() -> never = scenarios.selector_task(&Board())
 
 // Raise timer 0's interrupt from software; the timer itself never runs.
 private raise() = armv7m.pend_irq(mps2.TIMER0_IRQ)
@@ -157,7 +158,7 @@ private task_idle() -> never
         kernel.rest(&board)
 
 // R: the handle checks, then the waits, the timers, deferred work, task control, the statistics, the
-// mutex options, the kernel's trace, the error traces, the protection, the grants, a sleep with the tick
+// mutex options, the queue sets, the kernel's trace, the error traces, the protection, the grants, a sleep with the tick
 // stopped and the watchdog, whose hang ends the run. Were R to come
 // back from it, the run would end 0, which the boot test refuses.
 private task_r() -> never
@@ -169,6 +170,7 @@ private task_r() -> never
     scenarios.control(&board, &entries)
     scenarios.stats(&board, &entries)
     scenarios.mutexes(&board, &entries)
+    scenarios.sets(&board, &entries)
     scenarios.tracing(&board, &entries)
     scenarios.traces(&board, &entries, CODE)
     scenarios.protection(&board, &entries, CODE, UART)

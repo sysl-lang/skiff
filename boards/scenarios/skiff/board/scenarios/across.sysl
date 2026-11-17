@@ -2,7 +2,7 @@ module skiff.board.scenarios
 
 import sysl.sync.Atomic
 import skiff.kernel
-import skiff.kernel.{Channel, Flags, MessageBuffer, Mutex, Pool, Queue, Semaphore, StreamBuffer, Task}
+import skiff.kernel.{Channel, Flags, MessageBuffer, Mutex, Pool, Queue, QueueSet, Semaphore, StreamBuffer, Task}
 
 // Everything the scenarios share between cores, in one structure: the objects two cores use and the
 // counters and handles each core reads of the other's. It lives in `.shared`, so it holds handles and
@@ -59,6 +59,12 @@ struct Across
     // masked (time.sysl).
     time_stage: Atomic[u32]
     time_from: Atomic[u32]
+    // The queue set in `.shared` core 0 waits on, its two members core 1 fills, and the step the two
+    // are at (sets.sysl).
+    gathering: QueueSet
+    far_units: Semaphore
+    far_mail: Queue[u32, 2]
+    set_stage: Atomic[u32]
 
 // The board's `Across`, in `.shared`.
 private[scenarios] var common: *Across

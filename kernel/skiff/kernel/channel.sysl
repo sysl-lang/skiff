@@ -44,6 +44,13 @@ impl[const N: usize] Channel[N]
     // How many buffers it holds at most.
     capacity(*self) -> u32 = u32(N)
 
+    // Join queue set `set`, as the queue under it does: the set hears of the channel whenever it holds a
+    // buffer a receive may take. Answers its index in the set.
+    join[P: Port](*self, p: *P, set: *QueueSet) -> Result[u8, SetError] = self.q.join(p, set)
+
+    // Leave the queue set it joined. Refused if it is in none.
+    leave[P: Port](*self, p: *P) -> Result[unit, SetError] = self.q.leave(p)
+
     // What a receiver does once handle `b` is out of the channel: the buffer is its own, so drop the
     // core's stale lines over it. A handle of another pool than the one named is the caller's mistake.
     private[kernel] taken[P: Port, Q: BufferPool](*self, p: *P, pool: *Q, b: Buffer) -> Buffer

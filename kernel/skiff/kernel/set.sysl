@@ -1,0 +1,197 @@
+module skiff.kernel
+
+import sysl.raw.ptr_cast
+import sysl.sync.Lock
+
+// Queue sets: how a task waits on several objects (DESIGN "Waiting on several objects: queue sets").
+//
+// A task waits on one thing at a time, so to wait on several it waits on a `QueueSet` the objects have
+// joined. A member that becomes available posts a notice naming itself (its index in the set) to its
+// set, and a task selecting from the set takes the notice and tries the member without waiting. A
+// notice is a hint: if another got there first the try fails, and the task selects again.
+//
+// - Members: semaphores, queues, event flags, stream and message buffers, channels; each joins at most
+//   one set, which gives it the lowest free index of `SET_MEMBERS`.
+// - At most one notice per member is queued, so the notices, a FIFO linked through the members'
+//   indexes, can never be more than the members: posting, selecting and leaving are each a few steps.
+// - A post with a task waiting on the set hands it the notice (`Given`, the index in its record's
+//   `value`); the queue holds notices only while nobody waits.
+// - A member posts under its own lock, taking the set's: member, then set, never the other way.
+// - A member names its set by place, never by pointer, so a member may lie in `.shared`; a member in
+//   `.shared` joins only a set in `.shared`.
+
+// How many members a set holds at most: one bit each in its bitmaps.
+const SET_MEMBERS: usize = 32
+
+// Why a join or a leave was refused.
+enum SetError
+    Joined      // the object is a member of a set already
+    Full        // the set has `SET_MEMBERS` members
+    NotJoined   // the object is a member of no set
+    Placement   // the object lies in `.shared` and the set does not
+
+// What a member keeps of its set: the set's place (`place_of`), its own index there, and whether it has
+// joined. All zeros is a member of no set, which is what a zeroed object in `.shared` holds.
+struct SetLink
+    place: usize
+    member: u8
+    joined: bool
+
+// A queue of notices from up to `SET_MEMBERS` members. `members` has a bit per index taken, `pending` a
+// bit per member with a notice queued; the notices are a circular FIFO through `prev`/`next` by index,
+// from `head`, read only while `pending` is not 0. A set of zeros is empty with no members, so one may
+// lie in `.shared`.
+struct QueueSet
+    w: Waitable
+    members: u32
+    pending: u32
+    head: u8
+    prev: [SET_MEMBERS]u8
+    next: [SET_MEMBERS]u8
+
+impl QueueSet
+    // An empty set called `name`.
+    const new(name: string) -> QueueSet = QueueSet(Waitable.new(name), 0, 0, 0, [0; SET_MEMBERS], [0; SET_MEMBERS])
+
+    // Take the oldest notice, waiting up to `timeout` ticks for one. Answers the index of the member it
+    // names, or None if none came. The member may no longer be available: try it without waiting. Only
+    // a task may wait; with a timeout of 0 nothing waits.
+    select[P: Port](*self, p: *P, timeout: u32) -> Option[u8]
+#if option_trace
+        trace_running(p, TraceKind.Take, TraceObject.Set, usize(&self.w), timeout)
+#endif
+        var l = self.w.lock.on(p)
+        l.acquire()
+        if self.pending != 0
+            val m = self.head
+            self.unlink(m)
+            l.release()
+            return Some(m)
+        if timeout == 0
+            l.release()
+            return None
+        val c = running_core(p)
+        enqueue_running(c, &self.w, timeout, 0, 0, 0)
+#if option_trace
+        trace_running(p, TraceKind.Blocked, TraceObject.Set, usize(&self.w), timeout)
+#endif
+        p.request_switch()
+        l.release()
+        if wait_outcome(c) == Outcome.Given then Some(u8(wait_value(c))) else None
+
+    // Take the oldest notice if there is one, without waiting. An interrupt handler may call it.
+    try_select[P: Port](*self, p: *P) -> Option[u8] = self.select(p, 0)
+
+    // How many notices are queued.
+    notices[P: Port](*self, p: *P) -> u32
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val n = self.pending.count_ones()
+        l.release()
+        n
+
+    // How many members it has.
+    size[P: Port](*self, p: *P) -> u32
+        var l = self.w.lock.on(p)
+        l.acquire()
+        val n = self.members.count_ones()
+        l.release()
+        n
+
+    // Under the lock: member `m` is available. Hand its notice to the best selector waiting, else queue
+    // it unless it is queued already.
+    private post_locked[P: Port](*self, p: *P, m: u8)
+        val at = self.w.queue.first()
+        if at != NONE
+            waiter(at).value = u32(m)
+            val _ = wake_at(p, &self.w, at, Outcome.Given)
+            return
+        val bit = 1u32 << u32(m)
+        if self.pending & bit != 0 then return
+        if self.pending == 0
+            self.head = m
+            self.prev[usize(m)] = m
+            self.next[usize(m)] = m
+        else
+            val tail = self.prev[usize(self.head)]
+            self.prev[usize(m)] = tail
+            self.next[usize(m)] = self.head
+            self.next[usize(tail)] = m
+            self.prev[usize(self.head)] = m
+        self.pending |= bit
+
+    // Under the lock: take member `m`'s notice, which is queued, out of the FIFO.
+    private unlink(*self, m: u8)
+        val bit = 1u32 << u32(m)
+        if self.next[usize(m)] != m
+            val before = self.prev[usize(m)]
+            val after = self.next[usize(m)]
+            self.next[usize(before)] = after
+            self.prev[usize(after)] = before
+            if self.head == m then self.head = after
+        self.pending &= ~bit
+
+    // Member `m` is available: take the lock and post. The caller holds the member's lock.
+    private[kernel] post[P: Port](*self, p: *P, m: u8)
+        var l = self.w.lock.on(p)
+        l.acquire()
+        self.post_locked(p, m)
+        l.release()
+
+    // Give a new member the lowest free index, posting its notice at once if it is `ready`. The caller
+    // holds the member's lock.
+    private[kernel] admit[P: Port](*self, p: *P, ready: bool) -> Option[u8]
+        var l = self.w.lock.on(p)
+        l.acquire()
+        if self.members == 0xffff_ffff
+            l.release()
+            return None
+        val m = u8((~self.members).trailing_zeros())
+        self.members |= 1u32 << u32(m)
+        if ready then self.post_locked(p, m)
+        l.release()
+        Some(m)
+
+    // Free member `m`'s index, withdrawing its notice if one is queued. The caller holds the member's
+    // lock.
+    private[kernel] dismiss[P: Port](*self, p: *P, m: u8)
+        var l = self.w.lock.on(p)
+        l.acquire()
+        if self.pending & (1u32 << u32(m)) != 0 then self.unlink(m)
+        self.members &= ~(1u32 << u32(m))
+        l.release()
+
+impl SetLink
+    // The link of an object in no set, for an object's constructor.
+    const none() -> SetLink = SetLink(0, 0, false)
+
+    // The member, of `bytes` bytes at `at`, joins `set`, posting its notice at once if it is `ready`.
+    // Answers its index. The caller holds the member's lock.
+    private[kernel] join[P: Port](*self, p: *P, set: *QueueSet, at: usize, bytes: usize, ready: bool) -> Result[u8, SetError]
+        if self.joined then return Err(SetError.Joined)
+        if in_shared(at, bytes) && !in_shared(usize(set), sizeof(QueueSet)) then return Err(SetError.Placement)
+        val m = set.admit(p, ready) match
+            Some(m) -> m
+            None -> return Err(SetError.Full)
+        self.place = place_of(usize(set))
+        self.member = m
+        self.joined = true
+        Ok(m)
+
+    // The member leaves its set. The caller holds the member's lock.
+    private[kernel] leave[P: Port](*self, p: *P) -> Result[unit, SetError]
+        if !self.joined then return Err(SetError.NotJoined)
+        self.set().dismiss(p, self.member)
+        self.place = 0
+        self.member = 0
+        self.joined = false
+        Ok(())
+
+    // The member is available: post its notice, if it is in a set. The caller holds the member's lock.
+    private[kernel] notify[P: Port](*self, p: *P)
+        if self.joined then self.set().post(p, self.member)
+
+    // Whether the member is in a set.
+    private[kernel] in_set(*self) -> bool = self.joined
+
+    private set(*self) -> *QueueSet = ptr_cast(at_place(self.place))
