@@ -1,0 +1,51 @@
+module skiff.board.scenarios
+
+import skiff.kernel
+import skiff.kernel.Port
+
+// The watchdog (DESIGN "Supervision"), R's last scenario on each core. R arms the core's watch and
+// creates a task that checks in every tick, watched with a period of `PERIOD` ticks; once `HEALTHY` of
+// the core's own ticks have passed, more than the watch's `TIMEOUT`, without a bite, R says so. Then, on a
+// core the scenario ends, a task above the watched one hangs, and the watched task checks in no more:
+//
+//   - unmasked (`masked` false), the core's tick still runs, and the watch bites from it: the board
+//     reports `watchdog` and stops the core alone;
+//   - masked, the tick runs no more, so no software watch can see the hang: the hardware watchdog's warning
+//     (an NMI) is what reports it.
+//
+// The core's own ticks come late and in bunches under multi-threaded TCG on a loaded host (up to 5 at
+// once on the AN521's core 1), so the period and the timeout are generous: 20 and 50 ticks.
+
+private const PERIOD: u32 = 20
+private const TIMEOUT: u32 = 50
+private const HEALTHY: u32 = 60
+private const BEAT_PRIORITY: u8 = 8
+private const HANG_PRIORITY: u8 = 9
+
+private var watch_stacks: [kernel.CORES][2][STACK_WORDS]u32
+
+// R: arm the watch, watch a task that checks in, wait `HEALTHY` ticks, and, with `hang`, start the hang.
+// A core that hangs never comes back to R.
+watchdog[P: Port](p: *P, e: *Entries, hang: bool)
+    val me = kernel.here_id(p)
+    kernel.arm_watchdog(p, TIMEOUT)
+    val beat = created(kernel.create(p, me, watch_stacks[me][0], e.beat, BEAT_PRIORITY))
+    if kernel.watch(p, beat, PERIOD).is_err() then panic("skiff: the watch refused its task")
+    val start = kernel.here(p).own_ticks()
+    while kernel.here(p).own_ticks() -% start < HEALTHY do kernel.sleep(p, 1)
+    say(p, "a watched task checked in for 60 ticks, and its core's watchdog held off\n")
+    if hang
+        val _ = created(kernel.create(p, me, watch_stacks[me][1], e.hang, HANG_PRIORITY))
+
+// The watched task: check in on every tick.
+beat_task[P: Port](p: *P) -> never
+    loop
+        val _ = kernel.check_in(p)
+        kernel.sleep(p, 1)
+
+// The hang: spin for ever above the watched task, with the kernel's interrupts masked or not.
+hang_task[P: Port](p: *P, masked: bool) -> never
+    if masked
+        val _ = p.mask()
+    loop
+        ()

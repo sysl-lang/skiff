@@ -1,0 +1,145 @@
+module skiff.kernel
+@tests
+
+import sysl.sync.Ordering
+
+// The watchdog on the host, over the recording port (kernel_tests.sysl), whose hardware watchdog counts
+// what it is asked. No task runs: a test checks in as a task by making it the running one, and takes
+// the core's ticks by hand, each followed by the supervision the board's tick runs.
+
+private body() -> never
+    loop
+        ()
+
+private var watch_stacks: [3][128]u32
+
+private on_stack(r: *Recorder, n: usize, priority: u8) -> Task = create(r, 0, watch_stacks[n], &body, priority).unwrap()
+
+// Check in as the task `t` names.
+private as_task(r: *Recorder, t: Task) -> bool
+    here(r).sched.running = u16(t.slot())
+    check_in(r)
+
+// One tick of the core and the supervision after it: whether the watch bit.
+private step(r: *Recorder) -> bool
+    tick(r)
+    supervise(r)
+
+@test("the watch is fed only on the ticks every watched task has checked in within its period")
+fed_only_when_all_report()
+    var r = recorder(1, 0)
+    val a = on_stack(&r, 0, 2)
+    val b = on_stack(&r, 1, 1)
+    here(&r).sched.first()
+    arm_watchdog(&r, 50)
+    assert(watch(&r, a, 3).is_ok(), "a watched")
+    assert(watch(&r, b, 3).is_ok(), "b watched")
+    // Both are current for their first 3 ticks, then only `a` checks in.
+    for _ in 0..<6
+        assert(!step(&r), "no bite")
+        assert(as_task(&r, a), "a is watched")
+    assert_eq(r.feeds, 3)
+    assert_eq(watch_here(&r).fed, 3)
+    // `b` checks in again: fed from that tick on.
+    assert(as_task(&r, b), "b is watched")
+    assert(!step(&r), "no bite")
+    assert_eq(r.feeds, 4)
+    assert_eq(watch_here(&r).fed, 7)
+    assert_eq(r.masked, 0)
+
+@test("a watch left unfed for its timeout bites once, reports through the fault path and stops its hardware")
+missed_check_in_bites()
+    var r = recorder(1, 0)
+    val a = on_stack(&r, 0, 2)
+    here(&r).sched.first()
+    arm_watchdog(&r, 5)
+    assert_eq(r.watchdog_ticks, 10)
+    assert(watch(&r, a, 2).is_ok(), "watched")
+    // Fed on ticks 1 and 2; unfed from tick 3; it bites on the first tick more than 5 past tick 2.
+    for n in 1u32..<8
+        assert(!step(&r), "no bite yet")
+        assert_eq(here(&r).own_ticks(), n)
+    assert_eq(r.feeds, 2)
+    assert(step(&r), "bites on tick 8")
+    assert(bitten(&r), "bitten")
+    assert(stopped(0), "the core is stopped")
+    assert(here(&r).stopped, "and knows it")
+    assert_eq(r.watchdog_stops, 1)
+    assert(recorded(&r, "skiff: core 0 fault watchdog\n"), "reported")
+    // Disarmed by its bite: it never bites again.
+    assert(!step(&r), "bites once")
+    assert_eq(r.masked, 0)
+
+@test("a task that keeps checking in keeps the watch fed however long it runs")
+check_ins_hold_it_off()
+    var r = recorder(1, 0)
+    val a = on_stack(&r, 0, 2)
+    here(&r).sched.first()
+    arm_watchdog(&r, 4)
+    assert(watch(&r, a, 1).is_ok(), "watched")
+    for _ in 0..<100
+        assert(!step(&r), "no bite")
+        assert(as_task(&r, a), "checked in")
+    assert_eq(r.feeds, 100)
+    assert(!stopped(0), "running")
+
+@test("a watch counts across the wrap of the core's ticks")
+watch_across_the_wrap()
+    var r = recorder(1, 0)
+    val a = on_stack(&r, 0, 2)
+    here(&r).sched.first()
+    here(&r).ticks.store(0xffff_fffd, Ordering.Relaxed)
+    arm_watchdog(&r, 3)
+    assert(watch(&r, a, 1).is_ok(), "watched")
+    for _ in 0..<6
+        assert(!step(&r), "no bite across the wrap")
+        assert(as_task(&r, a), "checked in")
+    assert_eq(here(&r).own_ticks(), 3)
+    assert(!step(&r), "fed on tick 4, a checked in at 3")
+    assert(!step(&r), "tick 5: unfed, but within the timeout")
+    assert(!step(&r), "tick 6")
+    assert(!step(&r), "tick 7")
+    assert(step(&r), "bites on tick 8")
+
+@test("an unarmed watch never bites and feeds nothing, whatever its tasks do")
+unarmed_never_bites()
+    var r = recorder(1, 0)
+    val a = on_stack(&r, 0, 2)
+    here(&r).sched.first()
+    assert(watch(&r, a, 1).is_ok(), "watched")
+    for _ in 0..<20
+        assert(!step(&r), "no bite")
+    assert_eq(r.feeds, 0)
+    arm_watchdog(&r, 2)
+    disarm_watchdog(&r)
+    assert_eq(r.watchdog_stops, 1)
+    for _ in 0..<20
+        assert(!step(&r), "disarmed")
+    assert(!stopped(0), "running")
+
+@test("watching: a stale handle refused, the table's bound kept, a second watch a new period, unwatch")
+watch_bookkeeping()
+    var r = recorder(1, 0)
+    val a = on_stack(&r, 0, 2)
+    val b = on_stack(&r, 1, 2)
+    here(&r).sched.first()
+    assert(delete(&r, b).is_ok(), "b deleted")
+    assert(watch(&r, b, 5) == Err(TaskError.Stale), "a stale handle")
+    assert(watch(&r, task_handle(1, 0, 1), 5) == Err(TaskError.Stale), "no such core")
+    assert(!as_task(&r, a), "not watched yet")
+    assert(watch(&r, a, 5).is_ok(), "watched")
+    assert(watch(&r, a, 9).is_ok(), "watched again")
+    assert_eq(watch_here(&r).count, 1)
+    assert_eq(watch_here(&r).tasks[0].period, 9)
+    assert(as_task(&r, a), "watched now")
+    // The idle task's handle is as good as any: fill the table with it and `a`.
+    for n in 1..<option_watched
+        watch_here(&r).tasks[n] = Watched(task_handle(0, 15, u16(n)), 1, 0)
+    watch_here(&r).count = option_watched
+    val c = on_stack(&r, 2, 1)
+    assert(watch(&r, c, 5) == Err(TaskError.Full), "full")
+    assert(unwatch(&r, a), "unwatched")
+    assert(!unwatch(&r, a), "not twice")
+    assert_eq(watch_here(&r).count, option_watched - 1)
+    assert(watch(&r, c, 5).is_ok(), "a place again")
+    assert(!as_task(&r, a), "a is no longer watched")

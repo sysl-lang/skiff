@@ -1,9 +1,9 @@
 // skiff on QEMU's MPS2 AN521, both Cortex-M33 cores. By default it is one image, which both cores run:
 // both enter `_start` (skiff.chip.an521) and then `skiff_main`, and tell themselves apart by core number.
 // Core 0 creates both cores' tasks and releases core 1; each core greets, watches three of its own ticks
-// and runs its own tasks (skiff.board.scenarios) at once with the other. Then core 1 takes a fault on
-// purpose, which stops it alone. Core 0 sees it stopped, ticks on, checks that the time base counted its
-// ticks and no others, and stops the machine with status 0.
+// and runs its own tasks (skiff.board.scenarios) at once with the other. Then core 1 hangs on purpose,
+// and its watchdog, checked on its own tick, stops it alone. Core 0 sees it stopped, ticks on, checks that
+// the time base counted its ticks and no others, and stops the machine with status 0.
 //
 // Built as two images (the `core0` and `core1` features), each core runs its own, and the system
 // description (system.sysl) is what the two share: each core takes the peripherals and interrupts it
@@ -12,14 +12,13 @@
 // include the floating-point ones. From there the run is the one image's.
 
 import sysl.debug.ErrorTraceStore
-import sysl.raw.ptr_cast
 import sysl.sync.Atomic
 import skiff.arch.armv7m
 import skiff.arch.armv8m
 import skiff.board.scenarios
 import skiff.chip.an521
 import skiff.kernel
-import skiff.kernel.{Access, Cache, Doorbell, Isolation, Port, Protection, Region, RegionError, RunCounter, Slot}
+import skiff.kernel.{Access, Cache, Doorbell, Isolation, Port, Protection, Region, RegionError, RunCounter, Slot, Watchdog}
 import system
 import system.Resource
 
@@ -55,12 +54,6 @@ private const TIMER_IRQ: u32 = an521.TIMER0_IRQ
 
 // The status core 0 stops the machine with when the images disagree at the handshake.
 private const HANDSHAKE_REFUSED: i32 = 3
-
-// An address with nothing behind it in the AN521's map: a load from it is a BusFault.
-private const NOWHERE: usize = 0xF000_0000
-
-private struct Word
-    v: volatile u32
 
 // The cores as the kernel sees them: two, each with the UART of its own number as its console, its own
 // SysTick as its tick, and the armv7m context switch.
@@ -108,6 +101,14 @@ impl Isolation for Board
 impl RunCounter for Board
     run_count(*self) -> u32 = an521.counter_now()
 
+// No hardware stage: QEMU's SSE-200 wires its two secure watchdogs to CPU 0's NMI alone and its
+// non-secure one to interrupt 1 of both cores, so no hardware watchdog is a core's own (DESIGN
+// "Supervision"). Each core's watch is the kernel's, checked on its own tick.
+impl Watchdog for Board
+    start_watchdog(*self, ticks: u32) = ()
+    feed_watchdog(*self) = ()
+    stop_watchdog(*self) = ()
+
 // The bounds of the code and its constants, on 32-byte boundaries (link.ld): what every unprivileged
 // task runs.
 extern __code_start: u8
@@ -116,7 +117,7 @@ extern __code_end: u8
 // The status `boot` answered on core 0, which core 0's last task stops the machine with.
 private var status: i32 = 0
 
-private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject, &task_measured)
+private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject, &task_measured, &task_beat, &task_hang)
 
 @export("skiff_main")
 skiff_main() -> never
@@ -244,6 +245,8 @@ private task_hog() -> never = scenarios.hog_task(&Board())
 private fired(t: *kernel.Timer, due: u32) = scenarios.fired(&Board(), t, due)
 private task_subject() -> never = scenarios.subject_task(&Board())
 private task_measured() -> never = scenarios.measured_task(&Board())
+private task_beat() -> never = scenarios.beat_task(&Board())
+private task_hang() -> never = scenarios.hang_task(&Board(), false)
 
 // Raise the running core's timer interrupt from software; the timer itself never runs.
 private raise() = armv7m.pend_irq(TIMER_IRQ)
@@ -257,9 +260,9 @@ private task_idle() -> never
     loop
         armv7m.wait_for_interrupt()
 
-// R: the handle checks, then the waits, the timers, task control, the statistics, the protection and the
-// grants, then the end of the run. Core 1 faults; core 0 waits until it sees core 1 stopped, ticks on,
-// and stops the machine.
+// R: the handle checks, then the waits, the timers, task control, the statistics, the protection, the
+// grants and the watchdog, then the end of the run. Core 1 hangs, and its watchdog stops it; core 0, its
+// own watch still fed, waits until it sees core 1 stopped, ticks on, and stops the machine.
 private task_r() -> never
     var board = Board()
     scenarios.check_handles(&board, &entries)
@@ -272,9 +275,7 @@ private task_r() -> never
     scenarios.traces(&board, &entries, code)
     scenarios.protection(&board, &entries, code, Region(an521.uart_base(me), an521.UART_STRIDE, Access.Device))
     scenarios.grants(&board, code)
-    if me == 1
-        val nothing: *Word = ptr_cast(NOWHERE)
-        kernel.write_hex(&board, nothing.v)
+    scenarios.watchdog(&board, &entries, me == 1)
     while !kernel.stopped(1) do kernel.sleep(&board, 1)
     board.write("skiff: core 0 sees core 1 stopped\n".bytes)
     kernel.sleep(&board, 3)
@@ -289,11 +290,20 @@ board_doorbell()
     var board = Board()
     kernel.answer_doorbell(&board)
 
-// SysTick, on either core: one tick for the kernel on that core.
+// SysTick, on either core: one tick for the kernel on that core, then its supervision. A bite stops that
+// core alone, as a fault does.
 @export("skiff_systick")
 board_tick()
     var board = Board()
     kernel.tick(&board)
+    if kernel.supervise(&board) then armv7m.stop_core()
+
+// The NMI, which only core 0 takes, from a watchdog no core arms: the kernel's verdict all the same.
+@export("skiff_nmi")
+board_nmi()
+    var board = Board()
+    kernel.bite(&board)
+    armv7m.stop_core()
 
 // PendSV's switch, on either core: that core's kernel chooses its next task.
 @export("skiff_switch")

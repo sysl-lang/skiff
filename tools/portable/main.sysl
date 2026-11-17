@@ -4,7 +4,7 @@
 
 import sysl.sync.{Atomic, Lock}
 import skiff.kernel
-import skiff.kernel.{Access, Cache, Channel, Doorbell, Grant, Isolation, MessageBuffer, Pool, Port, Protection, Queue, Region, RegionError, RunCounter, Slot, StreamBuffer}
+import skiff.kernel.{Access, Cache, Channel, Doorbell, Grant, Isolation, MessageBuffer, Pool, Port, Protection, Queue, Region, RegionError, RunCounter, Slot, StreamBuffer, Watchdog}
 
 struct Nothing
 end Nothing
@@ -46,6 +46,11 @@ impl Isolation for Nothing
 
 impl RunCounter for Nothing
     run_count(*self) -> u32 = 0
+
+impl Watchdog for Nothing
+    start_watchdog(*self, ticks: u32) = ()
+    feed_watchdog(*self) = ()
+    stop_watchdog(*self) = ()
 
 private var stack: [64]u32 = [0; 64]
 // Objects one core keeps are constant data: an export reaches them, and a freestanding artifact has no
@@ -169,7 +174,16 @@ private control(m: *Nothing, t: kernel.Task) -> bool
 private stats(m: *Nothing, t: kernel.Task) -> bool
     if kernel.task_stats(m, t).is_ok() || kernel.stack_high_water(m, t).is_ok() then return false
     kernel.reset_stats(m)
-    kernel.core_stats(m).elapsed == 0
+    kernel.core_stats(m).elapsed == 0 && watchdog(m, t)
+
+// The watchdog: another core's task refused, then the running core's watch armed, fed and disarmed.
+private watchdog(m: *Nothing, t: kernel.Task) -> bool
+    if kernel.watch(m, t, 5).is_ok() || kernel.unwatch(m, t) || kernel.check_in(m) then return false
+    kernel.arm_watchdog(m, 10)
+    val bit = kernel.supervise(m)
+    if bit then kernel.bite(m)
+    kernel.disarm_watchdog(m)
+    !kernel.bitten(m)
 
 @export("main")
 probe() -> i32

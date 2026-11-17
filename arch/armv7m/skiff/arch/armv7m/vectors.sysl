@@ -8,6 +8,8 @@ module skiff.arch.armv7m
 //   - The four faults go to their own entries (faults.sysl), which hand the board the exception's number.
 //   - SysTick goes to `skiff_systick`, which the board exports: it calls the kernel's tick with the
 //     board's port.
+//   - NMI goes to `skiff_nmi`, which the board exports: the chip's watchdog raises it (DESIGN
+//     "Supervision"), and the board reports the core's watchdog and stops it.
 //   - SVCall and PendSV start and switch tasks (context.sysl).
 //   - Every other system exception goes to `skiff_exception`, so it stops the machine with
 //     `FAULT_STATUS` where, with no handler, it would escalate to a HardFault and lock the core up
@@ -21,7 +23,7 @@ asm
         ".section .vectors, \"a\""
         ".word _stack_top"
         ".word _start"
-        ".word skiff_exception"     // NMI
+        ".word skiff_nmi"           // NMI: the board's, whose hardware watchdog raises it
         ".word skiff_hardfault"
         ".word skiff_memmanage"
         ".word skiff_busfault"
@@ -41,6 +43,9 @@ asm
 // The status a fault stops the machine with. Nothing else uses it, so a run that ends in it is known to
 // have faulted rather than finished.
 const FAULT_STATUS: i32 = 99
+
+// The status a watchdog's bite stops a one-core machine with, apart from any fault's.
+const WATCHDOG_STATUS: i32 = 98
 
 // Every system exception lands here: stop the machine with `FAULT_STATUS`.
 @export("skiff_exception")
