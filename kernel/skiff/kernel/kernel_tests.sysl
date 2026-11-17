@@ -33,6 +33,20 @@ private[kernel] struct Recorder
     reserve: usize      // the bytes at the bottom of every stack its guard takes
     clock: u32          // the core's counter, moved by hand
     context_words: usize    // how many words the stack the last new context was laid on had
+    watchdog_ticks: u32     // what the hardware watchdog was last started at (0: never)
+    feeds: u32              // how many times it was fed
+    watchdog_stops: u32     // how many times it was stopped
+
+// A hardware watchdog that counts what it is asked.
+impl Watchdog for Recorder
+    start_watchdog(*self, ticks: u32)
+        self.watchdog_ticks = ticks
+
+    feed_watchdog(*self)
+        self.feeds += 1
+
+    stop_watchdog(*self)
+        self.watchdog_stops += 1
 
 // The counter is whatever the test last set it to.
 impl RunCounter for Recorder
@@ -127,7 +141,7 @@ impl Doorbell for Recorder
     ring(*self, core: u32) = panic("one core never rings")
     clear(*self) = panic("one core never rings")
 
-private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, 0, 0, 0, 0, null, null, 0, 0, 0, 0, 0, 0, false, 8, 0, 0, 0)
+private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, 0, 0, 0, 0, null, null, 0, 0, 0, 0, 0, 0, false, 8, 0, 0, 0, 0, 0, 0)
 
 // Whether `r` recorded exactly `want`.
 private[kernel] recorded(r: *Recorder, want: string) -> bool

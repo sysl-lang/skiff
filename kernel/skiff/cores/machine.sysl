@@ -3,7 +3,7 @@ module skiff.cores
 
 import sysl.sync.{Atomic, Ordering}
 import skiff.kernel
-import skiff.kernel.{Cache, Doorbell, Isolation, Port, Protection, Region, RegionError, RunCounter, Semaphore, Slot, Task}
+import skiff.kernel.{Cache, Doorbell, Isolation, Port, Protection, Region, RegionError, RunCounter, Semaphore, Slot, Task, Watchdog}
 
 // A machine of `kernel.CORES` cores on the host, played one core at a time: `me` says which core is
 // running, and a test changes it to act as another. Its doorbell rings nothing; it counts the rings each
@@ -20,10 +20,22 @@ struct Machine
     cleans: [kernel.CORES]u32      // how many cleans each core asked of its cache
     invalidates: [kernel.CORES]u32 // how many invalidates
     clocks: [kernel.CORES]u32      // each core's own counter, moved by hand
+    feeds: [kernel.CORES]u32       // how many times each core fed its hardware watchdog
+    watchdog_stops: [kernel.CORES]u32  // how many times each core stopped it
 
 // Each core reads its own counter.
 impl RunCounter for Machine
     run_count(*self) -> u32 = self.clocks[self.me]
+
+// Each core's hardware watchdog counts what that core asks of it.
+impl Watchdog for Machine
+    start_watchdog(*self, ticks: u32) = ()
+
+    feed_watchdog(*self)
+        self.feeds[self.me] += 1
+
+    stop_watchdog(*self)
+        self.watchdog_stops[self.me] += 1
 
 // A tick is taken by hand. A new task's context is only its stack's address. The chip's lock is a word
 // that is never contended, since one core acts at a time: finding it taken is a lock left held.
@@ -99,7 +111,7 @@ impl Isolation for Machine
 // every one of them may be used by two cores, so the whole address space counts as `.shared`.
 machine() -> Machine
     kernel.shared_bounds(0, 0xffff_ffff_ffff_ffff)
-    Machine(0, [0; kernel.CORES], [0; kernel.CORES], 0, [false; kernel.CORES], null, [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES])
+    Machine(0, [0; kernel.CORES], [0; kernel.CORES], 0, [false; kernel.CORES], null, [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES])
 
 // Act as core `core` from now on.
 on(m: *Machine, core: u32)

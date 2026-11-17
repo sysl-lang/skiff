@@ -20,7 +20,9 @@ mkdir -p "$scratch"
 # the link script's `.shared`, takes three ticks, finds the time base agreeing with its own count, then
 # runs the scenarios' tasks (boards/scenarios): two equal tasks taking turns on the tick, two keeping
 # their FPU registers across switches, a high-priority task running on the tick its sleep ends, and a
-# stale handle refused. It ends through semihosting with status 0.
+# stale handle refused. Its last scenario hangs the core with its interrupts masked, after a watched
+# task kept the core's watchdog fed for 60 ticks: the tick stops, and the hardware watchdog's NMI reports
+# it and ends the run through semihosting with status 98 (WATCHDOG_STATUS), not 0.
 # tasks_expected <core> [<line the FPU tasks print>]: a build with no FPU registers has no such line.
 tasks_expected() {
     echo "skiff: core $1 task A 1
@@ -143,6 +145,11 @@ skiff: core $1 two unprivileged tasks passed a pool buffer back and forth 4 time
 skiff: core $1 stopped a task that broke its memory protection
 skiff: core $1 an unprivileged task that wrote a buffer it had passed on was stopped, and the buffer reached its receiver"
 }
+# The watchdog, every core (boards/scenarios, watchdog.sysl): a watched task checking in every tick keeps
+# its core's watchdog from biting for longer than its timeout.
+watchdog_expected() {
+    echo "skiff: core $1 a watched task checked in for 60 ticks, and its core's watchdog held off"
+}
 mps2_expected="skiff: hello
 skiff: .shared holds the shared state
 skiff: core 0 tick 1
@@ -159,7 +166,9 @@ $(stats_expected 0)
 $(mutexes_expected 0)
 $(traces_expected 0)
 $(protection_expected 0)
-$(grants_expected 0)"
+$(grants_expected 0)
+$(watchdog_expected 0)
+skiff: core 0 fault watchdog"
 
 # The AN521's two cores run one image, each greeting and ticking on the UART of its own number, then
 # running its own tasks at once with the other. Core 0 has no FPU (the SSE-200's CPU0, in QEMU as on
@@ -179,10 +188,11 @@ $(grants_expected 0)"
 # software timers and deferred work, and core 0 may not command a timer of core 1's nor post its work. Core 0 suspends, resumes, re-prioritizes
 # and stops a task of core 1 through core 1's inbox, and core 1 checks each step. Each core measures its
 # own tasks on its own counter, and core 0 is refused core 1's. Core 0 then masks its interrupts, taking
-# no tick, while core 1 alone moves the time base on and sleeps on it. Core 1 then faults on purpose: it
-# reports the fault on its own console and stops. Core 0 sees it stopped, takes more ticks, finds that
-# the time base moves a period for each of its own ticks without core 1, and stops the machine with
-# status 0.
+# no tick, while core 1 alone moves the time base on and sleeps on it. Each core's watchdog holds off
+# while a watched task checks in; then a task on core 1 spins above it, and core 1's watchdog, checked
+# on its own tick, reports on core 1's console and stops core 1 alone. Core 0 sees it stopped, takes
+# more ticks, finds that the time base moves a period for each of its own ticks without core 1, and
+# stops the machine with status 0.
 an521_core0_greeting="skiff: hello from core 0
 skiff: .shared holds the shared state"
 an521_core0_run="skiff: core 0 tick 1
@@ -212,6 +222,7 @@ skiff: core 0 an unprivileged task on core 1 took a unit core 0 gave and set fla
 $(grants_expected 0)
 skiff: core 0 had the pool buffer an unprivileged task sent core 1 through granted objects back
 skiff: core 0 took no tick while masked, and the time base moved on without it
+$(watchdog_expected 0)
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
 skiff: core 0 keeps the time base alone"
@@ -246,7 +257,8 @@ skiff: core 1 an unprivileged task took a unit core 0 gave, through its grant
 $(grants_expected 1)
 skiff: core 1 an unprivileged task received notes and a filled buffer an unprivileged task of core 0 sent, through its grants
 skiff: core 1 kept the time base moving while core 0 took no tick
-skiff: core 1 fault BusFault"
+$(watchdog_expected 1)
+skiff: core 1 fault watchdog"
 an521_core1_expected="skiff: hello from core 1
 $an521_core1_ticks
 $(tasks_expected 1)
@@ -335,10 +347,10 @@ build thumbv7em-freestanding-dp qemu-mps2 "$m7_image"
 build thumbv7em-freestanding qemu-mps2 "$m4_image"
 run "$scratch/mps2-an500.log" -M mps2-an500 -kernel "$m7_image"
 check mps2-an500 "$scratch/mps2-an500.log" "$mps2_expected"
-verdict mps2-an500 0
+verdict mps2-an500 98
 run "$scratch/mps2-an386.log" -M mps2-an386 -kernel "$m4_image"
 check mps2-an386 "$scratch/mps2-an386.log" "$mps2_expected"
-verdict mps2-an386 0
+verdict mps2-an386 98
 
 # The AN521: one image run by both cores, under multi-threaded TCG so that the cores really run at once.
 # Core 0's console, UART0, is QEMU's stdio; core 1's, UART1, goes to a file of its own.

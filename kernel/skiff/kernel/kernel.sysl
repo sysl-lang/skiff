@@ -59,10 +59,24 @@ trait Isolation
 trait RunCounter
     run_count(*self) -> u32
 
+// The running core's hardware watchdog: the second stage behind the kernel's own watch on the core
+// (DESIGN "Supervision"). Its early warning reaches the board, which calls `kernel.bite`; its reset is the
+// chip's, for when even the warning cannot run. A core with no hardware watchdog of its own does nothing
+// for any of the three.
+trait Watchdog
+    // Start it, to warn unless fed within `ticks` of the core's ticks.
+    start_watchdog(*self, ticks: u32)
+
+    // Put its count back to the full `ticks`.
+    feed_watchdog(*self)
+
+    // Stop it: the core's verdict is given, and a stopped core must not reset the machine.
+    stop_watchdog(*self)
+
 // The kernel's view of the processor and the machine under it. An arch package, a chip package and a
 // board program together implement it; the kernel itself knows nothing about the hardware beyond what
 // this trait says.
-trait Port: Doorbell + Cache + Protection + Isolation + RunCounter
+trait Port: Doorbell + Cache + Protection + Isolation + RunCounter + Watchdog
     // Write `bytes` to this core's console, waiting for room as long as it takes.
     write(*self, bytes: []const u8)
 

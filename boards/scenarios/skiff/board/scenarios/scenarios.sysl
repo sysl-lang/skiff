@@ -22,8 +22,9 @@ import skiff.kernel.{Port, Task, TaskError, TaskState}
 //     on core 1, which runs. Then it waits for the waits (waits.sysl), the messages (messages.sysl) and,
 //     on several cores, the waits across cores (crossing.sysl). Then it runs the software timers
 //     (timers.sysl), deferred work (deferred.sysl), task control (control.sysl), the statistics
-//     (stats.sysl), the mutex options (mutexes.sysl) and the protection scenarios (protection.sysl),
-//     and the board ends the run.
+//     (stats.sysl), the mutex options (mutexes.sysl), the protection scenarios (protection.sysl),
+//     the grants (grants.sysl) and the watchdog (watchdog.sysl), whose hang ends the core it is run
+//     with.
 
 // How many words each task's stack holds: 2 KiB, enough for a kernel call at -O0.
 const STACK_WORDS: usize = 512
@@ -68,6 +69,8 @@ struct Entries
     locker: *extern() -> never      // every task the mutex options' scenarios create (mutexes.sysl)
     work: *extern() -> never        // the work service (deferred.sysl)
     worked: kernel.WorkCallback
+    beat: *extern() -> never        // the watchdog's watched task (watchdog.sysl)
+    hang: *extern() -> never        // the task that hangs its core (watchdog.sysl)
 
 private var stacks: [kernel.CORES][STACKS][STACK_WORDS]u32
 

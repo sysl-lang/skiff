@@ -41,7 +41,8 @@ Core (private, one per core)          .shared
   `start_first`, `mask`, `restore`, `spin_lock`, `spin_try_lock` and `spin_unlock`; the arch package
   supplies the last eight. `Port` extends **`Doorbell`** (`ring(core)`), which the chip supplies: MHU0
   on the AN521; and **`Cache`** (`clean`, `invalidate`), the running core's data cache, which does
-  nothing on a core without one (see "Channels and the buffer pool"). The idle task's body is the board's (`kernel.run(p, idle_stack, idle)`), since a task
+  nothing on a core without one (see "Channels and the buffer pool"); and **`Watchdog`**, the
+  core's hardware watchdog, if it has one of its own (see "Supervision"). The idle task's body is the board's (`kernel.run(p, idle_stack, idle)`), since a task
   entry takes no port.
 - **One image is built for the weakest core it runs on**: the AN521's core 0 has no FP registers, so its
   image is built for `thumb-freestanding-soft`, and no core of it saves or uses them.
@@ -834,6 +835,49 @@ overwrite the other's, and behind the MPU an unprivileged task cannot read the k
 
 `map_regions` (usize, default 6, [2, 16]): regions in an unprivileged task's map, its stack among
 them. `grants` (usize, default 4, [0, 32]): objects one task may be granted.
+
+## Supervision
+
+A core that stops making progress is noticed and reported on its own console, and the other cores run
+on, as after a fault. `kernel/skiff/kernel/watchdog.sysl` is the kernel's side.
+
+- **A watch per core, in the core's private memory.** It holds the tasks the core watches (`watch(p, t,
+  period)`, its own tasks only, `option_watched` of them, default 4), the tick each last checked in on
+  (`check_in(p)`, by the running task), its timeout (`arm_watchdog(p, timeout)`) and the tick it was last
+  fed on. Every count is of the core's **own** ticks, so a core whose ticks come late (QEMU's AN521 core
+  1, under load) is judged by the ticks it took, never by another core's.
+- **The core's tick feeds it, and only when every watched task has checked in within its period.** The
+  board's tick handler calls `supervise(p)` after `tick`. No supervision task: it would need the highest
+  priority, and its own liveness would rest on the tick anyway; in the tick the check costs one pass over
+  the watched tasks under the core's mask, no stack, and proves both that the tick runs and that each
+  watched task does. A watch unfed for its timeout **bites**: `bite(p)` stops the hardware stage (below),
+  reports through the fault path (`fault(p, "watchdog")`: `skiff: core <n> fault watchdog`, the core
+  marked stopped in `.shared`), and `supervise` answers true, on which the board stops the core as its
+  fault handler would: `stop_core` on the AN521, the machine's halt on a one-core board. Only the owner
+  touches its watch, so no core can feed another's, and a stopped core's verdict changes nothing of the
+  others'.
+- **The hardware watchdog is the second stage** (the port's `Watchdog`: `start_watchdog(ticks)`,
+  `feed_watchdog`, `stop_watchdog`), started at `HARDWARE_STAGE` (2) times the timeout and fed with the
+  watch. It is what notices a core whose tick no longer runs (its interrupts masked for good, a lockup),
+  which no software watch can. Its warning reaches the board, which calls `bite` too; its reset, the
+  chip's, is for when even the warning cannot run. A bite stops it, so a core stopped by its verdict never
+  resets the machine.
+- **What QEMU models.** The MPS2 (AN500, AN386): one CMSDK APB watchdog at 0x4000_8000 (25 MHz), its
+  interrupt wired to the core's NMI; at a second expiry with the interrupt standing, with RESEN, it
+  resets. One core, so it is that core's own: the board arms it, and the NMI (`skiff_nmi`, now the arch's
+  NMI vector) reports `watchdog` and halts. The AN521 (SSE-200): three CMSDK watchdogs, the S32K one
+  (0x5002_E000, 32 kHz) and the secure one (0x5008_1000, 20 MHz) both through an OR gate to **CPU 0's NMI
+  alone**, and the non-secure one (0x4008_1000, 20 MHz) on interrupt 1, which a splitter delivers to
+  **both** cores. None is a core's own, so the AN521's cores have no hardware stage yet: each core's watch
+  is the kernel's, checked on its own SysTick (which each M33 has). A hardware stage there would give
+  core 0 the secure watchdog's NMI and core 1 the non-secure one's interrupt 1, enabled in core 1's NVIC
+  alone above the kernel's mask (it would see a core 1 masked by BASEPRI, not by PRIMASK), with either
+  reset machine-wide.
+- **Scenarios**: R's last on each core (`boards/scenarios/.../watchdog.sysl`): period 20, timeout 50, 60
+  healthy ticks. On the MPS2 the hang masks the kernel's interrupts, so only the NMI sees it, and the run
+  ends with `WATCHDOG_STATUS` (98). On the AN521 core 1's hang spins unmasked above its watched task, and
+  its watch bites from its tick; core 0's watch stays fed while it waits to see core 1 stopped. This
+  replaces the BusFault that ended core 1 before.
 
 ## Open questions
 

@@ -1,0 +1,84 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+import skiff.kernel.{Task, TaskError}
+
+// The watchdog on several cores: each core's watch is its own, fed by its own supervision from its own
+// tasks' check-ins and counted in its own ticks, and a bite stops that core alone.
+
+// One tick of the running core and the supervision after it: whether its watch bit.
+private step(m: *Machine) -> bool
+    kernel.tick(m)
+    kernel.supervise(m)
+
+// Check in as the task `t` names, on its own core.
+private as_task(m: *Machine, t: Task) -> bool
+    on(m, t.core())
+    kernel.here(m).sched.running = u16(t.slot())
+    kernel.check_in(m)
+
+@test("a core whose watched task stops checking in bites alone, and the other core's watch stays fed")
+bites_alone()
+    var m = machine()
+    val a = task_on(&m, 0, 0, 1)
+    val b = task_on(&m, 1, 1, 1)
+    begin(&m)
+    for core in 0u32..<2
+        on(&m, core)
+        kernel.arm_watchdog(&m, 5)
+    on(&m, 0)
+    assert(kernel.watch(&m, a, 2).is_ok(), "core 0 watches a")
+    on(&m, 1)
+    assert(kernel.watch(&m, b, 2).is_ok(), "core 1 watches b")
+    // Core 0's task checks in on every tick; core 1's never does, while core 0 takes as many ticks.
+    var bit_at: u32 = 0
+    for n in 1u32..<20
+        on(&m, 0)
+        assert(!step(&m), "core 0 never bites")
+        assert(as_task(&m, a), "a checks in")
+        on(&m, 1)
+        if step(&m) && bit_at == 0 then bit_at = n
+    assert_eq(bit_at, 8)
+    assert(kernel.stopped(1), "core 1 stopped")
+    assert(!kernel.stopped(0), "core 0 runs on")
+    assert_eq(m.feeds[0], 19)
+    assert_eq(m.feeds[1], 2)
+    assert_eq(m.watchdog_stops[1], 1)
+    assert_eq(m.watchdog_stops[0], 0)
+    on(&m, 0)
+    assert(!kernel.bitten(&m), "core 0's watch is whole")
+
+@test("each core's watch counts its own ticks: a core whose ticks stand still is not judged by another's")
+own_ticks_per_core()
+    var m = machine()
+    val a = task_on(&m, 0, 0, 1)
+    val b = task_on(&m, 1, 1, 1)
+    begin(&m)
+    on(&m, 1)
+    kernel.arm_watchdog(&m, 3)
+    assert(kernel.watch(&m, b, 1).is_ok(), "core 1 watches b")
+    // Core 0 takes many ticks and core 1 none: core 1's watch has not moved.
+    on(&m, 0)
+    for _ in 0..<50
+        assert(!step(&m), "core 0 is not armed")
+    on(&m, 1)
+    assert(!step(&m), "core 1's first tick: b checked in one tick ago")
+    assert_eq(m.feeds[1], 1)
+    assert_eq(m.feeds[0], 0)
+
+@test("a core may not watch another core's task, nor check in for it")
+watch_remote_refused()
+    var m = machine()
+    val a = task_on(&m, 0, 0, 1)
+    val b = task_on(&m, 1, 1, 1)
+    begin(&m)
+    on(&m, 0)
+    assert(kernel.watch(&m, b, 5) == Err(TaskError.Remote), "core 1's task")
+    assert(kernel.watch(&m, a, 5).is_ok(), "its own")
+    on(&m, 1)
+    assert(kernel.watch(&m, a, 5) == Err(TaskError.Remote), "and the other way")
+    assert(!as_task(&m, b), "b is not watched on core 1")
+    assert(!kernel.unwatch(&m, a), "core 1's watch never had a")
+    on(&m, 0)
+    assert(kernel.unwatch(&m, a), "core 0's had")
