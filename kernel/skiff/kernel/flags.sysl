@@ -8,8 +8,8 @@ import sysl.sync.Lock
 // uses it, and filled in at run time there.
 //
 // A set ends the wait of every waiter it satisfies, in the queue's order, and each is answered the bits
-// as the set left them; the bits the woken waiters asked to clear are cleared once all of them have been
-// seen, so two waiters for one bit are both woken by one set.
+// as the set left them. A woken waiter's clear-on-exit bits are cleared as it is woken, but the set
+// judges every waiter by the bits as it left them, so two waiters for one bit are both woken by one set.
 //
 // One set may satisfy every waiter, so looking at them all is the one thing in the kernel whose length is
 // the number of waiters. It is not done in one masked stretch: the set ORs its bits in and begins a walk,
@@ -20,8 +20,8 @@ import sysl.sync.Lock
 // already passed, so a walk looks only at the waiters that were there when it began.
 //
 // While a walk is under way the flags may be set, cleared, read and waited on, from any core or handler:
-// - a wait, a clear and a read see the bits as they stand, with the walk's clear-on-exit bits still in
-//   them: those are cleared as the walk ends;
+// - a wait, a clear and a read see the bits as they stand: the clear-on-exit bits of the waiters woken
+//   so far are cleared, those of the waiters the walk has yet to reach are not;
 // - a set during a walk ORs its bits in, keeps them from the walk's clearing and asks for another walk,
 //   begun as this one ends, over every waiter then waiting; it then helps, stepping until no walk is under
 //   way, so a set returns only once the waits it satisfies have ended;
@@ -39,12 +39,11 @@ struct Flags
     joining: u8         // the side a wait joins: the one the walk under way has passed, or the next walk's
     again: bool         // a set came during the walk: walk once more when it ends
     seen: u32           // what the walk under way judges by: the bits as the set that began it left them
-    clearing: u32       // what the waits the walk ended asked to clear
     kept: u32           // bits set during the walk and not cleared since, which its clearing leaves
 
 impl Flags
     // Flags called `name`, starting as `bits`.
-    const new(name: string, bits: u32) -> Flags = Flags(Waitable.new(name), bits, false, 0, false, 0, 0, 0)
+    const new(name: string, bits: u32) -> Flags = Flags(Waitable.new(name), bits, false, 0, false, 0, 0)
 
     // Set `bits`, ending every wait that is now satisfied. Answers the bits as they are afterwards. An
     // interrupt handler may call it.
@@ -122,8 +121,9 @@ impl Flags
                 None -> ()
 
     // One step of the walk under way, under the lock: the best waiter the walk has not looked at has its
-    // wait ended if the bits it judges by satisfy it, else moves to the side the walk has passed; with no
-    // waiter left, the walk ends, its clearing is applied, and another begins if a set asked for one.
+    // wait ended if the bits it judges by satisfy it, clearing the bits it asked to clear but those set
+    // during the walk, else moves to the side the walk has passed; with no waiter left, the walk ends,
+    // and another begins if a set asked for one.
     // Answers None while a walk is under way after the step, else the bits as they are.
     private[kernel] step[P: Port](*self, p: *P) -> Option[u32]
         var l = self.w.lock.on(p)
@@ -131,7 +131,6 @@ impl Flags
         if self.walking
             val at = self.w.queue.first_of(self.joining ^ 1)
             if at == NONE
-                self.bits &= ~(self.clearing & ~self.kept)
                 if self.again && self.w.queue.first_of(self.joining) != NONE
                     self.begin_walk()
                 else
@@ -139,7 +138,7 @@ impl Flags
             else
                 val r = waiter(at)
                 if satisfied(self.seen, r.value, r.mode)
-                    if r.mode & CLEAR_ON_EXIT != 0 then self.clearing |= r.value
+                    if r.mode & CLEAR_ON_EXIT != 0 then self.bits &= ~(r.value & ~self.kept)
                     r.value = self.seen
                     val _ = wake_at(p, &self.w, at, Outcome.Woken)
                 else
@@ -158,7 +157,6 @@ impl Flags
         self.again = false
         self.joining ^= 1
         self.seen = self.bits
-        self.clearing = 0
         self.kept = 0
 
 // Whether `bits` satisfy a wait for `wanted` on the terms `mode`.

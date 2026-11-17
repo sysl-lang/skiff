@@ -148,8 +148,9 @@ the object hands itself over, as a semaphore or a mutex does), and releases the 
   every other send and receive, so a woken receiver always has a message and a woken sender always has
   room. Messages leave in the order they came, whichever receiver takes them.
 - **Event flags**: a set ends every wait it satisfies (`Woken`, the bits as the set left them in the
-  record's `value`), and clears the bits the woken waits asked to clear once all have been seen. It
-  looks at them one per hold of the lock ("Event flags: a set walks in steps").
+  record's `value`), and clears the bits each woken wait asked to clear as it is woken, judging every
+  waiter by the bits as the set left them, so two waiters for one bit are both woken. It looks at them
+  one per hold of the lock ("Event flags: a set walks in steps").
 - **Task notifications**: each task's note (value, pending mark, `Waitable`) is in `.shared` at
   `notes[core][slot]`, so any core may send to any task. The note names its task by handle: it is
   renewed when a task is created in its slot (before the task can run) and cleared when the task is
@@ -186,8 +187,10 @@ masked: **a set masks its core for one waiter's worth of work at a time, and tak
   records the bits as they now are as what the walk judges by (`seen`) and flips the side waits join.
 - **A step, masked once each**: under the lock, the best waiter on the side the walk has not passed
   (`first_of`, the queue's own order) has its wait ended with `Woken` and `seen` if `seen` satisfies it,
-  its clear-on-exit bits noted, or is moved to the other side. With none left the walk ends: the noted
-  bits are cleared, then. A step is a lock acquisition, a count-leading-zeros, and either a wake (with a
+  its clear-on-exit bits cleared at once, or is moved to the other side. With none left the walk ends.
+  The clear is made at the wake, not saved for the walk's end, because the woken task may run before the
+  walk ends (a wake of a higher task switches as the step unmasks): it must find its own bits cleared,
+  or a second wait of its own would be answered by the same set. A step is a lock acquisition, a count-leading-zeros, and either a wake (with a
   post to another core's inbox) or an unlink and a link; it does not depend on how many wait.
 - **The sides swap with every walk.** Flags use only one side of their `WaitQueue` at a time; the walk
   moves the waiters it passes to the other, and a wait begun during a walk joins that other side. So a
@@ -200,9 +203,9 @@ masked: **a set masks its core for one waiter's worth of work at a time, and tak
   the object's, and any caller may take the next step. So a set returns only once every wait it
   satisfies has ended, a set from a higher task or another core is never left behind a walker that was
   preempted, and a set from an interrupt handler finishes the walk itself.
-- **What another caller sees during a walk.** A read, a clear or a wait sees the bits as they stand,
-  with the walk's clear-on-exit bits still in them until the walk ends: the one thing a set is no longer
-  atomic in. A clear during a walk takes effect after the set: the walk still judges by `seen`, and wakes
+- **What another caller sees during a walk.** A read, a clear or a wait sees the bits as they stand:
+  the clear-on-exit bits of the waiters woken so far are cleared, those of the waiters the walk has yet
+  to reach are not. That is the one thing a set is no longer atomic in. A clear during a walk takes effect after the set: the walk still judges by `seen`, and wakes
   the waiters the set satisfied. A wait during a walk that is satisfied at once is answered at once; one
   that waits is not looked at by that walk.
 - **Order.** Within one walk the waiters are taken best first, as from any queue. A waiter the walk
