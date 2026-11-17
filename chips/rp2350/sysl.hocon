@@ -1,0 +1,12 @@
+// Raspberry Pi's RP2350 with its two Cortex-M33 cores, both running in the Secure state from reset. The
+// image is executed in place from QSPI flash at 0x1000_0000 and works in SRAM at 0x2000_0000; the boot
+// ROM starts core 0 on it and holds core 1 until core 0 launches it through the SIO's FIFO.
+
+package {
+  name    = "rp2350"
+  version = "0.0.1"
+}
+
+dependencies {
+  armv7m { workspace = true }
+}

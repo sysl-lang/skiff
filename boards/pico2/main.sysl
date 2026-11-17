@@ -1,0 +1,262 @@
+// skiff on the Raspberry Pi Pico 2, both of the RP2350's Cortex-M33 cores, from one image. Both enter
+// `_start` (skiff.chip.rp2350) and then `skiff_main`, and tell themselves apart by core number. Core 0
+// starts the clocks, creates both cores' tasks and launches core 1; each core greets on its own UART,
+// watches three of its own ticks and runs its own tasks (skiff.board.scenarios) at once with the other.
+// Then core 1 takes a fault on purpose, which stops it alone. Core 0 sees it stopped, ticks on, checks that
+// the time base counted its ticks and no others, and stops the machine with status 0.
+
+import sysl.debug.ErrorTraceStore
+import sysl.raw.ptr_cast
+import sysl.sync.Atomic
+import skiff.arch.armv7m
+import skiff.arch.armv8m
+import skiff.board.scenarios
+import skiff.chip.rp2350
+import skiff.kernel
+import skiff.kernel.{Access, Cache, Doorbell, Isolation, Port, Protection, Region, RegionError, RunCounter, Slot}
+
+// The bounds of `.shared`, the image's vector table and core 1's stack, from the link script.
+extern __shared_start: u8
+extern __shared_end: u8
+extern __vectors_start: u8
+extern _stack_top1: u8
+
+// An address with nothing behind it in the RP2350's map: a load from it is a BusFault.
+private const NOWHERE: usize = 0xF000_0000
+
+private struct Word
+    v: volatile u32
+
+// The cores as the kernel sees them: two, each with the UART of its own number as its console, its own
+// SysTick as its tick, and the armv7m context switch.
+struct Board
+end Board
+
+impl Port for Board
+    write(*self, bytes: []const u8) = rp2350.write(rp2350.core_id(), bytes)
+    cores(*self) -> u32 = 2
+    core_id(*self) -> u32 = rp2350.core_id()
+    start_ticks(*self, hz: u32) = armv7m.systick_start(rp2350.CLOCK_HZ / hz)
+    idle(*self) = armv7m.wait_for_interrupt()
+    new_context(*self, stack: []u32, entry: *extern() -> never) -> usize = armv7m.new_context(stack, entry)
+    request_switch(*self) = armv7m.request_switch()
+    start_first(*self, sp: usize) -> never = armv7m.start_first(sp)
+    mask(*self) -> u32 = armv7m.mask()
+    restore(*self, state: u32) = armv7m.restore(state)
+    spin_lock(*self, word: *Atomic[u32]) = armv7m.spin_lock(word)
+    spin_try_lock(*self, word: *Atomic[u32]) -> bool = armv7m.spin_try_lock(word)
+    spin_unlock(*self, word: *Atomic[u32]) = armv7m.spin_unlock(word)
+
+// The doorbells are SIO's, one each way.
+impl Doorbell for Board
+    ring(*self, core: u32) = rp2350.ring_doorbell(core)
+    clear(*self) = rp2350.clear_doorbell()
+
+// The M33s have no data cache (the XIP cache holds only flash), so a buffer handed over needs nothing done.
+impl Cache for Board
+    clean(*self, bytes: []const u8) = ()
+    invalidate(*self, bytes: []u8) = ()
+
+// Each M33 has its own PMSAv8 MPU and stack limit: PSPLIM guards the running task's stack, and an
+// unprivileged task's map takes the regions below the null guard's two.
+impl Protection for Board
+    guard(*self, base: usize, bytes: usize) = armv8m.guard_stack_v8(base, bytes)
+    reserved(*self, base: usize, bytes: usize) -> usize = armv8m.reserved_v8(base, bytes)
+
+impl Isolation for Board
+    capacity(*self) -> usize = armv8m.capacity_v8()
+    encode(*self, r: Region) -> Result[Slot, RegionError] = armv8m.encode_v8(r)
+    load(*self, map: []const Slot) = armv8m.load_v8(map)
+    privilege(*self, unprivileged: bool) = armv7m.set_thread_privilege(unprivileged)
+
+// Each core's run-time counter is a timer of its own.
+impl RunCounter for Board
+    run_count(*self) -> u32 = rp2350.counter_now()
+
+// The bounds of the code and its constants, on 32-byte boundaries (link.ld): what every unprivileged
+// task runs.
+extern __code_start: u8
+extern __code_end: u8
+
+// What the scenarios share between the cores, in `.shared`.
+@section(".shared")
+private var objects: scenarios.Across
+
+// The status `boot` answered on core 0, which core 0's last task stops the machine with.
+private var status: i32 = 0
+
+private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject, &task_measured)
+
+@export("skiff_main")
+skiff_main() -> never
+    val me = rp2350.core_id()
+    var board = Board()
+    if me == 0 then rp2350.start_clocks()
+    rp2350.console_init(me)
+    armv7m.enable_faults()
+    val answer = kernel.boot(&board)
+    enable(rp2350.SPARE_IRQ)
+    enable(rp2350.SIO_IRQ_BELL)
+    if me == 0
+        status = answer
+        if kernel.shared_within(usize(&__shared_start), usize(&__shared_end))
+            board.write("skiff: .shared holds the shared state\n".bytes)
+        kernel.shared_bounds(usize(&__shared_start), usize(&__shared_end))
+        scenarios.share(&objects, false)
+        for core in 0u32..<2
+            scenarios.create_tasks(&board, core, &entries)
+        rp2350.launch_core1(usize(&__vectors_start), usize(&_stack_top1))
+    armv8m.enable_protection_v8()
+    kernel.start(&board)
+    for _ in 0..<3
+        val n = kernel.await_tick(&board)
+        board.write("skiff: core ".bytes)
+        kernel.write_dec(&board, me)
+        board.write(" tick ".bytes)
+        kernel.write_dec(&board, n)
+        board.write("\n".bytes)
+    scenarios.run_tasks(&board, &entries)
+
+// Interrupt `irq` on the running core's NVIC, at the kernel's priority.
+private enable(irq: u32)
+    armv7m.set_irq_priority(irq, armv7m.KERNEL_IRQ_PRIORITY)
+    armv7m.enable_irq(irq)
+
+private task_a() -> never = scenarios.take_turns(&Board(), "A", false)
+private task_b() -> never = scenarios.take_turns(&Board(), "B", true)
+private task_p1() -> never = scenarios.fp_task(&Board(), 0x1000, &entries)
+private task_p2() -> never = scenarios.fp_task(&Board(), 0x2000, &entries)
+private task_h() -> never = scenarios.wake_on_time(&Board())
+private meet() = scenarios.meet(&Board())
+private task_low() -> never = scenarios.low_task(&Board())
+private task_middle() -> never = scenarios.middle_task(&Board())
+private task_high() -> never = scenarios.high_task(&Board())
+private task_timed() -> never = scenarios.timed_task(&Board())
+private task_raiser() -> never = scenarios.raiser_task(&Board(), &entries)
+private task_hammer() -> never = scenarios.hammer_task(&Board())
+private task_receiver() -> never = scenarios.receiver_task(&Board())
+private task_sender() -> never = scenarios.sender_task(&Board())
+private task_owner() -> never = scenarios.owner_task(&Board())
+private task_worker() -> never = scenarios.worker_task(&Board())
+private task_waiter() -> never = scenarios.waiter_task(&Board())
+private task_echo() -> never = scenarios.echo_task(&Board())
+private task_timers() -> never = kernel.serve_timers(&Board())
+private task_hog() -> never = scenarios.hog_task(&Board())
+private fired(t: *kernel.Timer, due: u32) = scenarios.fired(&Board(), t, due)
+private task_subject() -> never = scenarios.subject_task(&Board())
+private task_measured() -> never = scenarios.measured_task(&Board())
+
+// Raise the running core's spare interrupt from software.
+private raise() = armv7m.pend_irq(rp2350.SPARE_IRQ)
+
+// The spare interrupt, on either core: the scenarios' give on that core.
+@export("skiff_spare")
+board_spare()
+    scenarios.interrupt(&Board())
+
+private task_idle() -> never
+    loop
+        armv7m.wait_for_interrupt()
+
+// R: the handle checks, then the waits, the timers, task control, the statistics, the protection and the
+// grants, then the end of the run. Core 1 faults; core 0 waits until it sees core 1 stopped, ticks on,
+// and stops the machine.
+private task_r() -> never
+    var board = Board()
+    scenarios.check_handles(&board, &entries)
+    scenarios.await_waits(&board)
+    scenarios.timers(&board, &entries)
+    scenarios.control(&board, &entries)
+    scenarios.stats(&board, &entries)
+    val me = rp2350.core_id()
+    val code = Region(usize(&__code_start), usize(&__code_end) - usize(&__code_start), Access.Execute)
+    scenarios.traces(&board, &entries, code)
+    scenarios.protection(&board, &entries, code, Region(rp2350.uart_base(me), rp2350.UART_BYTES, Access.Device))
+    scenarios.grants(&board, code)
+    if me == 1
+        val nothing: *Word = ptr_cast(NOWHERE)
+        kernel.write_hex(&board, nothing.v)
+    while !kernel.stopped(1) do kernel.sleep(&board, 1)
+    board.write("skiff: core 0 sees core 1 stopped\n".bytes)
+    kernel.sleep(&board, 3)
+    board.write("skiff: core 0 ticks on\n".bytes)
+    if kernel.ticks() == kernel.here(&board).own_ticks()
+        board.write("skiff: core 0 time base agrees\n".bytes)
+    armv7m.halt(status)
+
+// SIO's doorbell, on either core: that core's kernel clears it and drains its inboxes.
+@export("skiff_doorbell")
+board_doorbell()
+    var board = Board()
+    kernel.answer_doorbell(&board)
+
+// SysTick, on either core: one tick for the kernel on that core.
+@export("skiff_systick")
+board_tick()
+    var board = Board()
+    kernel.tick(&board)
+
+// PendSV's switch, on either core: that core's kernel chooses its next task.
+@export("skiff_switch")
+board_switch(sp: usize) -> usize
+    var board = Board()
+    kernel.switch_context(&board, sp)
+
+// A fault stops only the core that took it, once the kernel has reported it on that core's console. The
+// other core runs on.
+@export("skiff_fault_entry")
+board_fault(exception: u32, exc_return: u32) -> usize
+    var board = Board()
+    armv7m.task_fault(&board, exception, exc_return) match
+        Some(sp) -> sp
+        None -> stop(&board, exception)
+
+// A fault its protection raised stops the task alone; any other stops the core that took it.
+private stop(board: *Board, exception: u32) -> never
+    kernel.fault(board, armv7m.exception_name(exception))
+    armv7m.stop_core()
+
+// A task's trap into the kernel (armv7m calls.sysl), and the thread its call runs in.
+@export("skiff_call_entry")
+board_call(frame: *u32, registers: *u32) -> usize
+    var board = Board()
+    armv7m.call_entry(&board, frame, registers) match
+        Some(sp) -> sp
+        None -> stop(&board, 11)
+
+@export("skiff_serve_call")
+board_serve() -> usize
+    var board = Board()
+    kernel.serve_call(&board)
+
+// The error return trace every `?` records into, on either core: that core's handlers', its code's before
+// its tasks, or its running task's (armv7m traces.sysl).
+@export("sysl_error_trace_here")
+board_trace() -> *ErrorTraceStore = armv7m.error_trace_here(&Board())
+
+// The first task's privilege, from the SVC that starts it.
+@export("skiff_first_privilege")
+board_first_privilege()
+    var board = Board()
+    armv7m.set_thread_privilege(kernel.running_unprivileged(&board))
+
+@export("putchar")
+putchar(c: int) -> int
+    rp2350.put_byte(rp2350.core_id(), u8(c & 0xff))
+    c
+
+@export("memcpy")
+board_memcpy(dst: *u8, src: *u8, n: usize) -> *u8
+    for i in 0..<n
+        dst[i] = src[i]
+    dst
+
+@export("memset")
+board_memset(dst: *u8, byte: int, n: usize) -> *u8
+    for i in 0..<n
+        dst[i] = u8(byte & 0xff)
+    dst
+
+@export("exit")
+board_exit(code: int) -> never
+    armv7m.halt(i32(code))

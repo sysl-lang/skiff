@@ -1,0 +1,82 @@
+module skiff.chip.rp2350
+
+import sysl.raw.ptr_cast
+
+// The RP2350's two PL011 UARTs (UART0 0x4007_0000, UART1 0x4007_8000; RP2350 datasheet, "UART"). Each core
+// has a console of its own, so that the two never interleave: core 0 writes UART0, on GPIO 0, and core 1
+// UART1, on GPIO 4: the Pico 2's default pins for each. 115200 baud, 8 bits, no parity, one stop bit.
+// Both are open to unprivileged code as they come out of reset: ACCESSCTRL's default is Secure access
+// from either core at either privilege.
+
+private struct Uart
+    dr: volatile u32            // 0x00 a write sends a byte
+    rsr: volatile u32           // 0x04
+    before_fr: [4]u32
+    fr: volatile u32            // 0x18 bit 5: transmit FIFO full
+    before_ibrd: [2]u32
+    ibrd: volatile u32          // 0x24
+    fbrd: volatile u32          // 0x28
+    lcr_h: volatile u32         // 0x2c
+    cr: volatile u32            // 0x30
+
+@assert(offsetof(Uart, fr) == 0x18, "UARTFR is at 0x18")
+@assert(offsetof(Uart, cr) == 0x30, "UARTCR is at 0x30")
+
+private const UART_BASE: usize = 0x4007_0000
+private const UART_STRIDE: usize = 0x8000
+// What a UART's registers take, for a region that grants them.
+const UART_BYTES: usize = 0x1000
+
+private const FR_TXFF: u32 = 1 << 5
+// LCR_H: 8 bits (WLEN 3), FIFOs on.
+private const LCR_H_8N1: u32 = (3 << 5) | (1 << 4)
+// CR: UART, transmitter and receiver enabled.
+private const CR_ENABLE: u32 = (1 << 0) | (1 << 8) | (1 << 9)
+
+// The baud divisor, CLOCK_HZ / (16 * 115200) = 6.51, as 6 and 33/64.
+private const BAUD: u32 = 115200
+private const DIVISOR_64THS: u32 = (CLOCK_HZ * 4 + BAUD / 2) / BAUD
+
+// Where UART `n`'s registers start; they take `UART_BYTES` bytes.
+uart_base(n: u32) -> usize = UART_BASE + UART_STRIDE * usize(n)
+
+private uart(n: u32) -> *Uart = ptr_cast(uart_base(n))
+
+private struct Word
+    v: volatile u32
+
+// IO_BANK0's GPIOn_CTRL (FUNCSEL 2 is the UART) and PADS_BANK0's GPIOn, whose ISO bit holds the pad
+// isolated from its function until it is cleared.
+private const IO_BANK0: usize = 0x4002_8000
+private const PADS_BANK0: usize = 0x4003_8000
+private const FUNCSEL_UART: u32 = 2
+private const PAD_OD: u32 = 1 << 7
+private const PAD_ISO: u32 = 1 << 8
+
+// UART n's transmit pin: GPIO 0 for UART0, GPIO 4 for UART1.
+private tx_pin(n: u32) -> usize = 4 * usize(n)
+
+// Switch UART `n`'s transmitter on, on its pin. Its block is out of reset and clk_peri runs
+// (`start_clocks`).
+console_init(n: u32)
+    val pin = tx_pin(n)
+    val ctrl: *Word = ptr_cast(IO_BANK0 + 8 * pin + 4)
+    ctrl.v = FUNCSEL_UART
+    val pad: *Word = ptr_cast(PADS_BANK0 + 4 * pin + 4)
+    pad.v = pad.v & ~(PAD_ISO | PAD_OD)
+    val u = uart(n)
+    u.ibrd = DIVISOR_64THS / 64
+    u.fbrd = DIVISOR_64THS % 64
+    u.lcr_h = LCR_H_8N1
+    u.cr = CR_ENABLE
+
+// Send one byte on UART `n`, waiting while its transmit FIFO is full.
+put_byte(n: u32, b: u8)
+    val u = uart(n)
+    while (u.fr & FR_TXFF) != 0 do ()
+    u.dr = u32(b)
+
+// Send every byte of `bytes` on UART `n`.
+write(n: u32, bytes: []const u8)
+    for b in bytes
+        put_byte(n, b)

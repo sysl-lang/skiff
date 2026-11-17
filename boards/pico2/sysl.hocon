@@ -1,0 +1,23 @@
+// skiff on the Raspberry Pi Pico 2: one image that both of the RP2350's Cortex-M33 cores run. Core 0
+// starts the clocks, clears `.bss` and `.shared` and launches core 1 through the boot ROM; each core
+// greets on its own UART and ticks on its own SysTick. Both cores have an FPU, so the image uses it.
+
+package {
+  name    = "pico2"
+  version = "0.0.1"
+}
+
+dependencies {
+  kernel { workspace = true, options = { cores = 2, tasks = 32 } }
+  armv7m { workspace = true }
+  armv8m { workspace = true }
+  rp2350 { workspace = true }
+  scenarios { workspace = true }
+}
+
+targets {
+  thumb-freestanding {
+    linker_script = "link.ld"
+    entry         = "_start"
+  }
+}

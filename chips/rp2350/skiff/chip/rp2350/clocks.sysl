@@ -1,0 +1,83 @@
+module skiff.chip.rp2350
+
+import sysl.raw.ptr_cast
+
+// The clocks and resets as far as the kernel needs them (RP2350 datasheet, "Clocks", "Crystal oscillator",
+// "Resets", "Tick generators"). Core 0 calls `start_clocks` once, before anything else touches a
+// peripheral and before it launches core 1:
+//   - the crystal oscillator (XOSC, the Pico 2's 12 MHz crystal) starts, and clk_ref and then clk_sys
+//     run from it, so both cores and their SysTicks run at `CLOCK_HZ` whatever the ROM left running;
+//   - clk_peri, which the UARTs count on, runs from clk_sys;
+//   - the UARTs, the GPIO bank and its pads, and the two timers come out of reset;
+//   - the two timers' tick generators make one tick a microsecond from clk_ref.
+
+// The clock both cores, their SysTicks, clk_ref and clk_peri run on: the crystal's.
+const CLOCK_HZ: u32 = 12_000_000
+
+private struct Word
+    v: volatile u32
+
+private word(at: usize) -> *Word = ptr_cast(at)
+
+// XOSC (0x4004_8000).
+private const XOSC_CTRL: usize = 0x4004_8000
+private const XOSC_STATUS: usize = 0x4004_8004
+private const XOSC_STARTUP: usize = 0x4004_800c
+private const XOSC_ENABLE: u32 = 0xfab << 12
+private const XOSC_RANGE_1_15MHZ: u32 = 0xaa0
+private const XOSC_STABLE: u32 = 1 << 31
+// The start-up delay counts 256 crystal cycles a step: about a millisecond.
+private const XOSC_DELAY: u32 = (CLOCK_HZ / 1000 + 255) / 256
+
+// CLOCKS (0x4001_0000): each clock's CTRL, and SELECTED, one-hot, for the glitchless ones.
+private const CLK_REF_CTRL: usize = 0x4001_0030
+private const CLK_REF_SELECTED: usize = 0x4001_0038
+private const CLK_SYS_CTRL: usize = 0x4001_003c
+private const CLK_SYS_SELECTED: usize = 0x4001_0044
+private const CLK_PERI_CTRL: usize = 0x4001_0048
+private const CLK_REF_SRC_XOSC: u32 = 2
+private const CLK_SYS_SRC_CLK_REF: u32 = 0
+private const CLK_PERI_ENABLE: u32 = 1 << 11
+
+// RESETS (0x4002_0000): a set bit holds its block in reset; RESET_DONE reports it out.
+private const RESET: usize = 0x4002_0000
+private const RESET_DONE: usize = 0x4002_0008
+private const RESET_IO_BANK0: u32 = 1 << 6
+private const RESET_PADS_BANK0: u32 = 1 << 9
+private const RESET_TIMER0: u32 = 1 << 23
+private const RESET_TIMER1: u32 = 1 << 24
+private const RESET_UART0: u32 = 1 << 26
+private const RESET_UART1: u32 = 1 << 27
+private const RESETS_USED: u32 = RESET_IO_BANK0 | RESET_PADS_BANK0 | RESET_TIMER0 | RESET_TIMER1 | RESET_UART0 | RESET_UART1
+
+// TICKS (0x4010_8000): TIMER0's and TIMER1's tick generators.
+private const TICKS_TIMER0_CTRL: usize = 0x4010_8018
+private const TICKS_TIMER0_CYCLES: usize = 0x4010_801c
+private const TICKS_TIMER1_CTRL: usize = 0x4010_8024
+private const TICKS_TIMER1_CYCLES: usize = 0x4010_8028
+private const TICK_ENABLE: u32 = 1
+
+// Start the clocks and bring the blocks the kernel uses out of reset. Core 0, once.
+start_clocks()
+    word(XOSC_STARTUP).v = XOSC_DELAY
+    word(XOSC_CTRL).v = XOSC_ENABLE | XOSC_RANGE_1_15MHZ
+    while (word(XOSC_STATUS).v & XOSC_STABLE) == 0 do ()
+
+    val reference = word(CLK_REF_CTRL)
+    reference.v = (reference.v & ~3u32) | CLK_REF_SRC_XOSC
+    while word(CLK_REF_SELECTED).v != 1 << CLK_REF_SRC_XOSC do ()
+    val sys = word(CLK_SYS_CTRL)
+    sys.v = (sys.v & ~1u32) | CLK_SYS_SRC_CLK_REF
+    while word(CLK_SYS_SELECTED).v != 1 << CLK_SYS_SRC_CLK_REF do ()
+    // AUXSRC 0, clk_sys.
+    word(CLK_PERI_CTRL).v = CLK_PERI_ENABLE
+
+    val reset = word(RESET)
+    reset.v = reset.v & ~RESETS_USED
+    while (word(RESET_DONE).v & RESETS_USED) != RESETS_USED do ()
+
+    val per_microsecond = CLOCK_HZ / 1_000_000
+    word(TICKS_TIMER0_CYCLES).v = per_microsecond
+    word(TICKS_TIMER0_CTRL).v = TICK_ENABLE
+    word(TICKS_TIMER1_CYCLES).v = per_microsecond
+    word(TICKS_TIMER1_CTRL).v = TICK_ENABLE

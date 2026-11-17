@@ -1,0 +1,98 @@
+module skiff.chip.rp2350
+
+import sysl.raw.ptr_cast
+
+// The single-cycle I/O block (SIO, 0xD000_0000; RP2350 datasheet, "SIO"), which each core sees on its own
+// port: the core's number, the FIFOs between the cores, and the doorbells. The cores' locks are not
+// SIO's spinlocks, which erratum RP2350-E2 lets a write to a nearby SIO register release: they are the
+// exclusives (arch/armv7m spin.sysl), which on the RP2350 exclude across both cores in SRAM.
+
+private struct Sio
+    cpuid: volatile u32                 // 0x000
+    before_fifo: [19]u32
+    fifo_st: volatile u32               // 0x050
+    fifo_wr: volatile u32               // 0x054
+    fifo_rd: volatile u32               // 0x058
+    before_doorbells: [73]u32
+    doorbell_out_set: volatile u32      // 0x180
+    doorbell_out_clr: volatile u32      // 0x184
+    doorbell_in_set: volatile u32       // 0x188
+    doorbell_in_clr: volatile u32       // 0x18c
+
+@assert(offsetof(Sio, fifo_st) == 0x050, "FIFO_ST is at 0x050")
+@assert(offsetof(Sio, doorbell_out_set) == 0x180, "DOORBELL_OUT_SET is at 0x180")
+@assert(offsetof(Sio, doorbell_in_clr) == 0x18c, "DOORBELL_IN_CLR is at 0x18c")
+
+private const SIO: usize = 0xD000_0000
+private sio() -> *Sio = ptr_cast(SIO)
+
+// FIFO_ST: this core's receive FIFO holds a word (VLD), its transmit FIFO has room (RDY).
+private const FIFO_VLD: u32 = 1 << 0
+private const FIFO_RDY: u32 = 1 << 1
+
+// The doorbell the kernel rings, of the eight each core has.
+private const BELL: u32 = 1 << 0
+
+// The number of the core running this: 0 or 1.
+core_id() -> u32 = sio().cpuid
+
+// Ring core `to`'s doorbell: DOORBELL_OUT_SET rings the other core's, DOORBELL_IN_SET the running core's
+// own. Every write to memory before it is complete first, so the other core's handler finds whatever was
+// posted to it.
+ring_doorbell(to: u32)
+    asm
+        [thumb] "dsb"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.rp2350 is for the RP2350's Cortex-M33 cores"
+    if to == core_id() then sio().doorbell_in_set = BELL else sio().doorbell_out_set = BELL
+
+// Clear the running core's doorbell, so a ring that comes afterwards raises SIO_IRQ_BELL again.
+clear_doorbell()
+    sio().doorbell_in_clr = BELL
+    asm
+        [thumb] "dsb"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.rp2350 is for the RP2350's Cortex-M33 cores"
+
+// The board's handler for a doorbell rung at the running core.
+extern "skiff_doorbell" board_doorbell()
+
+// SIO_IRQ_BELL: the board's handler drains the inboxes, clearing the doorbell first.
+@export("skiff_rp2350_bell")
+private bell_handler()
+    board_doorbell()
+
+private send_event()
+    asm
+        [thumb] "sev"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.rp2350 is for the RP2350's Cortex-M33 cores"
+
+private wait_for_event()
+    asm
+        [thumb] "wfe"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.rp2350 is for the RP2350's Cortex-M33 cores"
+
+// Launch core 1, which waits in the boot ROM, on the image whose vector table is at `vectors`, with its
+// stack pointer at `stack`; it enters at the table's reset handler. This is the ROM's protocol (RP2350
+// datasheet, "Bootrom", "Launching code on processor core 1"): core 0 sends 0, 0, 1, the table, the stack
+// pointer and the entry through the FIFO one word at a time, and core 1 echoes each. A wrong echo starts
+// the sequence again; before each 0 core 0 empties its receive FIFO, since the 0s are what put the ROM
+// back at the start. Everything core 0 wrote to memory before the call is visible to core 1 when it starts:
+// the barrier completes those writes first.
+launch_core1(vectors: usize, stack: usize)
+    val table: *[2]u32 = ptr_cast(vectors)
+    val words = [0u32, 0, 1, u32(vectors), u32(stack), table[1]]
+    asm
+        [thumb] "dsb"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.rp2350 is for the RP2350's Cortex-M33 cores"
+    val s = sio()
+    var i = 0
+    while i < words.len
+        val word = words[i]
+        if word == 0
+            while (s.fifo_st & FIFO_VLD) != 0
+                val _ = s.fifo_rd
+            send_event()
+        while (s.fifo_st & FIFO_RDY) == 0 do ()
+        s.fifo_wr = word
+        send_event()
+        while (s.fifo_st & FIFO_VLD) == 0 do wait_for_event()
+        i = if s.fifo_rd == word then i + 1 else 0

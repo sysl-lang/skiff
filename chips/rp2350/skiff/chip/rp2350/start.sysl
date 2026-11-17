@@ -1,0 +1,102 @@
+module skiff.chip.rp2350
+
+import sysl.raw.ptr_cast
+
+// Reset for both of the RP2350's cores. The boot ROM enters core 0 here through the image's vector table
+// once it has found the image's IMAGE_DEF block (below); core 1 arrives here when core 0 launches it
+// (`launch_core1`, sio.sysl), with its VTOR, stack pointer and entry as core 0 sent them. It runs with no
+// stack the image chose, so it is assembly. Each core reads its number from SIO_CPUID (0xD000_0000) and
+//   - takes the top of its own stack, `_stack_top0` or `_stack_top1` from the link script, and clears
+//     MSPLIM, which the ROM may have left set;
+//   - points VTOR at the image's vector table (`__vectors_start`);
+//   - grants itself the FPU and the redundancy coprocessor (CPACR CP10/CP11 and CP7 full access; the
+//     register is per core);
+//   - seeds the redundancy coprocessor's canary salts unless they are seeded already. Through the ROM's
+//     boot they are, but an image a debug probe enters at `_start` arrives with the RCP untouched, and
+//     the ROM holds core 1 until it is seeded, before it will listen for the launch (the SDK's crt0 does
+//     the same at its entry point). Seeding it twice is a fault, hence the check;
+//   - core 0 copies `.data` from flash to SRAM and zeroes `.bss` and `.shared`: core 1 is in the ROM until
+//     core 0 launches it, so it touches none of them meanwhile. Core 1 zeroes [`__core1_zero_start`,
+//     `__core1_zero_end`), which is empty in one image;
+//   - calls `skiff_main`, which the board program exports.
+asm
+    [thumb]
+        ".syntax unified"
+        ".text"
+        ".thumb_func"
+        ".globl _start"
+        "_start:"
+        "ldr r4, =0xD0000000"
+        "ldr r4, [r4]"
+        "cmp r4, #0"
+        "bne 4f"
+        "ldr r0, =_stack_top0"
+        "b 5f"
+        "4: ldr r0, =_stack_top1"
+        "5: mov sp, r0"
+        "movs r0, #0"
+        "msr msplim, r0"
+        "ldr r0, =0xE000ED08"
+        "ldr r1, =__vectors_start"
+        "str r1, [r0]"
+        "ldr r0, =0xE000ED88"
+        "ldr r1, [r0]"
+        "orr r1, r1, #(0xF << 20)"
+        "orr r1, r1, #(3 << 14)"
+        "str r1, [r0]"
+        "dsb"
+        "isb"
+        "mrc p7, #1, apsr_nzcv, c0, c0, #0"
+        "bmi 12f"
+        "mcrr p7, #8, r0, r0, c0"
+        "mcrr p7, #8, r0, r0, c1"
+        "sev"
+        "12: movs r2, #0"
+        "cmp r4, #0"
+        "beq 8f"
+        "ldr r0, =__core1_zero_start"
+        "ldr r1, =__core1_zero_end"
+        "9: cmp r0, r1"
+        "beq 2f"
+        "str r2, [r0], #4"
+        "b 9b"
+        "8: ldr r0, =__data_start"
+        "ldr r1, =__data_end"
+        "ldr r3, =__data_load"
+        "10: cmp r0, r1"
+        "beq 11f"
+        "ldr r5, [r3], #4"
+        "str r5, [r0], #4"
+        "b 10b"
+        "11: ldr r0, =__bss_start"
+        "ldr r1, =__bss_end"
+        "1: cmp r0, r1"
+        "beq 6f"
+        "str r2, [r0], #4"
+        "b 1b"
+        "6: ldr r0, =__shared_start"
+        "ldr r1, =__shared_end"
+        "7: cmp r0, r1"
+        "beq 2f"
+        "str r2, [r0], #4"
+        "b 7b"
+        "2: bl skiff_main"
+        "3: b 3b"
+        ".ltorg"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.rp2350 is for the RP2350's Cortex-M33 cores"
+
+// The image's IMAGE_DEF block, which the boot ROM looks for in the first 4 KiB of flash before it will
+// run the image (RP2350 datasheet, "Bootrom", "Image definitions"). The link script puts it straight
+// after the vector table. Its one item says what the image is: an executable (1) for the Arm cores (0 <<
+// 8), Secure (2 << 4), for the RP2350 (1 << 12). The block links to itself, so it is the only one, and
+// with no entry-point item the ROM enters through the vector table at the image's start.
+asm
+    [thumb]
+        ".section .picobin, \"a\""
+        ".word 0xffffded3"          // PICOBIN_BLOCK_MARKER_START
+        ".word 0x10210142"          // IMAGE_TYPE, one word: flags 0x1021
+        ".word 0x000001ff"          // LAST, the items are one word long
+        ".word 0x00000000"          // the next block: this one
+        ".word 0xab123579"          // PICOBIN_BLOCK_MARKER_END
+        ".text"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.rp2350 is for the RP2350's Cortex-M33 cores"

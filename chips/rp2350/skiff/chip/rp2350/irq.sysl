@@ -1,0 +1,26 @@
+module skiff.chip.rp2350
+
+// The RP2350's interrupts, as far as the board uses them: the vector table's chip half, which the link
+// script puts straight after the architecture's sixteen words. Both cores run from the one table, and
+// each core's NVIC is its own. The table runs to the first spare interrupt; the others up to it stop the
+// machine, as an unhandled system exception does. No device past it is ever enabled.
+
+// SIO_IRQ_BELL: a doorbell rung at the running core (sio.sysl).
+const SIO_IRQ_BELL: u32 = 26
+
+// SPARE_IRQ_0, which no device raises: the interrupt the board raises from software, on either core.
+const SPARE_IRQ: u32 = 46
+
+asm
+    [thumb]
+        ".section .vectors.irq, \"a\""
+        ".rept 26"
+        ".word skiff_exception"
+        ".endr"
+        ".word skiff_rp2350_bell"
+        ".rept 19"
+        ".word skiff_exception"
+        ".endr"
+        ".word skiff_spare"
+        ".text"
+    [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.chip.rp2350 is for the RP2350's Cortex-M33 cores"

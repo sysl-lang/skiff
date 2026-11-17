@@ -1,0 +1,20 @@
+module skiff.chip.rp2350
+
+import sysl.raw.ptr_cast
+
+// A free-running counter for each core, for the kernel's run-time statistics: core 0 reads TIMER0
+// (0x400b_0000) and core 1 TIMER1 (0x400b_8000), so each has one of its own, as each core of a chip with a
+// cycle counter has its own. Both count microseconds from their tick generators (`start_clocks`); the
+// low word, read through TIMERAWL, which latches nothing, wraps about every 71 minutes, far slower than a
+// tick. The kernel only ever takes differences of it.
+
+private struct Timer
+    v: volatile u32
+
+private const TIMER0_RAWL: usize = 0x400b_0028
+private const TIMER1_RAWL: usize = 0x400b_8028
+
+// Microseconds the running core's counter has counted, modulo 2^32.
+counter_now() -> u32
+    val t: *Timer = ptr_cast(if core_id() == 0 then TIMER0_RAWL else TIMER1_RAWL)
+    t.v
