@@ -7,12 +7,17 @@
 #   SKIFF_SYSL      the compiler (default: sysl)
 #   SKIFF_OPT       passed to the build (e.g. -O0)
 #   SKIFF_TIMEOUT   seconds per boot (default 10)
+#   SKIFF_BENCHTOP  the benchtop emulator that boots the Pico 2 (default: ../benchtop/benchtop beside
+#                   the repository)
+#   SKIFF_BOARD_TIME  the Pico 2's boot limit in the board's own emulated time (default 60s)
 
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)
 compiler=${SKIFF_SYSL:-sysl}
 opt=${SKIFF_OPT:-}
 limit=${SKIFF_TIMEOUT:-10}
+benchtop=${SKIFF_BENCHTOP:-$root/../benchtop/benchtop}
+board_time=${SKIFF_BOARD_TIME:-60s}
 scratch="$root/scratch"
 mkdir -p "$scratch"
 
@@ -170,10 +175,12 @@ $(grants_expected 0)"
 # the time base counted its own ticks and none of core 1's, and stops the machine with status 0.
 an521_core0_greeting="skiff: hello from core 0
 skiff: .shared holds the shared state"
-an521_core0_run="skiff: core 0 tick 1
+# dual_core0_run [<line the FPU tasks print>]: core 0's run on a machine of two cores in one image.
+dual_core0_run() {
+    echo "skiff: core 0 tick 1
 skiff: core 0 tick 2
 skiff: core 0 tick 3
-$(tasks_expected 0)
+$(tasks_expected 0 "${1:-}")
 skiff: core 0 may not create a task on core 1, which runs
 $(waits_expected 0)
 $(messages_expected 0)
@@ -196,6 +203,8 @@ skiff: core 0 had the pool buffer an unprivileged task sent core 1 through grant
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
 skiff: core 0 time base agrees"
+}
+an521_core0_run=$(dual_core0_run)
 an521_core0_expected="$an521_core0_greeting
 $an521_core0_run"
 an521_core1_ticks="skiff: core 1 tick 1
@@ -364,5 +373,28 @@ if [ -z "$missing" ] && grep -q "tick 1" "$scratch/an521-skewed-core0.log" "$scr
     missing="mps2-an521 two images that disagree: a core ran on past the handshake"
 fi
 verdict "mps2-an521 two images that disagree" 3
+
+# The Raspberry Pi Pico 2 on benchtop: the image built for the board itself, both of the RP2350's cores
+# running it, each with an FPU, so core 0's floating-point tasks run too. benchtop enters core 0 at the
+# image's entry as a debug probe does, and core 1 waits in Raspberry Pi's boot ROM until core 0 launches
+# it. `--deterministic` runs the cores in reproducible turns, and the limit is the board's own time, not
+# the host's: benchtop ends a run that is not over by then with status 124. benchtop copies UART0 alone to
+# its output, so core 0's console is the one checked.
+pico2_core0_expected="$an521_core0_greeting
+$(dual_core0_run "f32 registers survived the switches")"
+pico2_image="$scratch/pico2.elf"
+build thumb-freestanding pico2 "$pico2_image"
+if [ ! -x "$benchtop" ]; then
+    echo "FAIL pico2: no benchtop at $benchtop (set SKIFF_BENCHTOP)"
+    failed=1
+else
+    start=$(date +%s)
+    "$benchtop" run --board pico2 --deterministic --timeout "$board_time" "$pico2_image" \
+        > "$scratch/pico2-core0.log" 2>&1 < /dev/null
+    code=$?
+    took=$(( $(date +%s) - start ))
+    check "pico2 core 0" "$scratch/pico2-core0.log" "$pico2_core0_expected"
+    verdict pico2 0
+fi
 
 exit $failed
