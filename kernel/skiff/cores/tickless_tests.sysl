@@ -1,0 +1,119 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+import skiff.kernel.{Core, Task, TaskState}
+
+// Tickless idle on several cores (DESIGN "Tickless idle"): a core that slept through ticks takes them at
+// once on waking, and the time base comes out as if every core had ticked every period, whichever cores
+// slept and whichever ticked. The machine's sleep plays what happens while a core sleeps: the `ticking`
+// cores take their ticks, and the cores of `inside` go to sleep in turn, each inside the last one's sleep.
+
+private var tickless_idle_stacks: [kernel.CORES][128]u32
+
+private tickless_tick_on(m: *Machine, core: u32)
+    on(m, core)
+    kernel.tick(m)
+
+private tickless_core(m: *Machine, core: u32) -> *Core
+    on(m, core)
+    kernel.here(m)
+
+// Every core with a sleeper at priority 2 and its idle task, every core's view of the time base settled
+// (as time_tests.sysl's `settle`), then each core's sleeper asleep for `counts[core]` ticks from the
+// time base, and the core running its idle task.
+private tickless_sleepers(m: *Machine, counts: []const u32) -> [kernel.CORES]Task
+    var sleepers: [kernel.CORES]Task = [kernel.NO_TASK; kernel.CORES]
+    for core in 0u32..<u32(kernel.CORES)
+        sleepers[core] = task_on(m, core, usize(core), 2)
+        on(m, core)
+        val c = kernel.here(m)
+        val i = c.sched.free_slot().unwrap()
+        c.sched.add_on(i, tickless_idle_stacks[core], 0, kernel.IDLE_PRIORITY)
+    begin(m)
+    tickless_tick_on(m, 0)
+    tickless_tick_on(m, 0)
+    for core in 1u32..<u32(kernel.CORES) do tickless_tick_on(m, core)
+    for core in 0u32..<u32(kernel.CORES)
+        on(m, core)
+        kernel.sleep(m, counts[usize(core)])
+        switch_now(m)
+    m.skip_limit = 100
+    sleepers
+
+private tickless_state(m: *Machine, t: Task) -> TaskState
+    on(m, t.core())
+    kernel.state(m, t).unwrap()
+
+@test("with one core asleep and two ticking, the time base moves exactly once a period, and the sleeper takes its ticks on waking")
+tickless_one_sleeps_two_tick()
+    var m = machine()
+    val sleepers = tickless_sleepers(&m, [30, 12, 30])
+    val from = kernel.ticks()
+    val own = tickless_core(&m, 1).own_ticks()
+    // Core 1 sleeps twelve periods, and cores 0 and 2 tick through them.
+    m.ticking = 0b101
+    on(&m, 1)
+    kernel.rest(&m)
+    assert_eq(kernel.ticks() -% from, 12)
+    assert_eq(tickless_core(&m, 1).own_ticks() -% own, 12)
+    on(&m, 1)
+    assert_eq(kernel.skipped_ticks(&m), 12)
+    assert(tickless_state(&m, sleepers[1]) == TaskState.Ready, "core 1's sleeper woke at its deadline")
+    assert(tickless_state(&m, sleepers[0]) == TaskState.Sleeping, "core 0's sleeps on")
+    // Every core ticking again: still once a period.
+    for _ in 0..<5
+        tickless_tick_on(&m, 2)
+        tickless_tick_on(&m, 0)
+        tickless_tick_on(&m, 1)
+    assert_eq(kernel.ticks() -% from, 17)
+
+@test("with every core asleep, the time base comes out at the longest sleep, whichever core wakes first")
+tickless_all_sleep()
+    var m = machine()
+    val sleepers = tickless_sleepers(&m, [15, 12, 9])
+    val from = kernel.ticks()
+    // Core 0 sleeps; inside its sleep core 1 does, and inside core 1's core 2: core 2 wakes first.
+    m.inside[0] = 1
+    m.inside[1] = 2
+    m.inside_count = 2
+    on(&m, 0)
+    kernel.rest(&m)
+    assert_eq(kernel.ticks() -% from, 15)
+    for core in 0u32..<u32(kernel.CORES)
+        assert(tickless_state(&m, sleepers[core]) == TaskState.Ready, "every sleeper woke")
+    // Each core took its own sleep's ticks.
+    on(&m, 0)
+    assert_eq(kernel.skipped_ticks(&m), 15)
+    on(&m, 1)
+    assert_eq(kernel.skipped_ticks(&m), 12)
+    on(&m, 2)
+    assert_eq(kernel.skipped_ticks(&m), 9)
+
+@test("a core woken early by an interrupt while the others tick takes only the periods that passed, and no period twice")
+tickless_early_wake_across_cores()
+    var m = machine()
+    val sleepers = tickless_sleepers(&m, [40, 40, 20])
+    val from = kernel.ticks()
+    val own = tickless_core(&m, 2).own_ticks()
+    // Core 2's doorbell ends its sleep in the sixth period, before cores 0 and 1 tick for it.
+    m.ticking = 0b011
+    m.wake_after = 6
+    m.lag = 1
+    on(&m, 2)
+    kernel.rest(&m)
+    assert_eq(tickless_core(&m, 2).own_ticks() -% own, 6)
+    assert_eq(kernel.ticks() -% from, 6)
+    assert(tickless_state(&m, sleepers[2]) == TaskState.Sleeping, "6 of 20")
+    // The sixth period's ticks on cores 0 and 1 find it taken.
+    tickless_tick_on(&m, 1)
+    tickless_tick_on(&m, 0)
+    assert_eq(kernel.ticks() -% from, 6)
+    // Core 2 sleeps the rest while the others tick to its deadline.
+    m.wake_after = kernel.FOREVER
+    m.lag = 0
+    on(&m, 2)
+    kernel.rest(&m)
+    assert_eq(kernel.ticks() -% from, 20)
+    assert_eq(tickless_core(&m, 2).own_ticks() -% own, 20)
+    assert(tickless_state(&m, sleepers[2]) == TaskState.Ready, "woke at its deadline")

@@ -208,6 +208,8 @@ probe() -> i32
     val t = kernel.create(&m, 1, stack, &body, 1)
     kernel.start(&m)
     kernel.await_tick(&m)
+    kernel.rest(&m)
+    if kernel.skipped_ticks(&m) != 0 then return 1
     kernel.answer_doorbell(&m)
     kernel.fault(&m, "none")
     val here = kernel.here(&m)

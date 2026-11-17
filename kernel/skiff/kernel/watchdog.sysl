@@ -69,6 +69,17 @@ impl Watch
             if now -% self.tasks[i].seen > self.tasks[i].period then return false
         true
 
+    // For how many of the core's ticks after `now` every watched task stays checked in within its period
+    // if none checks in again: `FOREVER` watching none, None when one is already overdue at `now`.
+    private slack(*self, now: u32) -> Option[u32]
+        var least = FOREVER
+        for i in 0..<self.count
+            val age = now -% self.tasks[i].seen
+            if age > self.tasks[i].period then return None
+            val left = self.tasks[i].period - age
+            if left < least then least = left
+        Some(least)
+
 private var watches: [option_cores]Watch
 
 // The running core's watch.
@@ -147,6 +158,35 @@ supervise[P: Port](p: *P) -> bool
     p.restore(state)
     if late then bite(p)
     late
+
+// How many of the running core's ticks after its tick `now` it may sleep through with its tick stopped
+// (DESIGN "Tickless idle") without its watch's verdict changing unseen: while every watched task stays
+// within its period, until the last tick the watch would still be fed on; once one is overdue, until the
+// last tick before the bite, so that the bite comes from a tick as it always has. `FOREVER` unarmed. No
+// task runs while the core sleeps, so none checks in.
+private[kernel] watch_allows[P: Port](p: *P, now: u32) -> u32
+    val w = watch_here(p)
+    if !w.armed then return FOREVER
+    w.slack(now) match
+        Some(s) -> if s > 0 then return s
+        None -> ()
+    val left = (w.fed +% w.timeout) -% now
+    if i32.wrap(left) <= 0 then 0 else left
+
+// The supervision of `count` of the running core's ticks taken at once after its tick `from`: the watch
+// is fed as it would have been on the last of them that every watched task was still within its period
+// on, and the hardware watchdog with it. It never bites: the sleep ended before a bite was due
+// (`watch_allows`), and a sleep that ran late leaves the bite to the core's next tick.
+private[kernel] supervise_skipped[P: Port](p: *P, from: u32, count: u32)
+    val w = watch_here(p)
+    if !w.armed then return
+    w.slack(from) match
+        Some(s) ->
+            val fed = if s < count then s else count
+            if fed > 0
+                w.fed = from +% fed
+                p.feed_watchdog()
+        None -> ()
 
 // The running core's watch has bitten, or its hardware watchdog has warned: disarm both, so a stopped
 // core never resets the machine, report `watchdog` on the core's console and mark the core stopped in

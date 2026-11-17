@@ -35,6 +35,8 @@ impl Port for Board
     spin_lock(*self, word: *Atomic[u32]) = armv7m.spin_lock(word)
     spin_try_lock(*self, word: *Atomic[u32]) -> bool = armv7m.spin_try_lock(word)
     spin_unlock(*self, word: *Atomic[u32]) = armv7m.spin_unlock(word)
+    override tickless_limit(*self) -> u32 = armv7m.systick_limit()
+    override sleep_ticks(*self, count: u32) -> u32 = armv7m.systick_sleep(count)
 
 // One core: the kernel has no other core to ring.
 impl Doorbell for Board
@@ -146,12 +148,15 @@ private raise() = armv7m.pend_irq(mps2.TIMER0_IRQ)
 board_timer0()
     scenarios.interrupt(&Board())
 
+// The idle task: sleep with the tick stopped through every tick nothing needs (DESIGN "Tickless idle").
 private task_idle() -> never
+    var board = Board()
     loop
-        armv7m.wait_for_interrupt()
+        kernel.rest(&board)
 
 // R: the handle checks, then the waits, the timers, deferred work, task control, the statistics, the
-// mutex options, the protection, the grants and the watchdog, whose hang ends the run. Were R to come
+// mutex options, the protection, the grants, a sleep with the tick stopped and the watchdog, whose hang
+// ends the run. Were R to come
 // back from it, the run would end 0, which the boot test refuses.
 private task_r() -> never
     var board = Board()
@@ -165,6 +170,7 @@ private task_r() -> never
     scenarios.traces(&board, &entries, CODE)
     scenarios.protection(&board, &entries, CODE, UART)
     scenarios.grants(&board, CODE)
+    scenarios.tickless(&board)
     scenarios.watchdog(&board, &entries, true)
     armv7m.halt(status)
 

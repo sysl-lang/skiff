@@ -75,6 +75,8 @@ impl Port for Board
     spin_lock(*self, word: *Atomic[u32]) = armv7m.spin_lock(word)
     spin_try_lock(*self, word: *Atomic[u32]) -> bool = armv7m.spin_try_lock(word)
     spin_unlock(*self, word: *Atomic[u32]) = armv7m.spin_unlock(word)
+    override tickless_limit(*self) -> u32 = armv7m.systick_limit()
+    override sleep_ticks(*self, count: u32) -> u32 = armv7m.systick_sleep(count)
 
 // The doorbells are MHU0's, one each way.
 impl Doorbell for Board
@@ -260,12 +262,16 @@ private raise() = armv7m.pend_irq(TIMER_IRQ)
 board_timer0()
     scenarios.interrupt(&Board())
 
+// The idle task, on either core: sleep with the tick stopped through every tick nothing on the core needs
+// (DESIGN "Tickless idle").
 private task_idle() -> never
+    var board = Board()
     loop
-        armv7m.wait_for_interrupt()
+        kernel.rest(&board)
 
 // R: the handle checks, then the waits, the timers, deferred work, task control, the statistics, the
-// mutex options, the protection, the grants, the time base without core 0 and the watchdog, then the
+// mutex options, the protection, the grants, the time base without core 0, a sleep with the tick
+// stopped and the watchdog, then the
 // end of the run. Core 1 hangs, and its watchdog stops it; core 0, its own watch still fed, waits until
 // it sees core 1 stopped, ticks on, and stops the machine.
 private task_r() -> never
@@ -283,6 +289,7 @@ private task_r() -> never
     scenarios.protection(&board, &entries, code, Region(an521.uart_base(me), an521.UART_STRIDE, Access.Device))
     scenarios.grants(&board, code)
     scenarios.time_alone(&board)
+    scenarios.tickless(&board)
     scenarios.watchdog(&board, &entries, me == 1)
     while !kernel.stopped(1) do kernel.sleep(&board, 1)
     board.write("skiff: core 0 sees core 1 stopped\n".bytes)

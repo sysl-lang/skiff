@@ -150,6 +150,11 @@ skiff: core $1 an unprivileged task that wrote a buffer it had passed on was sto
 watchdog_expected() {
     echo "skiff: core $1 a watched task checked in for 60 ticks, and its core's watchdog held off"
 }
+# Tickless idle, every core (boards/scenarios, tickless.sysl): with only its idle task to run, the core
+# stops its tick, and a timed wait and a sleep still end on their deadlines.
+tickless_expected() {
+    echo "skiff: core $1 slept with its tick stopped, and a timed wait and a sleep still ended on their deadlines"
+}
 mps2_expected="skiff: hello
 skiff: .shared holds the shared state
 skiff: core 0 tick 1
@@ -167,6 +172,7 @@ $(mutexes_expected 0)
 $(traces_expected 0)
 $(protection_expected 0)
 $(grants_expected 0)
+$(tickless_expected 0)
 $(watchdog_expected 0)
 skiff: core 0 fault watchdog"
 
@@ -222,6 +228,7 @@ skiff: core 0 an unprivileged task on core 1 took a unit core 0 gave and set fla
 $(grants_expected 0)
 skiff: core 0 had the pool buffer an unprivileged task sent core 1 through granted objects back
 skiff: core 0 took no tick while masked, and the time base moved on without it
+$(tickless_expected 0)
 $(watchdog_expected 0)
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
@@ -257,6 +264,7 @@ skiff: core 1 an unprivileged task took a unit core 0 gave, through its grant
 $(grants_expected 1)
 skiff: core 1 an unprivileged task received notes and a filled buffer an unprivileged task of core 0 sent, through its grants
 skiff: core 1 kept the time base moving while core 0 took no tick
+$(tickless_expected 1)
 $(watchdog_expected 1)
 skiff: core 1 fault watchdog"
 an521_core1_expected="skiff: hello from core 1

@@ -510,8 +510,63 @@ handing over a buffer, never by copying it. A **pool** holds the buffers; a **ch
   every chip (the AN521's timers are per core; `RunCounter` is per core by design), its rate, and the
   register in the chip, and is what tickless idle brings anyway.
 - A deadline is `i32(deadline - now) <= 0`, so the counter may wrap.
-- Tickless idle (milestone 10) replaces the periodic tick with a one-shot wake at the next deadline; the
-  counter then comes from a hardware timer every core can read.
+- **A core may take several ticks at once**: one that slept through `n` periods with its tick stopped
+  (below, "Tickless idle") brings the time base to `n` past where its last tick left it, unless other
+  cores have moved it that far or further since, and records where it is. The rule above is the case
+  `n = 1`: "no core has advanced it since" is "it has moved less than one". Taking `n` waits for the spin
+  word (`spin_lock`) rather than trying it, since the holder is only taking one period of the `n`, and
+  holds it for a load and a store. So a sleeping core does not slow the time base while another ticks
+  (that core advances it every period it finds unmoved), a waking core adds only the periods nobody took
+  while it slept, and with every core asleep the first to wake brings it on by its whole sleep. The time
+  base still never moves back: a view far behind (a core that was stopped) has seen it move more than
+  `n`, and only records.
+
+## Tickless idle
+
+A core with nothing to run but its idle task stops its periodic tick and sleeps until the next thing
+that needs it, then takes every tick it slept through at once. `kernel/skiff/kernel/tickless.sysl` is the
+kernel's side; the port's is two members of `Port` with defaults.
+
+- **The port**: `tickless_limit()`, the most ticks one sleep can span (default 0), and
+  `sleep_ticks(count)`, called with the kernel's interrupts masked: stop the tick, sleep until `count`
+  ticks after the last one or until any interrupt is pending, restart the tick in step with its old
+  period, and answer how many periods ended meanwhile. Their tick interrupts are never delivered; a tick
+  already pending answers 0 and stays pending. **A port that implements neither keeps today's behaviour**:
+  a limit under 2 makes the idle step `p.idle()`, a sleep to the next tick.
+- **The idle task's body is `loop kernel.rest(p)`**. `rest` masks, asks how far the core may sleep
+  (`skippable`), and sleeps only if that is 2 ticks or more: its running task is the idle task, nothing
+  above priority 0 is ready, no expired wait is waiting to be ended, and the core is not stopped. The
+  sleep is the fewest of the port's limit, the ticks to the head of the core's timeout list (every sleep
+  and every timed wait, the timer service's wait for its soonest expiry and the work service's among
+  them, so a software timer bounds it with no list of its own), and what the watch allows (below).
+- **On waking it takes the ticks that passed, `n`, in one step** (`take_ticks`, the tick's own path with
+  a count): the core's own count moves by `n`, the time base as "Time" says, the running task (the idle
+  task) is charged the counter's difference, and the timeout list expires everything due at the new time,
+  in deadline order. Then the mask is restored, the waits that expired are ended under their objects'
+  locks as after any tick, and the interrupt that woke the core, if any, is taken. An interrupt that
+  woke it early (a doorbell, a device) gets exactly the periods that ended before it, never the whole
+  sleep; the next idle step sleeps the rest.
+- **The watch** (DESIGN "Supervision") counts the core's own ticks, and no task checks in while the core
+  sleeps. So a sleep lasts no longer than its verdict could stay unchanged: while every watched task is
+  still within its period, until the last tick it would be fed on; once one is overdue, until the last
+  tick before the bite, so the bite still comes from a real tick on the tick it always would. Waking, it
+  is fed as of the last tick in the sleep on which every watched task was still within its period, and
+  the hardware stage with it, which is started at twice the timeout and so outlasts any such sleep.
+- **What is exact**: own ticks, the time base on a core alone, every deadline's tick, a timer's due tick,
+  the watch's feeding and its bite, and the idle task's run time. **What is not**: the tick's phase after
+  a sleep moves by the few cycles the port spends with the counter stopped; a wake later than the port
+  can measure (QEMU stalling a core longer than the counter's span) loses the periods past it, as a tick
+  held off under a mask loses them today.
+- **Armv7-M** (`arch/armv7m/systick.sysl`): SysTick's reload is set to what remains of the current period
+  plus `count - 1` whole ones, then WFI with PRIMASK set and BASEPRI open, so any enabled interrupt wakes
+  the core (BASEPRI would keep the kernel's own from waking it) but none is taken until the kernel has
+  taken the ticks. On waking, the cycles slept (the counter, and COUNTFLAG for one reload past the wake)
+  give the periods ended and how far into the next the core is; SysTick's pending bit is cleared if a
+  period ended, the counter is reloaded with the cycles left of the current period, and the reload is set
+  back to the period once that is loaded. A restart under 64 cycles takes that tick early instead. The
+  limit is the periods that fit the 24-bit counter, less one: 66 at 25 MHz and 100 Hz, 82 at 20 MHz.
+- **Several cores**: each sleeps on its own; nothing is shared but the time base. A remote wake reaches a
+  sleeping core as any message does, through its inbox and doorbell, which ends the sleep early.
 
 ## Software timers
 

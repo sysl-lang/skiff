@@ -108,7 +108,7 @@ private struct Byte
     v: volatile u8
 
 // ICSR, the Interrupt Control and State Register, and its PendSV set-pending bit.
-private const ICSR: usize = 0xE000_ED04
+private[armv7m] const ICSR: usize = 0xE000_ED04
 private const PENDSVSET: u32 = 1 << 28
 
 // The priority bytes of PendSV and SysTick in SHPR3.

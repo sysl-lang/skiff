@@ -22,6 +22,13 @@ struct Machine
     clocks: [kernel.CORES]u32      // each core's own counter, moved by hand
     feeds: [kernel.CORES]u32       // how many times each core fed its hardware watchdog
     watchdog_stops: [kernel.CORES]u32  // how many times each core stopped it
+    skip_limit: u32                 // the most ticks a sleep with the tick stopped may span (0: no core's tick stops)
+    wake_after: u32                 // how many ticks such a sleep lasts before an interrupt ends it (FOREVER: none comes)
+    ticking: u32                    // bit n: core n takes its tick each period another core sleeps through
+    lag: u32                        // of those periods, how many last ones' ticks land after the sleeper wakes
+    inside: [kernel.CORES]u32      // the cores whose idle step is taken while the sleeping core sleeps, in turn
+    inside_count: usize             // how many of them there are
+    inside_next: usize              // the next to take
 
 // Each core reads its own counter.
 impl RunCounter for Machine
@@ -74,6 +81,27 @@ impl Port for Machine
     spin_try_lock(*self, word: *Atomic[u32]) -> bool = word.swap(1, Ordering.Acquire) == 0
     spin_unlock(*self, word: *Atomic[u32]) = word.store(0, Ordering.Release)
 
+    // A sleep with the tick stopped spans the ticks it was asked, or `wake_after` if an interrupt comes
+    // sooner. While it lasts, the next core of `inside` takes its idle step (so it sleeps too, inside this
+    // sleep), and the `ticking` cores take their ticks for every period but the last `lag`.
+    override tickless_limit(*self) -> u32 = self.skip_limit
+
+    override sleep_ticks(*self, count: u32) -> u32
+        val sleeper = self.me
+        val slept = if self.wake_after < count then self.wake_after else count
+        if self.inside_next < self.inside_count
+            self.me = self.inside[self.inside_next]
+            self.inside_next += 1
+            kernel.rest(self)
+        val periods = if self.lag < slept then slept - self.lag else 0
+        for _ in 0u32..<periods
+            for core in 0u32..<u32(kernel.CORES)
+                if core != sleeper && self.ticking & (1 << core) != 0
+                    self.me = core
+                    kernel.tick(self)
+        self.me = sleeper
+        slept
+
 impl Doorbell for Machine
     ring(*self, core: u32)
         self.rung[core] += 1
@@ -111,7 +139,7 @@ impl Isolation for Machine
 // every one of them may be used by two cores, so the whole address space counts as `.shared`.
 machine() -> Machine
     kernel.shared_bounds(0, 0xffff_ffff_ffff_ffff)
-    Machine(0, [0; kernel.CORES], [0; kernel.CORES], 0, [false; kernel.CORES], null, [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES])
+    Machine(0, [0; kernel.CORES], [0; kernel.CORES], 0, [false; kernel.CORES], null, [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], 0, kernel.FOREVER, 0, 0, [0; kernel.CORES], 0, 0)
 
 // Act as core `core` from now on.
 on(m: *Machine, core: u32)

@@ -122,6 +122,20 @@ trait Port: Doorbell + Cache + Protection + Isolation + RunCounter + Watchdog
     // Let it go, publishing everything written under it to the next holder.
     spin_unlock(*self, word: *Atomic[u32])
 
+    // The most ticks this core can sleep through with its periodic tick stopped (DESIGN "Tickless idle").
+    // A port that cannot stop its tick keeps this default of 0, and the kernel's idle then sleeps until
+    // the next tick, as it always has.
+    tickless_limit(*self) -> u32 = 0
+
+    // With the kernel's interrupts masked: stop this core's periodic tick and sleep until `count` ticks
+    // after its last tick have come, or until any interrupt is pending, whichever is first, then start
+    // the tick again in step with where it would have been. Answers how many tick periods ended while the
+    // core slept: their tick interrupts are never delivered, since the kernel takes them all at once. A
+    // tick already pending answers 0 at once and stays pending. The interrupt that ended the sleep is
+    // taken once the kernel restores its mask, after the kernel has taken the ticks. `count` is 2 to
+    // `tickless_limit()`.
+    sleep_ticks(*self, count: u32) -> u32 = 0
+
 // Bring the kernel up on `p`: greet on this core's console. On a machine with more than one core the
 // greeting names the core. Answers the status the machine should stop with: 0 for success.
 boot[P: Port](p: *P) -> i32
