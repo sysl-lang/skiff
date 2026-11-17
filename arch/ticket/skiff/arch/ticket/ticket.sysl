@@ -1,0 +1,62 @@
+module skiff.arch.ticket
+
+import sysl.sync.{Atomic, Ordering, spin_hint}
+
+// The ticket lock a port makes its chip lock of, where the chip has an atomic add and compare-and-swap.
+// It is fair: cores are served in the order they took their tickets, so a core waits for at most
+// `cores - 1` holders ahead of it, where a test-and-set lock lets one core take it again and again while
+// another waits.
+//
+// The whole lock is one word, the `KernelLock.word` the kernel already holds: the high half is the next
+// ticket to hand out, the low half the ticket now served. Equal halves are free, so zero is free. Each
+// half counts modulo 2^16 on its own, which is enough while fewer than 65536 cores wait at once. A
+// release advances the low half alone: a plain add of one would carry into the high half when the low
+// half wraps from 0xffff and hand out a ticket nobody holds, which nobody would ever serve.
+
+// What taking a ticket adds to the word.
+const TICKET: u32 = 0x1_0000
+
+// The next ticket `word` hands out.
+next_ticket(word: u32) -> u32 = word >> 16
+
+// The ticket `word` serves.
+serving(word: u32) -> u32 = word & 0xffff
+
+// Whether nobody holds the lock `word` describes, nor waits for it.
+is_free(word: u32) -> bool = next_ticket(word) == serving(word)
+
+// `word` with one more ticket handed out: the high half wraps on its own, the low half is untouched.
+taken(word: u32) -> u32 = word +% TICKET
+
+// `word` with the next ticket served: the low half wraps on its own, never carrying into the high half.
+served(word: u32) -> u32 = (word & 0xffff_0000) | ((word +% 1) & 0xffff)
+
+// Take a ticket on the lock at `word` and wait until it is served. Everything the last holder wrote is
+// visible once it returns.
+lock(word: *Atomic[u32])
+    val mine = take(word)
+    while !turn(word, mine) do spin_hint()
+
+// Take the next ticket on the lock at `word`, answering it. Taking orders nothing: the holder's writes
+// are acquired by the `turn` that finds the ticket served.
+take(word: *Atomic[u32]) -> u32 = next_ticket(word.add(TICKET, Ordering.Relaxed))
+
+// Whether the lock at `word` now serves `ticket`: once it does, the ticket's holder has the lock and
+// sees everything the last holder wrote.
+turn(word: *Atomic[u32], ticket: u32) -> bool = serving(word.load(Ordering.Acquire)) == ticket
+
+// Take the lock at `word` only if nobody holds it or waits for it, answering whether it did. It never
+// jumps the queue: a lock with a waiter is refused even between two holders.
+try_lock(word: *Atomic[u32]) -> bool
+    val seen = word.load(Ordering.Relaxed)
+    is_free(seen) && word.cas(seen, taken(seen), Ordering.Acquire) == seen
+
+// Serve the next ticket on the lock at `word`, publishing everything written under it. Other cores may
+// take tickets meanwhile, which changes the high half, so the low half is rewritten by compare-and-swap
+// until it lands on a word nobody changed. Only the holder writes the low half.
+unlock(word: *Atomic[u32])
+    var seen = word.load(Ordering.Relaxed)
+    loop
+        val found = word.cas(seen, served(seen), Ordering.Release)
+        if found == seen then return
+        seen = found

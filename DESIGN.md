@@ -186,10 +186,32 @@ wake can find it.
 - **Each object holds its own lock**: a `KernelLock`, chosen by the build. With one core it masks the
   core's kernel interrupts through the port and does nothing more; the spin is not in the image. With
   several it masks them and then spins on the chip's lock through the port (`spin_lock`,
-  `spin_try_lock`, `spin_unlock` on the lock's word): LDREX/STREX on Armv7-M and Armv8-M (an atomic
-  exchange, which compiles to the pair, in `arch/armv7m`), the SIO spinlocks on an RP2040 (whose M0+ has
+  `spin_try_lock`, `spin_unlock` on the lock's word): a ticket lock on Armv7-M and Armv8-M (below; its
+  atomic add and compare-and-swap compile to LDREX/STREX), the SIO spinlocks on an RP2040 (whose M0+ has
   no exclusives; sysl refuses an atomic read-modify-write there), HSEM on the STM32H7. The kernel names
   no instruction.
+- **Where the chip has exclusives, the chip lock is a ticket lock, because it must be fair.** A
+  test-and-set lock (what the first port had: an atomic exchange of 1) lets the core that just let it go
+  take it again before a waiting core's exchange lands, so with two or more cores one can starve
+  another for as long as it keeps asking. A ticket lock serves cores in the order they asked: a core
+  waits for at most `cores - 1` holders ahead of it, each holding for a few instructions. It is its own
+  package, `arch/ticket` (`lock`, `try_lock`, `unlock`, over `sysl.sync.Atomic` and nothing else), so
+  its host tests run the code the boards run, and `arch/armv7m`'s port members call it. It is not in the
+  kernel: the kernel is built for thumbv6m too, which refuses an atomic add or compare-and-swap even in
+  a function nothing calls.
+- **The ticket lock is the lock's one word**: the high half is the next ticket to hand out, the low half
+  the ticket now served; equal halves are free, so zero is a free lock and `.shared`'s zeroing makes
+  every lock in it free. Taking is an atomic add of `0x1_0000` (relaxed: it orders nothing), whose
+  answer's high half is the core's ticket, then a spin on an acquiring load until the low half equals
+  it. A try succeeds only on a free word, by compare-and-swap from (n, n) to (n + 1, n) with acquire: it
+  never jumps a waiter. Releasing serves the next ticket with release ordering.
+- **Each half wraps modulo 2^16 on its own.** The high half wrapping is the add's carry out of the word,
+  which drops it. The low half must not carry: an add of 1 to the whole word when the low half is 0xffff
+  would also advance the next ticket, handing out a ticket nobody holds, and every core would then wait
+  for ever behind it. So the release is a compare-and-swap loop that rewrites the low half alone
+  (`(w & 0xffff_0000) | ((w + 1) & 0xffff)`), retrying when another core took a ticket meanwhile. Only
+  the holder writes the low half, so the loop retries only for tickets taken, at most `cores - 1` times.
+  A busy lock passes the wrap often: the AN521's hammers take one lock 600,000 times.
 - **The single-core lock is not `sysl.sync.IrqLock`**, as this file first said: `IrqLock` masks
   everything through PRIMASK, where the kernel's mask is BASEPRI and leaves the interrupts above it
   alone, and a program reaching it on any machine but a Cortex-M is refused, which would refuse the
