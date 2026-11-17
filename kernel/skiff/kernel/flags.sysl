@@ -8,8 +8,25 @@ import sysl.sync.Lock
 // uses it, and filled in at run time there.
 //
 // A set ends the wait of every waiter it satisfies, in the queue's order, and each is answered the bits
-// as the set left them; the bits the woken waiters asked to clear are cleared once all of them have been
-// seen, so two waiters for one bit are both woken by one set.
+// as the set left them. A woken waiter's clear-on-exit bits are cleared as it is woken, but the set
+// judges every waiter by the bits as it left them, so two waiters for one bit are both woken by one set.
+//
+// One set may satisfy every waiter, so looking at them all is the one thing in the kernel whose length is
+// the number of waiters. It is not done in one masked stretch: the set ORs its bits in and begins a walk,
+// and the walk takes the object's lock once per waiter. Each step looks at the best waiter the walk has
+// not yet looked at and either ends its wait or moves it to the queue's other side, which is where the
+// walk has been. So the core is masked for one waiter's worth of work at a time, and interrupts are taken
+// between steps. The waiters' side swaps with every walk: a wait joins the side the walk under way has
+// already passed, so a walk looks only at the waiters that were there when it began.
+//
+// While a walk is under way the flags may be set, cleared, read and waited on, from any core or handler:
+// - a wait, a clear and a read see the bits as they stand: the clear-on-exit bits of the waiters woken
+//   so far are cleared, those of the waiters the walk has yet to reach are not;
+// - a set during a walk ORs its bits in, keeps them from the walk's clearing and asks for another walk,
+//   begun as this one ends, over every waiter then waiting; it then helps, stepping until no walk is under
+//   way, so a set returns only once the waits it satisfies have ended;
+// - the walk judges each waiter by the bits its set left (`seen`), so a clear during it takes effect after
+//   the set, as if it came once the set was done.
 
 // The terms of a flags wait, kept in its record's mode.
 private const WAIT_ALL: u8 = 1       // every bit named, not any one of them
@@ -18,31 +35,22 @@ private const CLEAR_ON_EXIT: u8 = 2  // the bits named are cleared as the wait e
 struct Flags
     w: Waitable
     bits: u32
+    walking: bool       // a set's walk over the waiters is under way
+    joining: u8         // the side a wait joins: the one the walk under way has passed, or the next walk's
+    again: bool         // a set came during the walk: walk once more when it ends
+    seen: u32           // what the walk under way judges by: the bits as the set that began it left them
+    kept: u32           // bits set during the walk and not cleared since, which its clearing leaves
 
 impl Flags
     // Flags called `name`, starting as `bits`.
-    const new(name: string, bits: u32) -> Flags = Flags(Waitable.new(name), bits)
+    const new(name: string, bits: u32) -> Flags = Flags(Waitable.new(name), bits, false, 0, false, 0, 0)
 
     // Set `bits`, ending every wait that is now satisfied. Answers the bits as they are afterwards. An
     // interrupt handler may call it.
     set[P: Port](*self, p: *P, bits: u32) -> u32
-        var l = self.w.lock.on(p)
-        l.acquire()
-        self.bits |= bits
-        var cleared: u32 = 0
-        var at = self.w.queue.first()
-        while at != NONE
-            val r = waiter(at)
-            val next = r.next
-            if satisfied(self.bits, r.value, r.mode)
-                if r.mode & CLEAR_ON_EXIT != 0 then cleared |= r.value
-                r.value = self.bits
-                val _ = wake_at(p, &self.w, at, Outcome.Woken)
-            at = next
-        self.bits &= ~cleared
-        val now = self.bits
-        l.release()
-        now
+        self.start_set(p, bits) match
+            Some(now) -> now
+            None -> self.finish(p)
 
     // Clear `bits`. Answers the bits as they were before. An interrupt handler may call it.
     clear[P: Port](*self, p: *P, bits: u32) -> u32
@@ -50,6 +58,7 @@ impl Flags
         l.acquire()
         val was = self.bits
         self.bits &= ~bits
+        self.kept &= ~bits
         l.release()
         was
 
@@ -72,17 +81,83 @@ impl Flags
         l.acquire()
         if satisfied(self.bits, wanted, mode)
             val got = self.bits
-            if clear then self.bits &= ~wanted
+            if clear
+                self.bits &= ~wanted
+                self.kept &= ~wanted
             l.release()
             return Some(got)
         if timeout == 0
             l.release()
             return None
         val c = running_core(p)
-        enqueue_running(c, &self.w, timeout, mode, wanted)
+        enqueue_running(c, &self.w, timeout, self.joining, mode, wanted)
         p.request_switch()
         l.release()
         if wait_outcome(c) == Outcome.Woken then Some(wait_value(c)) else None
+
+    // The masked part of a set: OR `bits` in and, if anyone waits, begin a walk, or ask the walk under way
+    // for another. Answers the bits if no walk is under way after it, else None, and the caller steps.
+    private[kernel] start_set[P: Port](*self, p: *P, bits: u32) -> Option[u32]
+        var l = self.w.lock.on(p)
+        l.acquire()
+        self.bits |= bits
+        var walk = true
+        if self.walking
+            self.kept |= bits
+            self.again = true
+        elif self.w.queue.first_of(self.joining) != NONE
+            self.begin_walk()
+        else
+            walk = false
+        val now = self.bits
+        l.release()
+        if walk then None else Some(now)
+
+    // Step until no walk is under way, whoever began it. Answers the bits as the last step left them.
+    private[kernel] finish[P: Port](*self, p: *P) -> u32
+        loop
+            self.step(p) match
+                Some(now) -> return now
+                None -> ()
+
+    // One step of the walk under way, under the lock: the best waiter the walk has not looked at has its
+    // wait ended if the bits it judges by satisfy it, clearing the bits it asked to clear but those set
+    // during the walk, else moves to the side the walk has passed; with no waiter left, the walk ends,
+    // and another begins if a set asked for one.
+    // Answers None while a walk is under way after the step, else the bits as they are.
+    private[kernel] step[P: Port](*self, p: *P) -> Option[u32]
+        var l = self.w.lock.on(p)
+        l.acquire()
+        if self.walking
+            val at = self.w.queue.first_of(self.joining ^ 1)
+            if at == NONE
+                if self.again && self.w.queue.first_of(self.joining) != NONE
+                    self.begin_walk()
+                else
+                    self.walking = false
+            else
+                val r = waiter(at)
+                if satisfied(self.seen, r.value, r.mode)
+                    if r.mode & CLEAR_ON_EXIT != 0 then self.bits &= ~(r.value & ~self.kept)
+                    r.value = self.seen
+                    val _ = wake_at(p, &self.w, at, Outcome.Woken)
+                else
+                    val _ = self.w.queue.remove(at)
+                    r.side = self.joining
+                    self.w.queue.insert(at)
+        val walking = self.walking
+        val now = self.bits
+        l.release()
+        if walking then None else Some(now)
+
+    // Begin a walk over the waiters on the side waits have been joining, judged by the bits as they are.
+    // The caller holds the lock.
+    private begin_walk(*self)
+        self.walking = true
+        self.again = false
+        self.joining ^= 1
+        self.seen = self.bits
+        self.kept = 0
 
 // Whether `bits` satisfy a wait for `wanted` on the terms `mode`.
 private satisfied(bits: u32, wanted: u32, mode: u8) -> bool

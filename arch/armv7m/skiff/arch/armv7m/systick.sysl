@@ -30,3 +30,113 @@ systick_start(cycles: u32)
     t.rvr = cycles - 1
     t.cvr = 0
     t.csr = CSR_ENABLE | CSR_TICKINT | CSR_CLKSOURCE
+
+// Tickless idle (DESIGN "Tickless idle"): SysTick's reload stretched over the ticks to sleep through.
+
+private const CSR_COUNTFLAG: u32 = 1 << 16     // the count has reached 0 since the register was last read
+private const CSR_STOPPED: u32 = CSR_TICKINT | CSR_CLKSOURCE
+private const CSR_RUNNING: u32 = CSR_ENABLE | CSR_TICKINT | CSR_CLKSOURCE
+private const PENDSTSET: u32 = 1 << 26          // ICSR: SysTick's interrupt is pending
+private const PENDSTCLR: u32 = 1 << 25          // ICSR: make it not pending
+private const RELOAD_LIMIT: u32 = 0x100_0000   // the counter's 24 bits
+
+// The fewest cycles a restarted tick may run before its first interrupt: fewer, and the tick is taken
+// that many cycles early instead, so the restart never races a counter about to reach 0.
+private const SHORTEST: u32 = 64
+
+private struct Register
+    v: volatile u32
+
+// How many ticks one sleep with the tick stopped may span on the running core: the whole periods that fit
+// in the counter, less the one under way. 0 before `systick_start`.
+systick_limit() -> u32
+    val t: *SysTick = ptr_cast(SYSTICK)
+    if t.rvr == 0 then return 0
+    RELOAD_LIMIT / (t.rvr + 1) - 1
+
+// With the kernel's handlers masked (BASEPRI): stop the tick, sleep until `count` ticks after the last one
+// or until any interrupt is pending, then restart the tick in step with its old period, and answer how
+// many periods ended during the sleep. Their interrupt is never delivered.
+//
+// The counter is reloaded with the cycles to the wake: what remained of the current period, then `count -
+// 1` whole ones. The sleep is a WFI with PRIMASK set and BASEPRI open, so any enabled interrupt ends it
+// (BASEPRI would keep the kernel's from waking the core) but none is taken until the kernel has taken the
+// ticks and restored its mask. On waking, the cycles slept give the periods ended and how far into the
+// next the core is, and the counter is restarted to end that period on time: reloaded with the cycles left
+// of it, and its reload register set back to the period once that is loaded. The few cycles spent stopped
+// in between are lost to the tick's phase.
+systick_sleep(count: u32) -> u32
+    val t: *SysTick = ptr_cast(SYSTICK)
+    val icsr: *Register = ptr_cast(ICSR)
+    val period = t.rvr + 1
+    val limit = systick_limit()
+    val n = if count > limit then limit else count
+    disable_interrupts()
+    val _ = t.csr
+    t.csr = CSR_STOPPED
+    if n < 2 || icsr.v & PENDSTSET != 0
+        // A tick due is the kernel's to take as a tick.
+        t.csr = CSR_RUNNING
+        enable_interrupts()
+        return 0
+    val first = t.cvr + 1
+    val total = first + (n - 1) * period
+    t.rvr = total - 1
+    t.cvr = 0
+    t.csr = CSR_RUNNING
+    while t.cvr == 0 do ()
+    val level = open_mask()
+    wait_for_interrupt()
+    restore(level)
+    val flags = t.csr
+    t.csr = CSR_STOPPED
+    val left = t.cvr
+    val elapsed = if flags & CSR_COUNTFLAG != 0 then total + (total - 1 - left) else total - 1 - left
+    var ended: u32 = 0
+    var next: u32 = 0
+    if elapsed >= first
+        val past = elapsed - first
+        ended = 1 + past / period
+        next = period - past % period
+    else
+        next = first - elapsed
+    if next < SHORTEST && next + period <= RELOAD_LIMIT
+        ended += 1
+        next += period
+    if ended > 0 then icsr.v = PENDSTCLR
+    t.rvr = next - 1
+    t.cvr = 0
+    t.csr = CSR_RUNNING
+    while t.cvr == 0 do ()
+    t.rvr = period - 1
+    enable_interrupts()
+    ended
+
+// PRIMASK: hold off every interrupt but the faults' and NMI, and let them go again.
+private disable_interrupts()
+    asm
+        [thumb]
+            "cpsid i"
+            "isb"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+
+private enable_interrupts()
+    asm
+        [thumb]
+            "cpsie i"
+            "isb"
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+
+// Open BASEPRI entirely, answering what `restore` puts back.
+private open_mask() -> u32
+    var old: u32 = 0
+    val open: u32 = 0
+    asm
+        [thumb]
+            "mrs {old}, basepri"
+            "msr basepri, {open}"
+            "isb"
+            out old : reg
+            in open : reg
+        [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+    old

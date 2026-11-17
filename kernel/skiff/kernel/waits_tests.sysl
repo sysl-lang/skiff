@@ -36,17 +36,27 @@ private order(q: *WaitQueue) -> u32
     var at = q.first()
     while at != NONE
         digits = digits * 10 + u32(at) + 1
-        at = waiter(at).next
+        at = q.after(at)
     digits
 
-// Queue record `w` at `priority` by hand.
-private queue_at(q: *WaitQueue, w: u16, priority: u8)
+// Queue record `w` at `priority` on side 0 by hand.
+private queue_at(q: *WaitQueue, w: u16, priority: u8) = queue_on(q, w, 0, priority)
+
+// Queue record `w` at `priority` on side `side` by hand.
+private queue_on(q: *WaitQueue, w: u16, side: u8, priority: u8)
     waiter(w).priority = priority
+    waiter(w).side = side
     q.insert(w)
+
+// A queue with nobody waiting, as `Waitable.new` makes one.
+private empty() -> WaitQueue = Waitable.new("q").queue
+
+// The bit of priority `p`.
+private bit(p: u8) -> u32 = 1 << u32(p)
 
 @test("waiters queue by priority, first come within a priority")
 queue_order()
-    var q = WaitQueue(NONE, 0)
+    var q = empty()
     queue_at(&q, 0, 1)
     queue_at(&q, 1, 3)
     queue_at(&q, 2, 2)
@@ -56,12 +66,9 @@ queue_order()
     assert_eq(q.count, 5)
     assert_eq(q.first(), 1)
 
-@test("a waiter leaves the queue from anywhere, and a queue of zeros is empty")
+@test("a waiter leaves the queue from anywhere")
 queue_remove()
-    var zeros = WaitQueue(0, 0)
-    assert_eq(zeros.first(), NONE)
-    assert(!zeros.remove(0), "nothing to remove")
-    var q = WaitQueue(NONE, 0)
+    var q = empty()
     queue_at(&q, 0, 2)
     queue_at(&q, 1, 2)
     queue_at(&q, 2, 2)
@@ -73,6 +80,70 @@ queue_remove()
     assert(q.remove(2), "the last")
     assert_eq(q.first(), NONE)
     assert_eq(q.count, 0)
+    assert_eq(q.bits[0], 0)
+
+@test("an empty queue, of zeros or new, has no waiter on either side")
+queue_empty()
+    var zeros = WaitQueue([0; SIDES], [[0; PRIORITIES]; SIDES], 0)
+    var fresh = empty()
+    for q in [&zeros, &fresh]
+        assert_eq(q.first(), NONE)
+        assert_eq(q.first_of(0), NONE)
+        assert_eq(q.first_of(1), NONE)
+        assert_eq(q.count, 0)
+    assert_eq(sizeof(WaitQueue), 140)
+
+@test("waiters at many priorities keep a FIFO each, and leave from a FIFO's head, middle and tail")
+queue_many_priorities()
+    var q = empty()
+    val priorities = [31u8, 1, 5, 31, 5, 1, 5, 16, 31]
+    for i in 0..<priorities.len do queue_at(&q, u16(i), priorities[i])
+    assert_eq(order(&q), 149835726)
+    assert_eq(q.bits[0], bit(31) | bit(16) | bit(5) | bit(1))
+    assert(q.remove(4), "the middle of priority 5")
+    assert_eq(order(&q), 14983726)
+    assert(q.remove(0), "the head of priority 31, the queue's head")
+    assert_eq(order(&q), 4983726)
+    assert_eq(q.first(), 3)
+    assert(q.remove(5), "the tail of priority 1, the queue's tail")
+    assert_eq(order(&q), 498372)
+    assert(q.remove(8), "the tail of priority 31")
+    assert_eq(order(&q), 48372)
+    assert(q.remove(7), "the only one of priority 16")
+    assert_eq(order(&q), 4372)
+    assert_eq(q.bits[0], bit(31) | bit(5) | bit(1))
+    // What is left still links both ways: one queued again behind each FIFO lands at its tail.
+    queue_at(&q, 0, 5)
+    queue_at(&q, 4, 31)
+    assert_eq(order(&q), 453712)
+    assert_eq(q.count, 6)
+
+@test("each side's best waiter is found at once, though the other side holds the best priority")
+queue_sides()
+    var q = empty()
+    queue_on(&q, 0, 1, 30)
+    queue_on(&q, 1, 0, 2)
+    queue_on(&q, 2, 0, 2)
+    queue_on(&q, 3, 1, 30)
+    queue_on(&q, 4, 0, 1)
+    assert_eq(q.first_of(0), 1)
+    assert_eq(q.first_of(1), 0)
+    assert_eq(q.first(), 0)
+    assert_eq(q.after(2), 4)
+    assert_eq(q.after(4), NONE)
+    assert_eq(q.after(0), 3)
+    assert_eq(q.after(3), NONE)
+    assert(q.remove(1), "side 0's best")
+    assert_eq(q.first_of(0), 2)
+    assert(q.remove(0), "side 1's best")
+    assert(q.remove(3), "side 1's last")
+    assert_eq(q.first_of(1), NONE)
+    assert_eq(q.first(), 2)
+    assert_eq(q.bits[1], 0)
+    // On a tie of priorities, `first` answers side 0's.
+    queue_on(&q, 5, 1, 2)
+    assert_eq(q.first(), 2)
+    assert_eq(q.count, 3)
 
 @test("a take with a unit answers at once; without one it blocks the task and asks for a switch")
 take_blocks()
@@ -232,6 +303,38 @@ waiter_reinserted()
     assert_eq(priority_of(&r, d), 4)
     reprioritize(&r, c, a.slot(), 1)
     assert_eq(order(&s.w.queue), 321)
+    assert_eq(r.masked, 0)
+
+@test("a waiter raised or lowered moves between priorities' FIFOs, setting and clearing their bits")
+waiter_moves_across_priorities()
+    var r = recorder(1, 0)
+    var s = Semaphore.new("s", 0, 3)
+    val a = task_at(&r, 0, 3)
+    val b = task_at(&r, 1, 3)
+    val d = task_at(&r, 2, 2)
+    val _ = task_at(&r, 3, 1)
+    val c = here(&r)
+    c.sched.first()
+    for _ in 0..<3
+        val _ = s.take(&r, FOREVER)
+        switch_now(&r)
+    val q = &s.w.queue
+    assert_eq(order(q), 123)
+    reprioritize(&r, c, b.slot(), 31)
+    assert_eq(order(q), 213)
+    assert_eq(q.bits[0], bit(31) | bit(3) | bit(2))
+    reprioritize(&r, c, b.slot(), 1)
+    assert_eq(order(q), 132)
+    assert_eq(q.bits[0], bit(3) | bit(2) | bit(1))
+    reprioritize(&r, c, d.slot(), 3)
+    assert_eq(order(q), 132)
+    assert_eq(q.bits[0], bit(3) | bit(1))
+    reprioritize(&r, c, a.slot(), 2)
+    assert_eq(order(q), 312)
+    reprioritize(&r, c, b.slot(), 3)
+    assert_eq(order(q), 321)
+    assert_eq(q.bits[0], bit(3) | bit(2))
+    assert_eq(q.count, 3)
     assert_eq(r.masked, 0)
 
 @test("deleting a waiting task withdraws its wait")

@@ -4,9 +4,9 @@ import sysl.sync.{Atomic, Lock}
 
 // The lock every kernel object holds. Taking it masks the running core's kernel interrupts, which keeps
 // that core's tasks and handlers out; on a machine with more than one core it then spins on the chip's
-// lock word, which keeps the other cores out. The spin is the port's (LDREX/STREX on Armv7-M and
-// Armv8-M, a hardware spinlock where a core has no exclusives), so the kernel names no instruction. With
-// one core the spin is not in the image at all: the mask is the whole lock.
+// lock word, which keeps the other cores out. The spin is the port's (a ticket lock on Armv7-M
+// and Armv8-M, a hardware spinlock where a core has no exclusives), so the kernel names no instruction.
+// With one core the spin is not in the image at all: the mask is the whole lock.
 //
 // A lock is held only for a few instructions: never across a block or a switch, and never two at once.
 // Where a core's ready set is needed under it, the order is the object's lock, then the ready set, which
@@ -23,7 +23,7 @@ const NAME_BYTES: usize = 16
 // build of two images is another core's memory.
 struct KernelLock
     name: [NAME_BYTES]u8    // what a misplaced object is reported as
-    word: Atomic[u32]       // the chip lock's word: 0 when free
+    word: Atomic[u32]       // the chip lock's word, which the port reads its own way: 0 is free
     saved: u32              // what the holder's mask answered, which the release restores
     user: u32               // the core that first took the lock, plus one; SHARED_USE once another has
 

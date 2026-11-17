@@ -81,6 +81,9 @@ private apply[P: Port](p: *P, c: *Core, m: Message)
         MessageKind.Hand ->
             if wait_ended(c, i)
                 c.sched.tasks[i].held += 1
+                // The ceiling is fixed at creation, so it is read without the mutex's lock.
+                val mutex: *Mutex = ptr_cast(at_place(m.mutex))
+                if mutex.ceiling != 0 then c.sched.hold_ceiling(i, mutex.ceiling)
                 val e = c.sched.inherit(i, m.priority)
                 if e > c.sched.tasks[i].priority then c.sched.set_effective(i, e)
                 val _ = c.sched.wake(i)

@@ -1,0 +1,41 @@
+module skiff.board.scenarios
+
+import skiff.kernel
+import skiff.kernel.{Port, Semaphore}
+
+// Tickless idle (DESIGN "Tickless idle"), R's on each core before the watchdog. With every other task of
+// the core waiting, R makes a timed take of a semaphore nobody gives, then sleeps: the core has only its
+// idle task to run, which stops the tick and sleeps until the deadline. Each must end at or after its
+// deadline and within `LATE` ticks of it, and the core must have slept through some of its ticks with the
+// tick stopped, taking them on waking. QEMU delivers a core's ticks late and in bunches under load, so the
+// bound is generous and nothing waits for an exact tick.
+
+private const NAP: u32 = 25         // the timed take's timeout
+private const SLEEP: u32 = 30       // the sleep's
+private const LATE: u32 = 20        // how far past its deadline either may end
+
+private var naps = [Semaphore.new("nap", 0, 1); kernel.CORES]
+
+// R's part, on the running core.
+tickless[P: Port](p: *P)
+    val me = kernel.here_id(p)
+    val skipped = kernel.skipped_ticks(p)
+    val start = kernel.ticks()
+    val given = naps[me].take(p, NAP)
+    val napped = kernel.ticks()
+    kernel.sleep(p, SLEEP)
+    val woke = kernel.ticks()
+    val slept = kernel.skipped_ticks(p) -% skipped
+    if !given && on_time(start +% NAP, napped) && on_time(napped +% SLEEP, woke) && slept > 0
+        say(p, "slept with its tick stopped, and a timed wait and a sleep still ended on their deadlines\n")
+    else
+        say(p, "a sleep with the tick stopped went wrong: the wait ended ")
+        kernel.write_dec(p, napped -% start)
+        p.write(" ticks after it began, the sleep ".bytes)
+        kernel.write_dec(p, woke -% napped)
+        p.write(", with ".bytes)
+        kernel.write_dec(p, slept)
+        p.write(" ticks slept through\n".bytes)
+
+// Whether `now` is at or after `deadline`, by no more than `LATE`.
+private on_time(deadline: u32, now: u32) -> bool = kernel.expired(deadline, now) && now -% deadline <= LATE

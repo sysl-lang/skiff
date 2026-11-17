@@ -2,10 +2,11 @@ module skiff.kernel
 
 import sysl.sync.Ordering
 
-// Time: one counter for every core, in `.shared`, advanced by core 0's tick. Every core ticks at the same
-// rate and compares its deadlines with this counter, so a timeout means the same on every core.
+// Time: one counter for every core, in `.shared`, which any core's tick advances when no other core has
+// since its last (`Core.tick`). Every core ticks at the same rate and compares its deadlines with this
+// counter, so a timeout means the same on every core.
 
-// The time base: the ticks core 0 has taken since it started its tick.
+// The time base: the tick periods that have passed since the first core started its tick.
 ticks() -> u32 = time_base().load(Ordering.Acquire)
 
 // Whether `deadline` has come at `now`. Both are tick counts that wrap, and a deadline is never more than

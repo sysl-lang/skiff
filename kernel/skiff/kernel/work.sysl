@@ -1,0 +1,121 @@
+module skiff.kernel
+
+// Deferred work: an interrupt handler (or a task) hands a function and an argument to a task of its core,
+// the work service, which calls it in task context, so the handler itself stays short.
+//
+// A `Work` is a plain struct the application declares, whose zero is work not yet created, and it belongs
+// to the core whose task creates it (`create_work`). Posting it (`defer_work`) puts an item, the work and
+// a `u32` argument, on the core's queue of `work_items` and never waits: a full queue refuses the post,
+// which is counted (`deferred_refused`), and nothing already queued is lost. The work service is a task
+// the board creates at a priority it chooses, whose body is `serve_work`; it takes the items one at a
+// time, oldest first, and calls each work's callback with the argument it was posted with. While one
+// runs, no other item of its core runs, so a callback may do what a task may do, waiting among it, but
+// holds up every item behind it while it waits.
+//
+// The queue is a `Queue` private to the core, so the service waits on it through the queue's one
+// `WaitQueue`, and a post wakes it as any send wakes a receiver. Only the work's own core may post it: the
+// queue is that core's private state, and a post from another core is refused as `Remote` (DESIGN
+// "Deferred work"). The masked part of a post is the queue's send: a lock, a copy of two words and, when
+// the service waits, the wake of that one waiter. It holds no loop over the items.
+
+// What work does: a function given the work and the argument it was posted with. The kernel holds the
+// work while an item of it is queued, and the callback may keep it too, as a post it makes does.
+type WorkCallback = *extern(@keeps *Work, u32) -> unit
+
+struct Work
+    name: string
+    callback: WorkCallback
+    owner: u32          // one more than the core that created it: 0 until it is created
+
+impl Work
+    // The core the work belongs to, or None before it is created.
+    core(*self) -> Option[u32] = if self.owner == 0 then None else Some(self.owner - 1)
+
+// Why a work call was refused.
+enum WorkError
+    NotCreated      // the work has not been created
+    Created         // the work has been created already: work is created once
+    Remote          // the work is another core's: only its own core posts it
+    Full            // the core's queue of items was full: the post was dropped and counted
+
+// How many items each core's queue holds: the option `work_items`, for boards.
+const WORK_ITEMS: usize = option_work_items
+
+// One post of `work`, with the argument it was posted with. A zero item is an empty slot of the queue.
+struct WorkItem
+    work: *Work
+    argument: u32
+
+// A core's work service: the items posted and not yet taken, and how many posts a full queue refused.
+// Private to the core: its tasks and interrupt handlers post to `items`, and its service task alone takes
+// from it.
+struct WorkService
+    items: Queue[WorkItem, option_work_items]
+    refused: u32
+
+private var work_services: [option_cores]WorkService = [WorkService(Queue.new("deferred work"), 0); option_cores]
+
+// The running core's work service.
+private[kernel] work_here[P: Port](p: *P) -> *WorkService = &work_services[here_id(p)]
+
+// Create work `w` on the running core, calling `callback` for every post of it.
+create_work[P: Port](p: *P, w: *Work, name: string, callback: WorkCallback) -> Result[unit, WorkError]
+    val state = p.mask()
+    if w.owner != 0
+        p.restore(state)
+        return Err(WorkError.Created)
+    *w = Work(name, callback, here_id(p) + 1)
+    p.restore(state)
+    Ok(())
+
+// Post `w` with `argument` to the running core's work service, which must be `w`'s, without waiting. An
+// interrupt handler may call it. A full queue refuses it as `Full` and counts the refusal; the items
+// already queued stay as they are.
+defer_work[P: Port](p: *P, w: *Work, argument: u32) -> Result[unit, WorkError]
+    if w.owner == 0 then return Err(WorkError.NotCreated)
+    if w.owner - 1 != here_id(p) then return Err(WorkError.Remote)
+    val s = work_here(p)
+    if s.items.try_send(p, WorkItem(w, argument)) then return Ok(())
+    val state = p.mask()
+    s.refused = s.refused +% 1
+    p.restore(state)
+    Err(WorkError.Full)
+
+// How many posts the running core's full queue has refused, wrapping at 2^32.
+deferred_refused[P: Port](p: *P) -> u32
+    val s = work_here(p)
+    val state = p.mask()
+    val n = s.refused
+    p.restore(state)
+    n
+
+// How many items the running core's queue holds, waiting for the service.
+deferred_waiting[P: Port](p: *P) -> u32 = work_here(p).items.waiting(p)
+
+// The body of the running core's work service: wait for an item, call it, and again. The board's service
+// task calls it.
+serve_work[P: Port](p: *P) -> never
+    loop
+        serve_work_once(p)
+
+// One round of the service: wait for the oldest item, as long as it takes, and call it.
+private[kernel] serve_work_once[P: Port](p: *P)
+    work_here(p).items.receive(p, FOREVER) match
+        Some(item) -> run_item(item)
+        None -> ()
+
+// Call every item waiting on the running core, oldest first, with no wait; answers how many ran. An item
+// posted by one of them runs in the same turn, after those before it.
+work_turn[P: Port](p: *P) -> u32
+    val s = work_here(p)
+    var ran: u32 = 0
+    loop
+        s.items.try_receive(p) match
+            Some(item) ->
+                run_item(item)
+                ran += 1
+            None -> return ran
+
+// Call one item's work with its argument.
+private[kernel] run_item(item: WorkItem)
+    item.work.callback(item.work, item.argument)

@@ -27,7 +27,10 @@ private const UART_STRIDE: usize = 0x8000
 // What a UART's registers take, for a region that grants them.
 const UART_BYTES: usize = 0x1000
 
-private const FR_TXFF: u32 = 1 << 5
+// Where the register whose bit `UART_TX_FULL` says the transmit FIFO is full lies, from the base.
+const UART_FLAGS: u32 = 0x18
+const UART_TX_FULL: u32 = 1 << 5
+@assert(offsetof(Uart, fr) == usize(UART_FLAGS), "UART_FLAGS is UARTFR")
 // LCR_H: 8 bits (WLEN 3), FIFOs on.
 private const LCR_H_8N1: u32 = (3 << 5) | (1 << 4)
 // CR: UART, transmitter and receiver enabled.
@@ -73,7 +76,7 @@ console_init(n: u32)
 // Send one byte on UART `n`, waiting while its transmit FIFO is full.
 put_byte(n: u32, b: u8)
     val u = uart(n)
-    while (u.fr & FR_TXFF) != 0 do ()
+    while (u.fr & UART_TX_FULL) != 0 do ()
     u.dr = u32(b)
 
 // Send every byte of `bytes` on UART `n`.

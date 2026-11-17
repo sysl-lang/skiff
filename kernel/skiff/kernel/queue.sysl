@@ -19,7 +19,7 @@ import sysl.sync.Lock
 // Senders and receivers wait in the one queue of waiters, each marked with its side. Both sides wait at
 // once only for the moment between a kept slot or message and its taker running.
 
-// The side a waiter of a queue is on: its record's mode.
+// The side a waiter of a queue is on: its record's side.
 private const RECEIVING: u8 = 0
 private const SENDING: u8 = 1
 
@@ -50,7 +50,7 @@ impl[T, const N: usize] Queue[T, N]
             l.release()
             return false
         val c = running_core(p)
-        enqueue_running(c, &self.w, timeout, SENDING, 0)
+        enqueue_running(c, &self.w, timeout, SENDING, 0, 0)
         p.request_switch()
         l.release()
         if wait_outcome(c) != Outcome.Given then return false
@@ -73,7 +73,7 @@ impl[T, const N: usize] Queue[T, N]
             l.release()
             return None
         val c = running_core(p)
-        enqueue_running(c, &self.w, timeout, RECEIVING, 0)
+        enqueue_running(c, &self.w, timeout, RECEIVING, 0, 0)
         p.request_switch()
         l.release()
         if wait_outcome(c) != Outcome.Given then return None

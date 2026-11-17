@@ -86,9 +86,11 @@ struct Tcb
     suspended: bool     // kept out of its FIFO whatever its state, until resumed
     boost: u8           // the highest priority it inherited while it holds a mutex, or 0
     run_time: u64       // the core's counter counts it has run since it was created or the core's statistics were reset
+    ceilings: [PRIORITIES]u8    // how many mutexes of each ceiling it holds (sync.sysl)
+    ceiling_bits: u32           // bit c set while it holds a mutex of ceiling c
 
 // An empty slot, in its first generation.
-private[kernel] val FREE_TCB: Tcb = Tcb(0, 0, TaskState.Free, 1, NONE, NONE, 0, NONE, 0, 0, None, 0, 0, false, 0, 0)
+private[kernel] val FREE_TCB: Tcb = Tcb(0, 0, TaskState.Free, 1, NONE, NONE, 0, NONE, 0, 0, None, 0, 0, false, 0, 0, [0; PRIORITIES], 0)
 
 // One core's table and the choices made over it. It holds no hardware state, so the host tests drive
 // one directly; each core's is in its `Core`.
@@ -135,6 +137,8 @@ impl Scheduler
         self.tasks[i].base = priority
         self.tasks[i].held = 0
         self.tasks[i].boost = 0
+        self.tasks[i].ceilings = [0; PRIORITIES]
+        self.tasks[i].ceiling_bits = 0
         self.tasks[i].suspended = false
         self.tasks[i].run_time = 0
         self.tasks[i].state = TaskState.Ready
@@ -241,8 +245,26 @@ impl Scheduler
         if priority > self.tasks[i].boost then self.tasks[i].boost = priority
         self.effective(i)
 
-    // The priority task `i` should run at: the higher of its base and what it inherited.
-    effective(*self, i: usize) -> u8 = if self.tasks[i].boost > self.tasks[i].base then self.tasks[i].boost else self.tasks[i].base
+    // The priority task `i` should run at: the highest of its base, what it inherited, and the ceilings
+    // of the mutexes it holds.
+    effective(*self, i: usize) -> u8
+        var e = if self.tasks[i].boost > self.tasks[i].base then self.tasks[i].boost else self.tasks[i].base
+        val bits = self.tasks[i].ceiling_bits
+        if bits != 0
+            val top = u8(31 - bits.leading_zeros())
+            if top > e then e = top
+        e
+
+    // Task `i` now holds one more mutex of ceiling `ceiling` (1 to 31).
+    hold_ceiling(*self, i: usize, ceiling: u8)
+        self.tasks[i].ceilings[usize(ceiling)] += 1
+        self.tasks[i].ceiling_bits = self.tasks[i].ceiling_bits | priority_bit(usize(ceiling))
+
+    // Task `i` has let go of a mutex of ceiling `ceiling`: the ceiling stays while it holds another.
+    drop_ceiling(*self, i: usize, ceiling: u8)
+        self.tasks[i].ceilings[usize(ceiling)] -= 1
+        if self.tasks[i].ceilings[usize(ceiling)] == 0
+            self.tasks[i].ceiling_bits = self.tasks[i].ceiling_bits & ~priority_bit(usize(ceiling))
 
     // One of the owner's ticks, at time `now`: wake every sleeper whose deadline has come, then end the
     // running task's turn if another of its priority is ready. Answers whether to switch.

@@ -33,6 +33,24 @@ private[kernel] struct Recorder
     reserve: usize      // the bytes at the bottom of every stack its guard takes
     clock: u32          // the core's counter, moved by hand
     context_words: usize    // how many words the stack the last new context was laid on had
+    watchdog_ticks: u32     // what the hardware watchdog was last started at (0: never)
+    feeds: u32              // how many times it was fed
+    watchdog_stops: u32     // how many times it was stopped
+    masks: u32              // how many times the kernel masked, nested ones among them
+    skip_limit: u32         // the most ticks a sleep with the tick stopped may span (0: the tick never stops)
+    wake_after: u32         // how many ticks such a sleep lasts before an interrupt ends it (FOREVER: none comes)
+    asked: u32              // the ticks the last such sleep was asked to span (0: none was)
+
+// A hardware watchdog that counts what it is asked.
+impl Watchdog for Recorder
+    start_watchdog(*self, ticks: u32)
+        self.watchdog_ticks = ticks
+
+    feed_watchdog(*self)
+        self.feeds += 1
+
+    stop_watchdog(*self)
+        self.watchdog_stops += 1
 
 // The counter is whatever the test last set it to.
 impl RunCounter for Recorder
@@ -112,6 +130,7 @@ impl Port for Recorder
 
     mask(*self) -> u32
         self.masked += 1
+        self.masks += 1
         self.masked - 1
 
     restore(*self, state: u32)
@@ -122,12 +141,20 @@ impl Port for Recorder
     spin_try_lock(*self, word: *Atomic[u32]) -> bool = panic("one core never spins")
     spin_unlock(*self, word: *Atomic[u32]) = panic("one core never spins")
 
+    // A sleep with the tick stopped spans the ticks it was asked, or `wake_after` if an interrupt comes
+    // sooner. The test moves the counter by hand.
+    override tickless_limit(*self) -> u32 = self.skip_limit
+
+    override sleep_ticks(*self, count: u32) -> u32
+        self.asked = count
+        if self.wake_after < count then self.wake_after else count
+
 // One core: the kernel has no other core to ring.
 impl Doorbell for Recorder
     ring(*self, core: u32) = panic("one core never rings")
     clear(*self) = panic("one core never rings")
 
-private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, 0, 0, 0, 0, null, null, 0, 0, 0, 0, 0, 0, false, 8, 0, 0, 0)
+private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, 0, 0, 0, 0, null, null, 0, 0, 0, 0, 0, 0, false, 8, 0, 0, 0, 0, 0, 0, 0, 0, FOREVER, 0)
 
 // Whether `r` recorded exactly `want`.
 private[kernel] recorded(r: *Recorder, want: string) -> bool
@@ -181,27 +208,61 @@ deadline_across_wrap()
     assert(expired(5, 5), "the deadline, after the wrap")
     assert(expired(0xffff_ffff, 2), "a deadline before the wrap, seen after it")
 
-@test("core 0's tick advances the time base and another core's does not")
-only_core_0_keeps_time()
+private[kernel] fresh_core(id: u32, own: u32, seen: u32) -> Core = Core(id, Atomic(own), seen, false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false, 0, 0, 0, 0)
+
+@test("a tick advances the time base unless another core's has since this core's last, whichever core it is")
+a_tick_advances_time_unless_another_did()
     var time: Atomic[u32] = Atomic(0)
-    var first = Core(0, Atomic(0), false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false, 0, 0, 0)
-    var second = Core(1, Atomic(0), false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false, 0, 0, 0)
+    var first = fresh_core(0, 0, 0)
+    var second = fresh_core(1, 0, 0)
     first.tick(&time)
-    second.tick(&time)
-    second.tick(&time)
-    assert_eq(first.own_ticks(), 1)
-    assert_eq(second.own_ticks(), 2)
     assert_eq(time.load(), 1)
-    assert(first.keeps_time(), "core 0 keeps time")
-    assert(!second.keeps_time(), "core 1 does not")
+    // Core 1's last tick (none) saw 0, and core 0 has advanced it since: this period is taken.
+    second.tick(&time)
+    assert_eq(time.load(), 1)
+    assert_eq(second.time_seen, 1)
+    // Nobody has advanced it since core 1's last tick: core 1 does, without core 0.
+    second.tick(&time)
+    assert_eq(time.load(), 2)
+    first.tick(&time)
+    assert_eq(time.load(), 2)
+    assert_eq(first.time_seen, 2)
+    assert_eq(first.own_ticks(), 2)
+    assert_eq(second.own_ticks(), 2)
 
 @test("the time base wraps from the largest u32 to 0")
 time_base_wraps()
     var time: Atomic[u32] = Atomic(0xffff_ffff)
-    var first = Core(0, Atomic(0xffff_ffff), false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false, 0, 0, 0)
+    var first = fresh_core(0, 0xffff_ffff, 0xffff_ffff)
     first.tick(&time)
     assert_eq(time.load(), 0)
     assert_eq(first.own_ticks(), 0)
+    assert_eq(first.time_seen, 0)
+
+// The cores tests cannot set the time base near its wrap (it is the kernel's), so the wrap across several
+// cores is played here, on `Core`s of the test's own over a time base of its own.
+@test("the time base wraps from the largest u32 to 0 on whichever of three cores takes the period")
+time_wraps_across_cores()
+    var time: Atomic[u32] = Atomic(0xffff_fffe)
+    var a = fresh_core(0, 7, 3)
+    var b = fresh_core(1, 9, 3)
+    var c = fresh_core(2, 1, 3)
+    // Every core's view is stale: core 1 records the time base, then advances it.
+    b.tick(&time)
+    assert_eq(time.load(), 0xffff_fffe)
+    b.tick(&time)
+    assert_eq(time.load(), 0xffff_ffff)
+    val deadline = time.load() +% 2
+    a.tick(&time)
+    c.tick(&time)
+    b.tick(&time)
+    assert_eq(time.load(), 0)
+    assert(!expired(deadline, time.load()), "one period before the deadline, after the wrap")
+    c.tick(&time)
+    a.tick(&time)
+    b.tick(&time)
+    assert_eq(time.load(), 1)
+    assert(expired(deadline, time.load()), "the deadline, after the wrap")
 
 @test("with one core, here() is the one Core and never asks the machine")
 here_on_one_core()

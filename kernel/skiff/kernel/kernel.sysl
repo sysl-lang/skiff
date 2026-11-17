@@ -59,10 +59,24 @@ trait Isolation
 trait RunCounter
     run_count(*self) -> u32
 
+// The running core's hardware watchdog: the second stage behind the kernel's own watch on the core
+// (DESIGN "Supervision"). Its early warning reaches the board, which calls `kernel.bite`; its reset is the
+// chip's, for when even the warning cannot run. A core with no hardware watchdog of its own does nothing
+// for any of the three.
+trait Watchdog
+    // Start it, to warn unless fed within `ticks` of the core's ticks.
+    start_watchdog(*self, ticks: u32)
+
+    // Put its count back to the full `ticks`.
+    feed_watchdog(*self)
+
+    // Stop it: the core's verdict is given, and a stopped core must not reset the machine.
+    stop_watchdog(*self)
+
 // The kernel's view of the processor and the machine under it. An arch package, a chip package and a
 // board program together implement it; the kernel itself knows nothing about the hardware beyond what
 // this trait says.
-trait Port: Doorbell + Cache + Protection + Isolation + RunCounter
+trait Port: Doorbell + Cache + Protection + Isolation + RunCounter + Watchdog
     // Write `bytes` to this core's console, waiting for room as long as it takes.
     write(*self, bytes: []const u8)
 
@@ -107,6 +121,20 @@ trait Port: Doorbell + Cache + Protection + Isolation + RunCounter
 
     // Let it go, publishing everything written under it to the next holder.
     spin_unlock(*self, word: *Atomic[u32])
+
+    // The most ticks this core can sleep through with its periodic tick stopped (DESIGN "Tickless idle").
+    // A port that cannot stop its tick keeps this default of 0, and the kernel's idle then sleeps until
+    // the next tick, as it always has.
+    tickless_limit(*self) -> u32 = 0
+
+    // With the kernel's interrupts masked: stop this core's periodic tick and sleep until `count` ticks
+    // after its last tick have come, or until any interrupt is pending, whichever is first, then start
+    // the tick again in step with where it would have been. Answers how many tick periods ended while the
+    // core slept: their tick interrupts are never delivered, since the kernel takes them all at once. A
+    // tick already pending answers 0 at once and stays pending. The interrupt that ended the sleep is
+    // taken once the kernel restores its mask, after the kernel has taken the ticks. `count` is 2 to
+    // `tickless_limit()`.
+    sleep_ticks(*self, count: u32) -> u32 = 0
 
 // Bring the kernel up on `p`: greet on this core's console. On a machine with more than one core the
 // greeting names the core. Answers the status the machine should stop with: 0 for success.

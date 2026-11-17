@@ -1,7 +1,7 @@
 #!/bin/sh
-# skiff's boot test: build each QEMU board image and boot it on every machine it serves. A boot passes
-# only if each console's output has its expected lines, in order, and QEMU exits with the expected
-# status (the machine stops itself through semihosting). A hang is killed by PID after SKIFF_TIMEOUT
+# skiff's boot test: build each board image and boot it on every machine it serves (QEMU, and benchtop
+# for the Pico 2). A boot passes only if each console's output has its expected lines, in order, and the
+# emulator exits with the expected status (the machine stops itself through semihosting). A hang is killed by PID after SKIFF_TIMEOUT
 # seconds (QEMU ignores SIGALRM, so the watchdog kills it).
 #
 #   SKIFF_SYSL      the compiler (default: sysl)
@@ -9,7 +9,8 @@
 #   SKIFF_TIMEOUT   seconds per boot (default 10)
 #   SKIFF_BENCHTOP  the benchtop emulator that boots the Pico 2 (default: ../benchtop/benchtop beside
 #                   the repository)
-#   SKIFF_BOARD_TIME  the Pico 2's boot limit in the board's own emulated time (default 60s)
+#   SKIFF_BOARD_TIME  the Pico 2's boot limit in the board's own emulated time (default 300s: through the
+#                   boot ROM the two cores' hammers alone take 90-120 s of it, a few seconds of wall time)
 
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -17,7 +18,7 @@ compiler=${SKIFF_SYSL:-sysl}
 opt=${SKIFF_OPT:-}
 limit=${SKIFF_TIMEOUT:-10}
 benchtop=${SKIFF_BENCHTOP:-$root/../benchtop/benchtop}
-board_time=${SKIFF_BOARD_TIME:-60s}
+board_time=${SKIFF_BOARD_TIME:-300s}
 scratch="$root/scratch"
 mkdir -p "$scratch"
 
@@ -25,7 +26,9 @@ mkdir -p "$scratch"
 # the link script's `.shared`, takes three ticks, finds the time base agreeing with its own count, then
 # runs the scenarios' tasks (boards/scenarios): two equal tasks taking turns on the tick, two keeping
 # their FPU registers across switches, a high-priority task running on the tick its sleep ends, and a
-# stale handle refused. It ends through semihosting with status 0.
+# stale handle refused. Its last scenario hangs the core with its interrupts masked, after a watched
+# task kept the core's watchdog fed for 60 ticks: the tick stops, and the hardware watchdog's NMI reports
+# it and ends the run through semihosting with status 98 (WATCHDOG_STATUS), not 0.
 # tasks_expected <core> [<line the FPU tasks print>]: a build with no FPU registers has no such line.
 tasks_expected() {
     echo "skiff: core $1 task A 1
@@ -89,6 +92,13 @@ stats_expected() {
     echo "skiff: core $1 a busy task ran more than a sleeping one, and the idle task ran most once neither did
 skiff: core $1 a task recursing 8 deep left less of its stack untouched than a shallow one, and both handles went stale"
 }
+# The mutex options, every core (boards/scenarios, mutexes.sysl): a recursive mutex handed to its waiter
+# only at the last of its unlocks, locked once; a ceiling holding off a task below it until the unlock,
+# and refusing a task above it.
+mutexes_expected() {
+    echo "skiff: core $1 a recursive mutex locked 3 times went to its waiter only at the third unlock, locked once
+skiff: core $1 a mutex of ceiling 6 kept a task of priority 5 out until it was unlocked, and one of ceiling 3 refused a task of priority 4"
+}
 # Software timers, every core (boards/scenarios, timers.sysl): a periodic timer called a period apart
 # with no drift though one call ran late, a one-shot called once, a timer stopped before its expiry never
 # called, a reset and a changed period counting from their commands, and every callback in its own core's
@@ -99,6 +109,11 @@ skiff: core $1 a one-shot timer was called once and went inactive
 skiff: core $1 a timer stopped before it expired was never called
 skiff: core $1 a reset timer and one whose period changed each counted from its command
 skiff: core $1 every timer callback ran in its own core's timer service"
+}
+# Deferred work, every core (boards/scenarios, deferred.sysl): an interrupt posts work once more than the
+# queue holds; the last post is refused and counted, and the core's work service runs the rest in order.
+deferred_expected() {
+    echo "skiff: core $1 work an interrupt deferred ran in the core's work service, in the order posted, and a full queue refused one post"
 }
 # Error traces, every core (boards/scenarios, traces.sysl): an interrupt's failure kept to the core's
 # handlers' trace, the interrupted task's untouched; two unprivileged tasks failing in turn, each finding
@@ -136,6 +151,16 @@ skiff: core $1 two unprivileged tasks passed a pool buffer back and forth 4 time
 skiff: core $1 stopped a task that broke its memory protection
 skiff: core $1 an unprivileged task that wrote a buffer it had passed on was stopped, and the buffer reached its receiver"
 }
+# The watchdog, every core (boards/scenarios, watchdog.sysl): a watched task checking in every tick keeps
+# its core's watchdog from biting for longer than its timeout.
+watchdog_expected() {
+    echo "skiff: core $1 a watched task checked in for 60 ticks, and its core's watchdog held off"
+}
+# Tickless idle, every core (boards/scenarios, tickless.sysl): with only its idle task to run, the core
+# stops its tick, and a timed wait and a sleep still end on their deadlines.
+tickless_expected() {
+    echo "skiff: core $1 slept with its tick stopped, and a timed wait and a sleep still ended on their deadlines"
+}
 mps2_expected="skiff: hello
 skiff: .shared holds the shared state
 skiff: core 0 tick 1
@@ -146,11 +171,16 @@ $(tasks_expected 0 "f32 registers survived the switches")
 $(waits_expected 0)
 $(messages_expected 0)
 $(timers_expected 0)
+$(deferred_expected 0)
 $(control_expected 0)
 $(stats_expected 0)
+$(mutexes_expected 0)
 $(traces_expected 0)
 $(protection_expected 0)
-$(grants_expected 0)"
+$(grants_expected 0)
+$(tickless_expected 0)
+$(watchdog_expected 0)
+skiff: core 0 fault watchdog"
 
 # The AN521's two cores run one image, each greeting and ticking on the UART of its own number, then
 # running its own tasks at once with the other. Core 0 has no FPU (the SSE-200's CPU0, in QEMU as on
@@ -167,12 +197,14 @@ $(grants_expected 0)"
 # and a task on core 0 waits on a mutex a task
 # of core 1 holds while a task of middling priority works on core 1, and must have it within a bound
 # through the boost core 1's inbox carries, which the owner gives up with the mutex. Each core runs its own
-# software timers, and core 0 may not command one of core 1's. Core 0 suspends, resumes, re-prioritizes
+# software timers and deferred work, and core 0 may not command a timer of core 1's nor post its work. Core 0 suspends, resumes, re-prioritizes
 # and stops a task of core 1 through core 1's inbox, and core 1 checks each step. Each core measures its
-# own tasks on its own counter, and core 0 is refused core 1's. Core 1 then faults
-# on purpose: it
-# reports the fault on its own console and stops. Core 0 sees it stopped, takes more ticks, finds that
-# the time base counted its own ticks and none of core 1's, and stops the machine with status 0.
+# own tasks on its own counter, and core 0 is refused core 1's. Core 0 then masks its interrupts, taking
+# no tick, while core 1 alone moves the time base on and sleeps on it. Each core's watchdog holds off
+# while a watched task checks in; then a task on core 1 spins above it, and core 1's watchdog, checked
+# on its own tick, reports on core 1's console and stops core 1 alone. Core 0 sees it stopped, takes
+# more ticks, finds that the time base moves a period for each of its own ticks without core 1, and
+# stops the machine with status 0.
 an521_core0_greeting="skiff: hello from core 0
 skiff: .shared holds the shared state"
 # dual_core0_run [<line the FPU tasks print>]: core 0's run on a machine of two cores in one image.
@@ -191,18 +223,24 @@ skiff: core 0 had every buffer it sent core 1 back in the pool
 skiff: core 0 the high task had the mutex a task on core 1 held within 10 ticks
 $(timers_expected 0)
 skiff: core 0 may not command a timer of core 1
+$(deferred_expected 0)
+skiff: core 0 may not post work of core 1
 $(control_expected 0)
 skiff: core 0 asked core 1 to suspend, resume, re-prioritize and stop a task of its own, and core 1 did
 $(stats_expected 0)
 skiff: core 0 is refused another core's task statistics and high-water marks
+$(mutexes_expected 0)
 $(traces_expected 0)
 $(protection_expected 0)
 skiff: core 0 an unprivileged task on core 1 took a unit core 0 gave and set flags core 0 waited on, through its grants
 $(grants_expected 0)
 skiff: core 0 had the pool buffer an unprivileged task sent core 1 through granted objects back
+skiff: core 0 took no tick while masked, and the time base moved on without it
+$(tickless_expected 0)
+$(watchdog_expected 0)
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
-skiff: core 0 time base agrees"
+skiff: core 0 keeps the time base alone"
 }
 an521_core0_run=$(dual_core0_run)
 an521_core0_expected="$an521_core0_greeting
@@ -225,15 +263,20 @@ skiff: core 1 read 3000 bytes core 0 wrote into a stream, every byte in order
 skiff: core 1 received 200 messages core 0 sent, each whole and in order
 skiff: core 1 the low task gave up the priority core 0's task lent it with the mutex
 $(timers_expected 1)
+$(deferred_expected 1)
 $(control_expected 1)
 skiff: core 1 core 0 suspended, resumed, re-prioritized and stopped a task of core 1 through its inbox
 $(stats_expected 1)
+$(mutexes_expected 1)
 $(traces_expected 1)
 $(protection_expected 1)
 skiff: core 1 an unprivileged task took a unit core 0 gave, through its grant
 $(grants_expected 1)
 skiff: core 1 an unprivileged task received notes and a filled buffer an unprivileged task of core 0 sent, through its grants
-skiff: core 1 fault BusFault"
+skiff: core 1 kept the time base moving while core 0 took no tick
+$(tickless_expected 1)
+$(watchdog_expected 1)
+skiff: core 1 fault watchdog"
 an521_core1_expected="skiff: hello from core 1
 $an521_core1_ticks
 $(tasks_expected 1)
@@ -243,10 +286,10 @@ $an521_core1_run"
 # runs its own, built from the one board program, and the two meet at the handshake, agreeing on the
 # layout of `.shared`, before either creates a task. Then the run is the one image's, except that core
 # 1's image uses its FPU, so its floating-point tasks run too, and that core 0 cannot name core 1's
-# timers at all, which are core 1's own.
+# timers or work at all, which are core 1's own.
 split_core0_expected="$an521_core0_greeting
 skiff: core 0 and core 1 agree on the layout of .shared
-$(echo "$an521_core0_run" | grep -v -x -F "skiff: core 0 may not command a timer of core 1")"
+$(echo "$an521_core0_run" | grep -v -x -F -e "skiff: core 0 may not command a timer of core 1" -e "skiff: core 0 may not post work of core 1")"
 split_core1_expected="skiff: hello from core 1
 skiff: core 1 agrees with core 0 on the layout of .shared
 $an521_core1_ticks
@@ -322,10 +365,10 @@ build thumbv7em-freestanding-dp qemu-mps2 "$m7_image"
 build thumbv7em-freestanding qemu-mps2 "$m4_image"
 run "$scratch/mps2-an500.log" -M mps2-an500 -kernel "$m7_image"
 check mps2-an500 "$scratch/mps2-an500.log" "$mps2_expected"
-verdict mps2-an500 0
+verdict mps2-an500 98
 run "$scratch/mps2-an386.log" -M mps2-an386 -kernel "$m4_image"
 check mps2-an386 "$scratch/mps2-an386.log" "$mps2_expected"
-verdict mps2-an386 0
+verdict mps2-an386 98
 
 # The AN521: one image run by both cores, under multi-threaded TCG so that the cores really run at once.
 # Core 0's console, UART0, is QEMU's stdio; core 1's, UART1, goes to a file of its own.
@@ -379,10 +422,16 @@ verdict "mps2-an521 two images that disagree" 3
 # the image's entry as a debug probe enters it, and once from reset through Raspberry Pi's boot ROM, which
 # runs the image only for its IMAGE_DEF block. Either way core 1 waits in the ROM until core 0 launches
 # it. `--deterministic` runs the cores in reproducible turns, and the limit is the board's own time, not
-# the host's: benchtop ends a run that is not over by then with status 124. benchtop copies UART0 alone to
-# its output, so core 0's console is the one checked.
+# the host's: benchtop ends a run that is not over by then with status 124. Core 0's console, UART0, is
+# benchtop's output, and core 1's, UART1, goes to a file of its own. With `--semihosting` the image's
+# SYS_EXIT_EXTENDED is benchtop's exit status, as QEMU's is. The run is the AN521's one image, with both
+# cores' floating-point tasks, but for the sleep with the tick stopped: the board leaves tickless idle off.
 pico2_core0_expected="$an521_core0_greeting
-$(dual_core0_run "f32 registers survived the switches")"
+$(dual_core0_run "f32 registers survived the switches" | grep -v -x -F "$(tickless_expected 0)")"
+pico2_core1_expected="skiff: hello from core 1
+$an521_core1_ticks
+$(tasks_expected 1 "f32 registers survived the switches")
+$(echo "$an521_core1_run" | grep -v -x -F "$(tickless_expected 1)")"
 pico2_image="$scratch/pico2.elf"
 build thumb-freestanding pico2 "$pico2_image"
 if [ ! -x "$benchtop" ]; then
@@ -391,11 +440,16 @@ if [ ! -x "$benchtop" ]; then
 else
     for entry in debugger rom; do
         start=$(date +%s)
-        "$benchtop" run --board pico2 --boot "$entry" --deterministic --timeout "$board_time" "$pico2_image" \
+        rm -f "$scratch/pico2-$entry-core1.log"
+        "$benchtop" run --board pico2 --boot "$entry" --deterministic --semihosting \
+            --serial uart1=file:"$scratch/pico2-$entry-core1.log" --timeout "$board_time" "$pico2_image" \
             > "$scratch/pico2-$entry-core0.log" 2>&1 < /dev/null
         code=$?
         took=$(( $(date +%s) - start ))
         check "pico2 ($entry entry) core 0" "$scratch/pico2-$entry-core0.log" "$pico2_core0_expected"
+        if [ -z "$missing" ]; then
+            check "pico2 ($entry entry) core 1" "$scratch/pico2-$entry-core1.log" "$pico2_core1_expected"
+        fi
         verdict "pico2 ($entry entry)" 0
     done
 fi

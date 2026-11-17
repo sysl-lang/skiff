@@ -4,7 +4,7 @@
 
 import sysl.sync.{Atomic, Lock}
 import skiff.kernel
-import skiff.kernel.{Access, Cache, Channel, Doorbell, Grant, Isolation, MessageBuffer, Pool, Port, Protection, Queue, Region, RegionError, RunCounter, Slot, StreamBuffer}
+import skiff.kernel.{Access, Cache, Channel, Doorbell, Grant, Isolation, MessageBuffer, Pool, Port, Protection, Queue, Region, RegionError, RunCounter, Slot, StreamBuffer, Watchdog}
 
 struct Nothing
 end Nothing
@@ -47,11 +47,17 @@ impl Isolation for Nothing
 impl RunCounter for Nothing
     run_count(*self) -> u32 = 0
 
+impl Watchdog for Nothing
+    start_watchdog(*self, ticks: u32) = ()
+    feed_watchdog(*self) = ()
+    stop_watchdog(*self) = ()
+
 private var stack: [64]u32 = [0; 64]
 // Objects one core keeps are constant data: an export reaches them, and a freestanding artifact has no
 // entry to fill them in, so this build fails if `new` stops folding.
 private var units = kernel.Semaphore.new("units", 0, 2)
 private var guard = kernel.Mutex.new("guard")
+private var nested = kernel.Mutex.recursive_with_ceiling("nested", 3)
 private var word = kernel.KernelLock.new("word")
 private var mail: Queue[u32, 2] = Queue.new("mail")
 private var events = kernel.Flags.new("events", 0)
@@ -75,6 +81,8 @@ private waits(m: *Nothing) -> bool
     if !units.give(m) || !units.try_take(m) || units.take(m, 1) || units.available(m) != 0 then return false
     if !guard.lock(m, kernel.FOREVER) then return false
     guard.unlock(m)
+    if nested.enter(m, 0).is_err() then return false
+    nested.unlock(m)
     guard.holder() == kernel.NO_TASK && messages(m)
 
 // The queues, the flags and the notifications, over the port.
@@ -145,6 +153,18 @@ private timers(m: *Nothing) -> bool
     if m.cores() > 3 then kernel.serve_timers(m)
     true
 
+private var job: kernel.Work
+
+private done(w: *kernel.Work, argument: u32) = ()
+
+// Deferred work and its service, over the port.
+private deferred(m: *Nothing) -> bool
+    if kernel.create_work(m, &job, "job", &done).is_err() || job.core() != Some(0) then return false
+    if kernel.defer_work(m, &job, 1).is_err() || kernel.deferred_waiting(m) != 1 then return false
+    if kernel.work_turn(m) != 1 || kernel.deferred_refused(m) != 0 then return false
+    if m.cores() > 3 then kernel.serve_work(m)
+    true
+
 private var user_stack: [64]u32 = [0; 64]
 
 // Unprivileged tasks, their calls, and stopping a task, over the port.
@@ -169,7 +189,16 @@ private control(m: *Nothing, t: kernel.Task) -> bool
 private stats(m: *Nothing, t: kernel.Task) -> bool
     if kernel.task_stats(m, t).is_ok() || kernel.stack_high_water(m, t).is_ok() then return false
     kernel.reset_stats(m)
-    kernel.core_stats(m).elapsed == 0
+    kernel.core_stats(m).elapsed == 0 && watchdog(m, t)
+
+// The watchdog: another core's task refused, then the running core's watch armed, fed and disarmed.
+private watchdog(m: *Nothing, t: kernel.Task) -> bool
+    if kernel.watch(m, t, 5).is_ok() || kernel.unwatch(m, t) || kernel.check_in(m) then return false
+    kernel.arm_watchdog(m, 10)
+    val bit = kernel.supervise(m)
+    if bit then kernel.bite(m)
+    kernel.disarm_watchdog(m)
+    !kernel.bitten(m)
 
 @export("main")
 probe() -> i32
@@ -179,13 +208,15 @@ probe() -> i32
     val t = kernel.create(&m, 1, stack, &body, 1)
     kernel.start(&m)
     kernel.await_tick(&m)
+    kernel.rest(&m)
+    if kernel.skipped_ticks(&m) != 0 then return 1
     kernel.answer_doorbell(&m)
     kernel.fault(&m, "none")
     val here = kernel.here(&m)
     if !kernel.stopped(here.id) || kernel.expired(kernel.ticks(), 0) then return 1
     if t.is_err() || kernel.delete(&m, t.unwrap()).is_ok() then return 1
     if !control(&m, t.unwrap()) then return 1
-    if !protection(&m) || !timers(&m) || !handshake() then return 1
+    if !protection(&m) || !timers(&m) || !deferred(&m) || !handshake() then return 1
     if here.sched.started()
         kernel.sleep(&m, 1)
         kernel.sleep_until(&m, 1)

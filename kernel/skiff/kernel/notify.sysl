@@ -107,7 +107,7 @@ private wait_for_note[P: Port](p: *P, c: *Core, n: *Note, l: *Locking[P], timeou
     if timeout == 0
         l.release()
         return false
-    enqueue_running(c, &n.w, timeout, 0, 0)
+    enqueue_running(c, &n.w, timeout, 0, 0, 0)
     p.request_switch()
     l.release()
     if wait_outcome(c) != Outcome.Woken then return false

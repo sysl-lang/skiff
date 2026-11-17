@@ -1,20 +1,18 @@
 module skiff.arch.armv7m
 
-import sysl.sync.{Atomic, Ordering, spin_hint}
+import sysl.sync.Atomic
+import skiff.arch.ticket
 
-// The chip lock on an Armv7-M or Armv8-M Mainline core, for the kernel's `Port`: a word in memory every
-// core reaches, taken with an exclusive pair. An atomic exchange compiles to LDREX/STREX here, with the
-// barrier its ordering asks for, so the lock is the language's and no assembly is needed.
+// The chip lock on an Armv7-M or Armv8-M Mainline core, for the kernel's `Port`: the ticket lock
+// (`arch/ticket`) on a word in memory every core reaches. Its atomic add and compare-and-swap compile to
+// LDREX/STREX here, with the barriers their orderings ask for, so the lock is the language's and no
+// assembly is needed. Cores take it in the order they asked for it.
 
-// Take the lock at `word`, spinning until no other core holds it. A waiter spins on a plain load and
-// tries the exchange again only once the word reads free.
-spin_lock(word: *Atomic[u32])
-    while word.swap(1, Ordering.Acquire) != 0
-        while word.load(Ordering.Relaxed) != 0 do spin_hint()
+// Take the lock at `word`, waiting behind every core that asked for it first.
+spin_lock(word: *Atomic[u32]) = ticket.lock(word)
 
-// Take the lock at `word` if it is free, answering whether it did.
-spin_try_lock(word: *Atomic[u32]) -> bool = word.swap(1, Ordering.Acquire) == 0
+// Take the lock at `word` if nobody holds it or waits for it, answering whether it did.
+spin_try_lock(word: *Atomic[u32]) -> bool = ticket.try_lock(word)
 
-// Let the lock at `word` go, publishing everything written under it.
-spin_unlock(word: *Atomic[u32])
-    word.store(0, Ordering.Release)
+// Let the lock at `word` go to the next core waiting, publishing everything written under it.
+spin_unlock(word: *Atomic[u32]) = ticket.unlock(word)

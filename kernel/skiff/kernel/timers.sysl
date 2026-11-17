@@ -35,7 +35,10 @@ struct Timer
     owner: u32          // one more than the core that created it: 0 until it is created
     active: bool        // whether it will expire: started, and since then neither stopped nor, if a one-shot, expired
     expiry: u32         // the tick an active timer next expires on
-    next: *Timer        // the active timer of its core that expires after it, or null
+    next: *Timer        // the timer after it in its service's list or in its pending timers, or null
+    prev: *Timer        // the timer before it there, or null
+    from: u32           // the tick a pending timer's expiry counts from
+    pending: bool       // whether it is active and among the pending timers, not yet in the list
 
 impl Timer
     // The core the timer belongs to, or None before it is created.
@@ -82,17 +85,25 @@ struct TimerCommand
     sent: u32
     period: u32
 
-// A core's timer service: its active timers, soonest first, and its commands. Private to the core: its
-// service task alone touches the list, and its tasks and interrupt handlers reach only `commands`.
+// A core's timer service: its list of active timers, soonest first, its pending timers, and its
+// commands. Private to the core: its tasks and interrupt handlers reach only `commands`.
 // While a callback runs, `calling` is set and `caller` is the service task's slot: a command sent then
 // from that task is the service's own, carried out at once.
+//
+// Carrying out a command (`apply`) costs the same however many timers are active: it unlinks the timer
+// from either list and appends it to the pending timers, oldest first. Only `settle` walks the sorted
+// list, moving the pending timers into it, and only the service task calls it, between callbacks and
+// unmasked. So the one walk that grows with the timers never runs in an interrupt handler, under the
+// mask or under a lock, even when a handler's command is carried out during a callback.
 struct TimerService
     head: *Timer
+    pending: *Timer     // the first pending timer, started since the list was last settled
+    last: *Timer        // the last pending timer
     commands: Queue[TimerCommand, option_timer_commands]
     calling: bool
     caller: u16
 
-private var timer_services: [option_cores]TimerService = [TimerService(null, Queue.new("timer commands"), false, 0); option_cores]
+private var timer_services: [option_cores]TimerService = [TimerService(null, null, null, Queue.new("timer commands"), false, 0); option_cores]
 
 // The running core's timer service.
 private[kernel] timers_here[P: Port](p: *P) -> *TimerService = &timer_services[here_id(p)]
@@ -109,7 +120,7 @@ create_timer[P: Port](p: *P, t: *Timer, name: string, period: u32, periodic: boo
     if t.owner != 0
         p.restore(state)
         return Err(TimerError.Created)
-    *t = Timer(name, callback, period, periodic, here_id(p) + 1, false, 0, null)
+    *t = Timer(name, callback, period, periodic, here_id(p) + 1, false, 0, null, null, 0, false)
     p.restore(state)
     Ok(())
 
@@ -144,7 +155,9 @@ private[kernel] serve_once[P: Port](p: *P)
     timer_turn(p)
     val s = timers_here(p)
     s.commands.receive(p, s.wait_from(ticks())) match
-        Some(c) -> s.apply(c)
+        Some(c) ->
+            s.apply(c)
+            s.settle()
         None -> ()
 
 // A turn of the running core's service with no wait: carry out every command waiting, then call every
@@ -152,6 +165,7 @@ private[kernel] serve_once[P: Port](p: *P)
 timer_turn[P: Port](p: *P)
     val s = timers_here(p)
     s.take_commands(p)
+    s.settle()
     s.expire(p, ticks())
 
 impl TimerService
@@ -181,8 +195,9 @@ impl TimerService
         self.calling = on
         p.restore(state)
 
-    // Add active timer `t`, whose `expiry` is set, as at tick `now`: behind every timer due no later.
-    // An expiry before `now` is overdue and comes before any that is not.
+    // Add active timer `t`, whose `expiry` is set, to the list as at tick `now`: behind every timer due no
+    // later. An expiry before `now` is overdue and comes before any that is not. A walk of the list: the
+    // service task's alone, unmasked.
     private insert(*self, t: *Timer, now: u32)
         val due_in = i32.wrap(t.expiry -% now)
         var before: *Timer = null
@@ -191,25 +206,49 @@ impl TimerService
             before = at
             at = at.next
         t.next = at
+        t.prev = before
+        if at != null then at.prev = t
         if before == null then self.head = t else before.next = t
 
-    // Take `t` out of the list, if it is in it.
-    private remove(*self, t: *Timer)
-        var before: *Timer = null
-        var at = self.head
-        while at != null && at != t
-            before = at
-            at = at.next
-        if at == null then return
-        if before == null then self.head = t.next else before.next = t.next
+    // Take active timer `t` out of whichever list holds it, in constant time.
+    private unlink(*self, t: *Timer)
+        if t.prev != null
+            t.prev.next = t.next
+        elif t.pending
+            self.pending = t.next
+        else
+            self.head = t.next
+        if t.next != null
+            t.next.prev = t.prev
+        elif t.pending
+            self.last = t.prev
         t.next = null
+        t.prev = null
+        t.pending = false
+
+    // Append active timer `t` to the pending timers, its expiry counting from tick `from`.
+    private hold(*self, t: *Timer, from: u32)
+        t.from = from
+        t.pending = true
+        t.prev = self.last
+        if self.last == null then self.pending = t else self.last.next = t
+        self.last = t
+
+    // Move every pending timer into the list, oldest first, so that equal expiries keep the order they
+    // were started in. The service task's alone, between callbacks: no command is carried out at once
+    // then, so nothing else touches either list.
+    private[kernel] settle(*self)
+        loop
+            val t = self.pending
+            if t == null then return
+            self.unlink(t)
+            self.insert(t, t.from)
 
     // Take out and answer the first timer whose expiry has come at `now`, or null.
     private take_due(*self, now: u32) -> *Timer
         val t = self.head
         if t == null || !expired(t.expiry, now) then return null
-        self.head = t.next
-        t.next = null
+        self.unlink(t)
         t
 
     // The ticks from `now` to the first expiry: 0 if it has come, `FOREVER` with no active timer.
@@ -221,9 +260,10 @@ impl TimerService
     // Call every timer whose expiry has come at `now`, soonest first. A periodic timer is put back a
     // period after the expiry it is called for, and called again in the same turn if that has come too;
     // a one-shot is no longer active. Each is settled before its callback runs, and a command the
-    // callback sends is carried out before the next timer due is taken.
+    // callback sends is carried out before the next timer due is taken, and settled into the list then.
     private expire[P: Port](*self, p: *P, now: u32)
         loop
+            self.settle()
             val t = self.take_due(now)
             if t == null then return
             val due = t.expiry
@@ -236,14 +276,14 @@ impl TimerService
             t.callback(t, due)
             self.set_calling(p, false)
 
-    // Carry out command `c`.
+    // Carry out command `c`, in constant time: a started timer waits among the pending ones for `settle`.
     private[kernel] apply(*self, c: TimerCommand)
         val t = c.timer
-        if t.active then self.remove(t)
+        if t.active then self.unlink(t)
         if c.op == STOP
             t.active = false
             return
         if c.op == PERIOD then t.period = c.period
         t.expiry = c.sent +% t.period
         t.active = true
-        self.insert(t, c.sent)
+        self.hold(t, c.sent)

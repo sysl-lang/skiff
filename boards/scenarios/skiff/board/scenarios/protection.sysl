@@ -40,6 +40,8 @@ struct Exchange
     start: u32              // the tick the scenarios start on
     worker: u32             // worker's handle, which echo notifies
     uart: u32               // where the core's UART's registers are
+    uart_flags: u32         // how far past them the register with the transmit-full bit lies
+    uart_full: u32          // that bit
     round_trips: u32        // worker's result
     got: u32                // the word echo's notification lands in
     refusals: u32           // forger's results
@@ -48,7 +50,7 @@ struct Exchange
     basepri_seen: u32
     finished: u32           // a bit for each of worker, forger, masker and speaker once it is done
     stage: u32              // the step of the scenarios R has let begin (`STEP_*`)
-    unused: [53]u32
+    unused: [51]u32
 
 // The bits of `finished`.
 private const WORKER_DONE: u32 = 1
@@ -99,14 +101,17 @@ private[scenarios] fill_shared_protection()
     common.crossed_bits = Flags.new("crossed", 0)
 
 // R's part, on the running core: create the tasks, judge each scenario as it falls due, and return once
-// every verdict is in. `code` is the code every unprivileged task runs, and `uart` the registers of the
-// core's UART, which speaker is granted.
-protection[P: Port](p: *P, e: *Entries, code: Region, uart: Region)
+// every verdict is in. `code` is the code every unprivileged task runs, and `console` the core's UART,
+// whose registers speaker is granted.
+protection[P: Port](p: *P, e: *Entries, code: Region, console: Console)
     val me = kernel.here_id(p)
     val x = &exchanges[me]
     val t = kernel.ticks() + 2
+    val uart = console.registers
     x.start = t
     x.uart = u32(uart.base)
+    x.uart_flags = console.flags
+    x.uart_full = console.full
     for k in 0..<16
         vaults[me][k] = 0x5a
     val shared = Region(usize(x), EXCHANGE_BYTES, Access.ReadWrite)
@@ -308,24 +313,33 @@ private forger_task() -> never
     x.finished |= FORGER_DONE
     rest()
 
-// The CMSDK UART's first two registers, which both boards' UARTs have.
-private struct Uart
-    data: volatile u32          // a write sends a byte
-    state: volatile u32         // bit 0: the transmit buffer is full
+// A core's UART as a task writes it register by register: its registers, the first of which sends a byte
+// on every board's UART (CMSDK DATA, PL011 UARTDR), and where the bit lies that says the transmit buffer
+// is full (`full` in the register `flags` bytes past the first).
+struct Console
+    registers: Region
+    flags: u32
+    full: u32
+
+private struct Register
+    v: volatile u32
 
 // Write `skiff: core <n> ` and `line` on the UART at the exchange's `uart`, register by register.
 private write_uart(x: *Exchange, line: string)
-    val u: *Uart = ptr_cast(usize(x.uart))
-    put_uart(u, "skiff: core ")
-    while (u.state & 1) != 0 do ()
-    u.data = u32('0') + user.current().core()
-    put_uart(u, " ")
-    put_uart(u, line)
+    put_uart(x, "skiff: core ")
+    put_byte(x, u32('0') + user.current().core())
+    put_uart(x, " ")
+    put_uart(x, line)
 
-private put_uart(u: *Uart, text: string)
+private put_uart(x: *Exchange, text: string)
     for b in text.bytes
-        while (u.state & 1) != 0 do ()
-        u.data = u32(b)
+        put_byte(x, u32(b))
+
+private put_byte(x: *Exchange, b: u32)
+    val data: *Register = ptr_cast(usize(x.uart))
+    val flags: *Register = ptr_cast(usize(x.uart) + usize(x.uart_flags))
+    while (flags.v & x.uart_full) != 0 do ()
+    data.v = b
 
 private speaker_task() -> never
     val x = mine()

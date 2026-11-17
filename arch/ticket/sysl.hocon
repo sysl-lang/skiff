@@ -1,0 +1,9 @@
+// The ticket lock, a fair spin lock for every core with an atomic add and compare-and-swap (Armv7-M and
+// Armv8-M Mainline: LDREX/STREX). It is the language's atomics and nothing else, so it is tested on the
+// host (`sysl test arch/ticket`); it is not in the kernel because a core with no atomic
+// read-modify-write (the RP2040's M0+) refuses it. armv7m's port members call it.
+
+package {
+  name    = "ticket"
+  version = "0.0.1"
+}

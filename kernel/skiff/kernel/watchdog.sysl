@@ -1,0 +1,202 @@
+module skiff.kernel
+
+// A watchdog per core (DESIGN "Supervision").
+//
+// Each core keeps a watch of its own, in private memory: the tasks it watches, each with the period it
+// must check in within, and the tick the watch was last fed. A watched task checks in (`check_in`); the
+// core's own tick calls `supervise`, which feeds the watch, and the port's hardware watchdog with it, only
+// when every watched task has checked in within its period. A watch left unfed for its timeout bites:
+// the core reports `watchdog` through the fault path and its board stops it, as after a fault, while the
+// other cores run on. Every count is of the core's own ticks, so a core whose ticks come late (another
+// core's, or a stalled processor's) is judged by the ticks it took.
+//
+// The hardware watchdog is the second stage, started at twice the timeout: it bites only when the core's
+// tick no longer runs at all (its interrupts masked for good, a lockup), which no software watch can see.
+// Only the owner acts on its watch, so no core can feed another's.
+
+// The kernel's tick rate: the `tick_hz` option, for a port converting ticks to its watchdog's clock.
+const TICK_HZ: u32 = option_tick_hz
+
+// How many times the watch's timeout the hardware watchdog waits for.
+const HARDWARE_STAGE: u32 = 2
+
+// One watched task: its handle, how many of its core's ticks it may go between check-ins, and the tick
+// of its last check-in (or of `watch`).
+struct Watched
+    task: Task
+    period: u32
+    seen: u32
+
+// One core's watch. Zero is unarmed and watching nothing.
+struct Watch
+    armed: bool
+    bitten: bool
+    timeout: u32        // the ticks it may go unfed
+    fed: u32            // the core's tick it was last fed on
+    count: usize        // the watched tasks, in `tasks[..<count]`
+    tasks: [option_watched]Watched
+
+impl Watch
+    // Where `t` is among the watched tasks.
+    private find(*self, t: Task) -> Option[usize]
+        for i in 0..<self.count
+            if self.tasks[i].task == t then return Some(i)
+        None
+
+    // Watch `t` from tick `now`, or watch it with a new period.
+    private add(*self, t: Task, period: u32, now: u32) -> Result[unit, TaskError]
+        val i = self.find(t) match
+            Some(i) -> i
+            None ->
+                if self.count == option_watched then return Err(TaskError.Full)
+                self.count += 1
+                self.count - 1
+        self.tasks[i] = Watched(t, period, now)
+        Ok(())
+
+    // Stop watching `t`: the last one takes its place.
+    private remove(*self, t: Task) -> bool
+        self.find(t) match
+            Some(i) ->
+                self.count -= 1
+                self.tasks[i] = self.tasks[self.count]
+                true
+            None -> false
+
+    // Whether every watched task has checked in within its period at the core's tick `now`.
+    private reported(*self, now: u32) -> bool
+        for i in 0..<self.count
+            if now -% self.tasks[i].seen > self.tasks[i].period then return false
+        true
+
+    // For how many of the core's ticks after `now` every watched task stays checked in within its period
+    // if none checks in again: `FOREVER` watching none, None when one is already overdue at `now`.
+    private slack(*self, now: u32) -> Option[u32]
+        var least = FOREVER
+        for i in 0..<self.count
+            val age = now -% self.tasks[i].seen
+            if age > self.tasks[i].period then return None
+            val left = self.tasks[i].period - age
+            if left < least then least = left
+        Some(least)
+
+private var watches: [option_cores]Watch
+
+// The running core's watch.
+private[kernel] watch_here[P: Port](p: *P) -> *Watch = &watches[here_id(p)]
+
+// Arm the running core's watch: from now on it bites if `timeout` of the core's ticks pass without every
+// watched task checked in within its period, and the port's hardware watchdog is started at
+// `HARDWARE_STAGE` times that. Arming again starts the count again.
+arm_watchdog[P: Port](p: *P, timeout: u32)
+    if timeout == 0 || timeout > 0xffff_ffff / HARDWARE_STAGE then panic("skiff: a watchdog's timeout is 1 tick to 2^31")
+    val w = watch_here(p)
+    val state = p.mask()
+    w.timeout = timeout
+    w.fed = here(p).own_ticks()
+    w.bitten = false
+    w.armed = true
+    p.start_watchdog(timeout * HARDWARE_STAGE)
+    p.restore(state)
+
+// Disarm the running core's watch and stop its hardware watchdog. What it watches is kept.
+disarm_watchdog[P: Port](p: *P)
+    val state = p.mask()
+    watch_here(p).armed = false
+    p.stop_watchdog()
+    p.restore(state)
+
+// Watch the task `t` names, which must check in within every `period` of its core's ticks from now on.
+// Watching it again sets a new period and counts from now. Only the owner watches its tasks.
+watch[P: Port](p: *P, t: Task, period: u32) -> Result[unit, TaskError]
+    if period == 0 then panic("skiff: a watched task's period is at least 1 tick")
+    owned(p, t)?
+    val c = here(p)
+    val state = p.mask()
+    val result = c.sched.check(t) match
+        Ok(_) -> watch_here(p).add(t, period, c.own_ticks())
+        Err(e) -> Err(e)
+    p.restore(state)
+    result
+
+// Stop watching the task `t` names: what a watched task does before it ends. Answers whether it was
+// watched.
+unwatch[P: Port](p: *P, t: Task) -> bool
+    val state = p.mask()
+    val result = watch_here(p).remove(t)
+    p.restore(state)
+    result
+
+// The running task checks in. Answers whether it is watched; a task that is not changes nothing.
+check_in[P: Port](p: *P) -> bool
+    val me = current(p)
+    val c = here(p)
+    val w = watch_here(p)
+    val state = p.mask()
+    val result = w.find(me) match
+        Some(i) ->
+            w.tasks[i].seen = c.own_ticks()
+            true
+        None -> false
+    p.restore(state)
+    result
+
+// The running core's supervision, which its tick calls after `tick`: feed the watch and the hardware
+// watchdog if every watched task has checked in within its period, else bite once the watch has gone
+// unfed for its timeout. Answers whether it bit: the caller then stops this core, as after a fault.
+supervise[P: Port](p: *P) -> bool
+    val w = watch_here(p)
+    if !w.armed then return false
+    val now = here(p).own_ticks()
+    val state = p.mask()
+    var late = false
+    if w.reported(now)
+        w.fed = now
+        p.feed_watchdog()
+    else if now -% w.fed > w.timeout
+        late = true
+    p.restore(state)
+    if late then bite(p)
+    late
+
+// How many of the running core's ticks after its tick `now` it may sleep through with its tick stopped
+// (DESIGN "Tickless idle") without its watch's verdict changing unseen: while every watched task stays
+// within its period, until the last tick the watch would still be fed on; once one is overdue, until the
+// last tick before the bite, so that the bite comes from a tick as it always has. `FOREVER` unarmed. No
+// task runs while the core sleeps, so none checks in.
+private[kernel] watch_allows[P: Port](p: *P, now: u32) -> u32
+    val w = watch_here(p)
+    if !w.armed then return FOREVER
+    w.slack(now) match
+        Some(s) -> if s > 0 then return s
+        None -> ()
+    val left = (w.fed +% w.timeout) -% now
+    if i32.wrap(left) <= 0 then 0 else left
+
+// The supervision of `count` of the running core's ticks taken at once after its tick `from`: the watch
+// is fed as it would have been on the last of them that every watched task was still within its period
+// on, and the hardware watchdog with it. It never bites: the sleep ended before a bite was due
+// (`watch_allows`), and a sleep that ran late leaves the bite to the core's next tick.
+private[kernel] supervise_skipped[P: Port](p: *P, from: u32, count: u32)
+    val w = watch_here(p)
+    if !w.armed then return
+    w.slack(from) match
+        Some(s) ->
+            val fed = if s < count then s else count
+            if fed > 0
+                w.fed = from +% fed
+                p.feed_watchdog()
+        None -> ()
+
+// The running core's watch has bitten, or its hardware watchdog has warned: disarm both, so a stopped
+// core never resets the machine, report `watchdog` on the core's console and mark the core stopped in
+// `.shared`. The caller then stops this core; the others run on.
+bite[P: Port](p: *P)
+    val w = watch_here(p)
+    w.armed = false
+    w.bitten = true
+    p.stop_watchdog()
+    fault(p, "watchdog")
+
+// Whether the running core's watch has bitten.
+bitten[P: Port](p: *P) -> bool = watch_here(p).bitten

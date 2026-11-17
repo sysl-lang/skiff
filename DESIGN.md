@@ -41,7 +41,8 @@ Core (private, one per core)          .shared
   `start_first`, `mask`, `restore`, `spin_lock`, `spin_try_lock` and `spin_unlock`; the arch package
   supplies the last eight. `Port` extends **`Doorbell`** (`ring(core)`), which the chip supplies: MHU0
   on the AN521; and **`Cache`** (`clean`, `invalidate`), the running core's data cache, which does
-  nothing on a core without one (see "Channels and the buffer pool"). The idle task's body is the board's (`kernel.run(p, idle_stack, idle)`), since a task
+  nothing on a core without one (see "Channels and the buffer pool"); and **`Watchdog`**, the
+  core's hardware watchdog, if it has one of its own (see "Supervision"). The idle task's body is the board's (`kernel.run(p, idle_stack, idle)`), since a task
   entry takes no port.
 - **One image is built for the weakest core it runs on**: the AN521's core 0 has no FP registers, so its
   image is built for `thumb-freestanding-soft`, and no core of it saves or uses them.
@@ -88,18 +89,27 @@ Core (private, one per core)          .shared
 waiter.
 
 - A task waits on at most one thing at a time, so each task has exactly one **`Waiter`** record, in
-  `.shared` at `waiters[core][slot]`. It holds the handle, the effective priority, a link (the next
-  waiter's index, `core * option_tasks + slot`, not a pointer), the wait's `outcome` (`Idle`,
-  `Waiting`, `Woken`, `Given`, `TimedOut`), its `mode` (what kind of wait it is, as its object reads it:
-  a queue's side, a flags wait's terms) and its `value`: what the wait asks for going in (the bits a
-  flags wait names) and what it carries back (the bits that ended it).
-- A `WaitQueue` is a head index and a count, in the object, ordered by priority and first-come within a
-  priority. Insertion walks the queue (bounded by the number of tasks); waking the best waiter is O(1).
-  The count alone says whether anyone waits, so a zeroed queue is empty. Two objects walk further: a
-  message queue's senders and receivers share its one `WaitQueue`, so a wake takes the best waiter of
-  the side it wants (`first_of(mode)`), walking past the other side, which waits only in the moment
-  between a kept slot or message and its taker running; and a flags set looks at every waiter, since
-  one set may satisfy several.
+  `.shared` at `waiters[core][slot]`. It holds the handle, the effective priority, two links (the
+  previous and next waiter's index, `core * option_tasks + slot`, not a pointer), whether it is queued,
+  the wait's `outcome` (`Idle`, `Waiting`, `Woken`, `Given`, `TimedOut`), its `side` (which of its
+  object's two lists it waits in: a queue's senders or receivers, a stream's writers or readers; every
+  other object uses side 0), its `mode` (the wait's terms as its object reads them: a flags wait's) and
+  its `value`: what the wait asks for going in (the bits a flags wait names) and what it carries back
+  (the bits that ended it).
+- **A `WaitQueue` is built as the ready set is**: for each of two sides, a circular FIFO per priority,
+  linked through the records, and a `u32` bitmap of the priorities whose FIFO has a waiter. A waiter
+  joins at the tail of its side's FIFO for its priority; the best waiter of a side is the head of the
+  FIFO a count-leading-zeros of its bitmap names; a waiter leaves by unlinking itself, clearing its bit
+  if its FIFO empties. **So queueing, waking, a timeout's or a stop's withdrawal and a priority change's
+  re-queueing each take a fixed number of steps under the object's lock, however many tasks wait**, and
+  a two-sided object finds the best waiter of the side it wants (`first_of(side)`) as directly as the
+  best of all (`first`; on a tie of priorities, side 0's). The order is still priority first, first
+  come within a priority, among waiters of every core alike. A head is read only when its bit is set,
+  so a zeroed queue is empty. The price is size: a queue is 140 bytes (two bitmaps, 64 heads of 16
+  bits, a count), in every object and in every task's note, so `.shared` holds
+  `option_cores * option_tasks` of them besides the application's objects. One walk is left, a flags
+  set's, since one set may satisfy every waiter; it takes the lock once per waiter (below, "Event flags:
+  a set walks in steps").
 - An object holds a `Waitable`: its `KernelLock` and its `WaitQueue`. A blocked task's private `Tcb.on`
   names it, which is how a timeout, a priority change or a delete reaches the queue under the lock.
 - A change of a waiter's priority while it waits (inheritance, `set_priority`) re-inserts it, under the
@@ -138,7 +148,9 @@ the object hands itself over, as a semaphore or a mutex does), and releases the 
   every other send and receive, so a woken receiver always has a message and a woken sender always has
   room. Messages leave in the order they came, whichever receiver takes them.
 - **Event flags**: a set ends every wait it satisfies (`Woken`, the bits as the set left them in the
-  record's `value`), and clears the bits the woken waits asked to clear once all have been seen.
+  record's `value`), and clears the bits each woken wait asked to clear as it is woken, judging every
+  waiter by the bits as the set left them, so two waiters for one bit are both woken. It looks at them
+  one per hold of the lock ("Event flags: a set walks in steps").
 - **Task notifications**: each task's note (value, pending mark, `Waitable`) is in `.shared` at
   `notes[core][slot]`, so any core may send to any task. The note names its task by handle: it is
   renewed when a task is created in its slot (before the task can run) and cleared when the task is
@@ -146,7 +158,7 @@ the object hands itself over, as a semaphore or a mutex does), and releases the 
   task waits on its own note; a send wakes it with `Woken`, and it takes the value when it runs.
 - **Stream and message buffers** (`StreamBuffer[N]`, `MessageBuffer[N]`, a byte ring of their own, so
   either in `.shared` carries bytes between cores; a zeroed one is empty with a trigger level of 1):
-  readers and writers share the one `WaitQueue`, marked by mode as a queue's are, and a writer's
+  readers and writers wait on the two sides of the one `WaitQueue`, as a queue's do, and a writer's
   `value` is the room it needs (1 for a stream, the message and its 4-byte length prefix for a
   message). Nothing is kept: a change of bytes wakes the best reader with `Woken` once the trigger
   level is met, and the best writers in order while the room each needs is there (one needing more
@@ -155,6 +167,55 @@ the object hands itself over, as a semaphore or a mutex does), and releases the 
   stream send writes what fits and waits for room for the rest; a receive whose timeout comes first
   takes whatever is there. A message goes in whole or not at all, and one longer than `N - 4`, or
   empty, is refused at once.
+
+### Event flags: a set walks in steps
+
+A flags set is the one wake that cannot be found in a fixed number of steps: one set may satisfy any
+number of waiters, each on its own terms (any or all of the bits it names, clearing them or not), so
+every waiter has to be looked at. **No bound on a set's whole length that does not grow with the waiters
+exists without changing what a set means**, so the bound is put on what matters, the time the core is
+masked: **a set masks its core for one waiter's worth of work at a time, and takes interrupts between.**
+
+- **How the others do it.** Zephyr's `k_event_post` walks every waiter under its spinlock, masked
+  throughout. FreeRTOS's `xEventGroupSetBits` walks with the scheduler suspended and interrupts open,
+  and defers a set from an interrupt to its timer task. ThreadX's `tx_event_flags_set` walks with
+  preemption off, opening interrupts between waiters, restarts the search when a handler set bits
+  meanwhile, and delays a clear that comes during the search. skiff has no scheduler suspension, and on
+  several cores another core may act on the object at any moment, so it takes ThreadX's shape, with the
+  object's lock in place of the open window.
+- **The set, masked once**: under the lock it ORs its bits in and, if anyone waits, begins a walk: it
+  records the bits as they now are as what the walk judges by (`seen`) and flips the side waits join.
+- **A step, masked once each**: under the lock, the best waiter on the side the walk has not passed
+  (`first_of`, the queue's own order) has its wait ended with `Woken` and `seen` if `seen` satisfies it,
+  its clear-on-exit bits cleared at once, or is moved to the other side. With none left the walk ends.
+  The clear is made at the wake, not saved for the walk's end, because the woken task may run before the
+  walk ends (a wake of a higher task switches as the step unmasks): it must find its own bits cleared,
+  or a second wait of its own would be answered by the same set. A step is a lock acquisition, a count-leading-zeros, and either a wake (with a
+  post to another core's inbox) or an unlink and a link; it does not depend on how many wait.
+- **The sides swap with every walk.** Flags use only one side of their `WaitQueue` at a time; the walk
+  moves the waiters it passes to the other, and a wait begun during a walk joins that other side. So a
+  walk needs no cursor that a timeout, a stop or a priority change could pull out from under it (they
+  unlink a waiter wherever it is), it looks only at the waiters that were waiting when its set came, and
+  it ends.
+- **Whoever sets, walks.** The set's caller steps until no walk is under way. A set that finds a walk
+  under way ORs its bits in, keeps them from that walk's clearing (`kept`), asks for another walk (begun
+  as this one ends, over every waiter then waiting, judged by the bits then), and steps too: the walk is
+  the object's, and any caller may take the next step. So a set returns only once every wait it
+  satisfies has ended, a set from a higher task or another core is never left behind a walker that was
+  preempted, and a set from an interrupt handler finishes the walk itself.
+- **What another caller sees during a walk.** A read, a clear or a wait sees the bits as they stand:
+  the clear-on-exit bits of the waiters woken so far are cleared, those of the waiters the walk has yet
+  to reach are not. That is the one thing a set is no longer atomic in. A clear during a walk takes effect after the set: the walk still judges by `seen`, and wakes
+  the waiters the set satisfied. A wait during a walk that is satisfied at once is answered at once; one
+  that waits is not looked at by that walk.
+- **Order.** Within one walk the waiters are taken best first, as from any queue. A waiter the walk
+  passes goes to the tail of its priority on the other side, behind any of its priority that began
+  waiting during the walk; since a set wakes every waiter it satisfies whatever their order, this changes
+  only which of one set's wakes is made first.
+- **The bound.** Masked, per lock acquisition: a constant number of instructions plus the chip lock's
+  wait, at most `cores - 1` holders ahead, each also holding for a constant (every other user of the
+  object's lock holds it for a constant now too). Unmasked, a set's whole length is one step per waiter
+  per walk, and one walk more for each set made during it.
 
 ### Timeouts race with wakes, and the outcome decides
 
@@ -186,10 +247,32 @@ wake can find it.
 - **Each object holds its own lock**: a `KernelLock`, chosen by the build. With one core it masks the
   core's kernel interrupts through the port and does nothing more; the spin is not in the image. With
   several it masks them and then spins on the chip's lock through the port (`spin_lock`,
-  `spin_try_lock`, `spin_unlock` on the lock's word): LDREX/STREX on Armv7-M and Armv8-M (an atomic
-  exchange, which compiles to the pair, in `arch/armv7m`), the SIO spinlocks on an RP2040 (whose M0+ has
+  `spin_try_lock`, `spin_unlock` on the lock's word): a ticket lock on Armv7-M and Armv8-M (below; its
+  atomic add and compare-and-swap compile to LDREX/STREX), the SIO spinlocks on an RP2040 (whose M0+ has
   no exclusives; sysl refuses an atomic read-modify-write there), HSEM on the STM32H7. The kernel names
   no instruction.
+- **Where the chip has exclusives, the chip lock is a ticket lock, because it must be fair.** A
+  test-and-set lock (what the first port had: an atomic exchange of 1) lets the core that just let it go
+  take it again before a waiting core's exchange lands, so with two or more cores one can starve
+  another for as long as it keeps asking. A ticket lock serves cores in the order they asked: a core
+  waits for at most `cores - 1` holders ahead of it, each holding for a few instructions. It is its own
+  package, `arch/ticket` (`lock`, `try_lock`, `unlock`, over `sysl.sync.Atomic` and nothing else), so
+  its host tests run the code the boards run, and `arch/armv7m`'s port members call it. It is not in the
+  kernel: the kernel is built for thumbv6m too, which refuses an atomic add or compare-and-swap even in
+  a function nothing calls.
+- **The ticket lock is the lock's one word**: the high half is the next ticket to hand out, the low half
+  the ticket now served; equal halves are free, so zero is a free lock and `.shared`'s zeroing makes
+  every lock in it free. Taking is an atomic add of `0x1_0000` (relaxed: it orders nothing), whose
+  answer's high half is the core's ticket, then a spin on an acquiring load until the low half equals
+  it. A try succeeds only on a free word, by compare-and-swap from (n, n) to (n + 1, n) with acquire: it
+  never jumps a waiter. Releasing serves the next ticket with release ordering.
+- **Each half wraps modulo 2^16 on its own.** The high half wrapping is the add's carry out of the word,
+  which drops it. The low half must not carry: an add of 1 to the whole word when the low half is 0xffff
+  would also advance the next ticket, handing out a ticket nobody holds, and every core would then wait
+  for ever behind it. So the release is a compare-and-swap loop that rewrites the low half alone
+  (`(w & 0xffff_0000) | ((w + 1) & 0xffff)`), retrying when another core took a ticket meanwhile. Only
+  the holder writes the low half, so the loop retries only for tickets taken, at most `cores - 1` times.
+  A busy lock passes the wrap often: the AN521's hammers take one lock 600,000 times.
 - **The single-core lock is not `sysl.sync.IrqLock`**, as this file first said: `IrqLock` masks
   everything through PRIMASK, where the kernel's mask is BASEPRI and leaves the interrupts above it
   alone, and a program reaching it on any machine but a Cortex-M is refused, which would refuse the
@@ -229,7 +312,7 @@ wake can find it.
   and applies it to its own scheduler, then asks for one switch if anything now outranks the running
   task. The chip clears the doorbell before the drain, so a message posted while it drains rings again.
   The poster makes its writes visible before it rings (a `dsb` before the AN521's MHU write).
-- Messages: `Wake(task)`, `Hand(task, priority)`, `Boost(task, priority, mutex)`, `Control(slot)`.
+- Messages: `Wake(task)`, `Hand(task, priority, mutex)`, `Boost(task, priority, mutex)`, `Control(slot)`.
 
 ## Mutexes across cores
 
@@ -245,12 +328,52 @@ wake can find it.
 - The locker raises a same-core owner after releasing the mutex's lock but before unmasking its core, so
   the raise never holds two object locks (a blocked owner's re-insertion takes the other object's).
 - An unlock hands the mutex to the best waiter (`Given`), and the new owner inherits at once from the
-  best of those still waiting. A new owner on another core is told by `Hand(task, priority)`: its core
+  best of those still waiting. A new owner on another core is told by `Hand(task, priority, mutex)`: its core
   counts the mutex in `Tcb.held`, raises the task to `priority` if that is higher, and makes it ready.
   The unlocking core never touches the new owner's `Tcb`.
 - **What a task inherits is kept apart from its base**, as its boost: the highest priority a waiter lent
   it while it holds a mutex, recorded whether or not it raises the task (a waiter below a high base
   still lends). The task runs at the higher of base and boost; the boost goes when it holds no mutex.
+
+### Recursive and ceiling mutexes
+
+Two options, fixed at creation: `Mutex.new(name)` (neither), `Mutex.recursive(name)`,
+`Mutex.with_ceiling(name, c)` and `Mutex.recursive_with_ceiling(name, c)`, all `const`. Each is plain
+data (`locks: u16`, `ceiling: u8`, `reentrant: bool` beside the owner), zero is a free plain mutex, and
+none holds a pointer, so any of them may lie in `.shared`. `lock(p, timeout) -> bool` is as before;
+`enter(p, timeout) -> Result[unit, MutexError]` is the same lock saying why it was refused:
+`Unavailable` (timeout 0, timed out, or the wait ended otherwise), `Ceiling`, `Depth`.
+
+- **Recursive.** The holder may lock it again; the mutex counts the locks (`locks`, `depth()`), and the
+  holder keeps it until it has unlocked once for each. A lock past `MAX_LOCKS` (65 535) is refused with
+  `Depth`, the count unchanged: a refusal, not a panic. It counts once in `Tcb.held`, at the first lock
+  and the last unlock, so a boost is dropped only at the last unlock of the last mutex. Unlocking once
+  more than it was locked finds the mutex free or another's, which is an unlock by a non-holder: the
+  same panic as on a plain mutex. A plain mutex locked again by its holder still panics.
+- **Hand-over hands the whole mutex.** The last unlock gives it to the best waiter locked once (`locks`
+  = 1), on its core or another: the count is the mutex's, reset by the unlocker under the mutex's lock,
+  so a `Hand` carries nothing of it.
+- **Immediate priority ceiling** (OSEK/AUTOSAR's resource priority, POSIX `PTHREAD_PRIO_PROTECT`). A
+  mutex of ceiling c raises its holder to c at least from the moment it holds it, by a lock or by a
+  hand-over, until it lets it go. A lock by a task whose **base** priority is above c is refused with
+  `Ceiling`, before anything is touched; so is every lock of a ceiling outside 1 to 31. The check reads
+  the base, not the effective priority: a boost or another ceiling is transient, and a refusal that
+  depends on timing is no configuration check. `set_priority` may raise a holder's base above a ceiling
+  it holds; it then runs at its base, and its next lock of that mutex is refused.
+- **The effective priority is the highest of the base, the boost, and the ceilings of every mutex held.**
+  `Tcb.ceilings[c]` counts the mutexes of ceiling c the task holds and `Tcb.ceiling_bits` has bit c set
+  while that count is not 0, so the top ceiling is one count of leading zeros, and an unlock in any order
+  takes away exactly its own ceiling: a task holding ceilings 5, 3 and 5 runs at 5 until both 5s are
+  gone. A recursive mutex's ceiling counts once. A boost is unchanged by ceilings: kept until the task
+  holds no mutex, as above.
+- **Across cores the ceiling applies on the holder's own core only.** The holder's core counts it, at the
+  lock or, for a hand-over to another core, when it applies the `Hand`, which now names the mutex (as
+  `Boost` does) so that core reads the ceiling, fixed since creation, without the mutex's lock. A waiter
+  of another core blocks and lends by `Boost` as on any mutex. There are no remote ceilings: a task of
+  core 1 holding a mutex does not run at a ceiling on core 0, and the ceiling does not bound how long a
+  task of another core waits (MPCP-style global ceilings, which raise the holder above every local
+  priority, are out of scope). With one core and a holder that never blocks while holding, a task that
+  might lock the mutex never runs while it is held, so no task waits on it.
 
 ## Task control
 
@@ -410,12 +533,92 @@ handing over a buffer, never by copying it. A **pool** holds the buffers; a **ch
 
 ## Time
 
-- **One time base**: `ticks()` is a single counter in `.shared`, advanced by core 0's tick. Every core
-  ticks its own scheduler at the same rate (time slices, its timeout list) and compares deadlines with
-  that one counter, so a timeout means the same on every core.
+- **One time base**: `ticks()` is a single counter in `.shared`. Every core ticks its own scheduler at
+  the same rate (time slices, its timeout list) and compares deadlines with that one counter, so a
+  timeout means the same on every core: a deadline computed on one core and checked on another is the
+  same instant, and every core reads the same `ticks()` at once.
+- **Any core's tick may advance it; no core's tick must.** A core remembers the time base as its last
+  tick left it (`Core.time_seen`). On a tick, if the time base still reads that, no core has advanced it
+  since, and this tick is the period's first: the core advances it by one. If the time base has moved,
+  another core took this period, and the core only records what it now reads. With several cores the
+  read and the advance are made holding a spin word beside the counter in `.shared`, taken with the
+  port's `spin_try_lock`, not a compare-and-swap: a thumbv6m core has none, and a port that has only
+  a hardware lock (the RP2040's SIO) supplies the try. A core that finds the word held only counts
+  its tick: the holder is taking the period. So:
+  - time advances while any core ticks: a core alone advances it on every tick after its first;
+  - cores ticking together advance it once a period, not once each, in whatever order their ticks land;
+  - it only ever moves forward by one, so it is monotonic, and every core reads the one counter;
+  - a tick does one try, one load and at most one store, and never waits for another core.
+- **What it costs**: time runs at the rate of the fastest-ticking live core, which is the tick rate,
+  since every core ticks at `tick_hz`. A core stopped, masked, or stalled for a while takes nothing
+  from it; its first tick after resynchronizes. On hardware a tick held off is merged into the one
+  pending bit, never delivered late, so a lagging core's count is lost, not owed, and resynchronizing is
+  right. Under QEMU's multi-threaded TCG a core's ticks can come late and in a bunch; the bunch then
+  advances time by up to its length minus one ahead of the clock, never backwards.
+- **Why not the alternatives.** *Core 0 alone* (the rule before) stops time for every core when core 0
+  stops, stalls or masks for long. *The largest of the cores' own counts* never double counts, but a core
+  that lost ticks lags for good, so once the leader stops, time stands still for as long as the survivor
+  is behind, and that lag grows with every masked stretch. *A counter every core reads* needs one on
+  every chip (the AN521's timers are per core; `RunCounter` is per core by design), its rate, and the
+  register in the chip, and is what tickless idle brings anyway.
 - A deadline is `i32.wrap(deadline -% now) <= 0`, so the counter may wrap.
-- Tickless idle (milestone 10) replaces the periodic tick with a one-shot wake at the next deadline; the
-  counter then comes from a hardware timer every core can read.
+- **A core may take several ticks at once**: one that slept through `n` periods with its tick stopped
+  (below, "Tickless idle") brings the time base to `n` past where its last tick left it, unless other
+  cores have moved it that far or further since, and records where it is. The rule above is the case
+  `n = 1`: "no core has advanced it since" is "it has moved less than one". Taking `n` waits for the spin
+  word (`spin_lock`) rather than trying it, since the holder is only taking one period of the `n`, and
+  holds it for a load and a store. So a sleeping core does not slow the time base while another ticks
+  (that core advances it every period it finds unmoved), a waking core adds only the periods nobody took
+  while it slept, and with every core asleep the first to wake brings it on by its whole sleep. The time
+  base still never moves back: a view far behind (a core that was stopped) has seen it move more than
+  `n`, and only records.
+
+## Tickless idle
+
+A core with nothing to run but its idle task stops its periodic tick and sleeps until the next thing
+that needs it, then takes every tick it slept through at once. `kernel/skiff/kernel/tickless.sysl` is the
+kernel's side; the port's is two members of `Port` with defaults.
+
+- **The port**: `tickless_limit()`, the most ticks one sleep can span (default 0), and
+  `sleep_ticks(count)`, called with the kernel's interrupts masked: stop the tick, sleep until `count`
+  ticks after the last one or until any interrupt is pending, restart the tick in step with its old
+  period, and answer how many periods ended meanwhile. Their tick interrupts are never delivered; a tick
+  already pending answers 0 and stays pending. **A port that implements neither keeps today's behaviour**:
+  a limit under 2 makes the idle step `p.idle()`, a sleep to the next tick.
+- **The idle task's body is `loop kernel.rest(p)`**. `rest` masks, asks how far the core may sleep
+  (`skippable`), and sleeps only if that is 2 ticks or more: its running task is the idle task, nothing
+  above priority 0 is ready, no expired wait is waiting to be ended, and the core is not stopped. The
+  sleep is the fewest of the port's limit, the ticks to the head of the core's timeout list (every sleep
+  and every timed wait, the timer service's wait for its soonest expiry and the work service's among
+  them, so a software timer bounds it with no list of its own), and what the watch allows (below).
+- **On waking it takes the ticks that passed, `n`, in one step** (`take_ticks`, the tick's own path with
+  a count): the core's own count moves by `n`, the time base as "Time" says, the running task (the idle
+  task) is charged the counter's difference, and the timeout list expires everything due at the new time,
+  in deadline order. Then the mask is restored, the waits that expired are ended under their objects'
+  locks as after any tick, and the interrupt that woke the core, if any, is taken. An interrupt that
+  woke it early (a doorbell, a device) gets exactly the periods that ended before it, never the whole
+  sleep; the next idle step sleeps the rest.
+- **The watch** (DESIGN "Supervision") counts the core's own ticks, and no task checks in while the core
+  sleeps. So a sleep lasts no longer than its verdict could stay unchanged: while every watched task is
+  still within its period, until the last tick it would be fed on; once one is overdue, until the last
+  tick before the bite, so the bite still comes from a real tick on the tick it always would. Waking, it
+  is fed as of the last tick in the sleep on which every watched task was still within its period, and
+  the hardware stage with it, which is started at twice the timeout and so outlasts any such sleep.
+- **What is exact**: own ticks, the time base on a core alone, every deadline's tick, a timer's due tick,
+  the watch's feeding and its bite, and the idle task's run time. **What is not**: the tick's phase after
+  a sleep moves by the few cycles the port spends with the counter stopped; a wake later than the port
+  can measure (QEMU stalling a core longer than the counter's span) loses the periods past it, as a tick
+  held off under a mask loses them today.
+- **Armv7-M** (`arch/armv7m/systick.sysl`): SysTick's reload is set to what remains of the current period
+  plus `count - 1` whole ones, then WFI with PRIMASK set and BASEPRI open, so any enabled interrupt wakes
+  the core (BASEPRI would keep the kernel's own from waking it) but none is taken until the kernel has
+  taken the ticks. On waking, the cycles slept (the counter, and COUNTFLAG for one reload past the wake)
+  give the periods ended and how far into the next the core is; SysTick's pending bit is cleared if a
+  period ended, the counter is reloaded with the cycles left of the current period, and the reload is set
+  back to the period once that is loaded. A restart under 64 cycles takes that tick early instead. The
+  limit is the periods that fit the 24-bit counter, less one: 66 at 25 MHz and 100 Hz, 82 at 20 MHz.
+- **Several cores**: each sleeps on its own; nothing is shared but the time base. A remote wake reaches a
+  sleeping core as any message does, through its inbox and doorbell, which ends the sleep early.
 
 ## Software timers
 
@@ -450,6 +653,22 @@ A software timer calls a function once a period has passed (one-shot), or every 
   running task being the one that called the callback; an interrupt handler arriving during the callback
   is indistinguishable from it and is carried out at once too, which is safe because the list is settled
   while a callback runs. One arriving while the service carries out a command of its own is queued.
+- **Carrying out a command costs the same however many timers are active; only the service task walks
+  the list, unmasked.** The list is linked both ways, so a stop or a restart takes the timer out in
+  constant time, and a started timer is appended to the service's *pending* timers with the tick its
+  expiry counts from. The service moves the pending timers into the list, oldest first, before each
+  timer due is taken (`settle`): so equal expiries still keep the order they were started in, and a
+  callback's start is in the list before the next timer due is taken. This matters because a command
+  carried out at once may be an interrupt handler's arriving during a callback: before, its sorted
+  insert walked the list inside the handler, which grows with the timers. Now, in a handler, under the
+  mask or under a lock, a command costs one queue operation and at most `timer_commands + 1` constant
+  carries-out (the queued ones, then its own), whatever the number of timers. The sorted insert is
+  O(active timers), in the service task, unmasked and preemptible by every interrupt and higher task,
+  holding no lock; a turn that expires k timers is O(k) callbacks and O(k × active) insert steps, which
+  only the service's own priority pays for. A timing wheel would make the insert constant too, but costs
+  a bucket array per core and a scan or spurious wakes to find the soonest expiry, and an overdue start
+  (a command taken after its expiry) would still need a sorted place; the walk is not where a bound
+  matters, since nothing waits on it but the service.
 - **The service waits through the one `WaitQueue`**: it receives on its command queue with a timeout of
   the ticks to the soonest expiry (`FOREVER` with none active), so a command wakes it as any send wakes
   a receiver, and the expiry is the wait's timeout ending on the owner's tick. A turn is: carry out every
@@ -461,6 +680,38 @@ A software timer calls a function once a period has passed (one-shot), or every 
   or queue, which is the same hop an inbox message would make. Reading `owner` from another core is a
   read of the owner's memory, written once at creation; on a core whose cache could hold a stale zero
   the answer is `NotCreated` instead of `Remote`, never an action.
+
+## Deferred work
+
+An interrupt handler hands a function and an argument to a task of its core, which calls it in task
+context, so the handler stays short: FreeRTOS's pended function calls, Zephyr's work queues.
+
+- **A `Work` is a plain struct the application declares**, as a `Timer` is; its zero is work not yet
+  created. `create_work(p, &w, name, callback)` creates it **on the running core, which owns it from then
+  on**; a second creation is refused (`Created`). A callback is `*extern(*Work, u32)`: the work and the
+  argument of the post, for the same reason a timer's is (a stored code address is a C one, and a closure
+  needs a heap). Work has no handle, so it cannot go stale; work never created is refused (`NotCreated`).
+- **Each core has a work service**: a `Queue[WorkItem, work_items]` (option, default 8) private to the
+  core, an item being the work and its argument. The board creates the service task on each core that
+  uses deferred work, at a priority it chooses, with the body `kernel.serve_work(p)`. **Callbacks run in
+  that task**, one at a time: never in the handler, and never on another core.
+- **`defer_work(p, &w, argument)` never waits**, from a handler or a task. A full queue refuses the post
+  (`Full`) and counts it (`deferred_refused(p)`, per core, wrapping); it never overwrites, so the items
+  already queued are kept and still run.
+- **Order is FIFO per core**: items run in the order their posts were accepted on that core, whoever
+  posted them. A post from a callback goes behind every item already queued. There is no order between
+  cores, since each core's items are its own.
+- **How long a post masks**: the queue's send, which is the queue's lock (the mask, and the spin word with
+  several cores, which no other core ever holds for this queue), a copy of two words, and, when the
+  service waits, the end of that one waiter's wait and a switch asked. The service is the queue's only
+  receiver, so its wait queue holds one waiter at most and the wake looks at one record. No loop over the
+  items, so the masked part of a post is O(1) and does not grow with `work_items`. The refusal count is
+  one more masked increment.
+- **The service waits through the one `WaitQueue`**: it receives on its queue with `FOREVER`, so a post
+  wakes it as any send wakes a receiver, and an item is kept for it until it runs.
+- **Only the owner posts its work; another core is refused (`Remote`)**, touching nothing, for the reason
+  a timer command is: the queue is the owner's private state, and the inbox carries only wakes, boosts and
+  task control. A handler that needs another core's work done notifies a task of that core.
 
 ## Placement, checked
 
@@ -692,6 +943,49 @@ overwrite the other's, and behind the MPU an unprivileged task cannot read the k
 `map_regions` (usize, default 6, [2, 16]): regions in an unprivileged task's map, its stack among
 them. `grants` (usize, default 4, [0, 32]): objects one task may be granted.
 
+## Supervision
+
+A core that stops making progress is noticed and reported on its own console, and the other cores run
+on, as after a fault. `kernel/skiff/kernel/watchdog.sysl` is the kernel's side.
+
+- **A watch per core, in the core's private memory.** It holds the tasks the core watches (`watch(p, t,
+  period)`, its own tasks only, `option_watched` of them, default 4), the tick each last checked in on
+  (`check_in(p)`, by the running task), its timeout (`arm_watchdog(p, timeout)`) and the tick it was last
+  fed on. Every count is of the core's **own** ticks, so a core whose ticks come late (QEMU's AN521 core
+  1, under load) is judged by the ticks it took, never by another core's.
+- **The core's tick feeds it, and only when every watched task has checked in within its period.** The
+  board's tick handler calls `supervise(p)` after `tick`. No supervision task: it would need the highest
+  priority, and its own liveness would rest on the tick anyway; in the tick the check costs one pass over
+  the watched tasks under the core's mask, no stack, and proves both that the tick runs and that each
+  watched task does. A watch unfed for its timeout **bites**: `bite(p)` stops the hardware stage (below),
+  reports through the fault path (`fault(p, "watchdog")`: `skiff: core <n> fault watchdog`, the core
+  marked stopped in `.shared`), and `supervise` answers true, on which the board stops the core as its
+  fault handler would: `stop_core` on the AN521, the machine's halt on a one-core board. Only the owner
+  touches its watch, so no core can feed another's, and a stopped core's verdict changes nothing of the
+  others'.
+- **The hardware watchdog is the second stage** (the port's `Watchdog`: `start_watchdog(ticks)`,
+  `feed_watchdog`, `stop_watchdog`), started at `HARDWARE_STAGE` (2) times the timeout and fed with the
+  watch. It is what notices a core whose tick no longer runs (its interrupts masked for good, a lockup),
+  which no software watch can. Its warning reaches the board, which calls `bite` too; its reset, the
+  chip's, is for when even the warning cannot run. A bite stops it, so a core stopped by its verdict never
+  resets the machine.
+- **What QEMU models.** The MPS2 (AN500, AN386): one CMSDK APB watchdog at 0x4000_8000 (25 MHz), its
+  interrupt wired to the core's NMI; at a second expiry with the interrupt standing, with RESEN, it
+  resets. One core, so it is that core's own: the board arms it, and the NMI (`skiff_nmi`, now the arch's
+  NMI vector) reports `watchdog` and halts. The AN521 (SSE-200): three CMSDK watchdogs, the S32K one
+  (0x5002_E000, 32 kHz) and the secure one (0x5008_1000, 20 MHz) both through an OR gate to **CPU 0's NMI
+  alone**, and the non-secure one (0x4008_1000, 20 MHz) on interrupt 1, which a splitter delivers to
+  **both** cores. None is a core's own, so the AN521's cores have no hardware stage yet: each core's watch
+  is the kernel's, checked on its own SysTick (which each M33 has). A hardware stage there would give
+  core 0 the secure watchdog's NMI and core 1 the non-secure one's interrupt 1, enabled in core 1's NVIC
+  alone above the kernel's mask (it would see a core 1 masked by BASEPRI, not by PRIMASK), with either
+  reset machine-wide.
+- **Scenarios**: R's last on each core (`boards/scenarios/.../watchdog.sysl`): period 20, timeout 50, 60
+  healthy ticks. On the MPS2 the hang masks the kernel's interrupts, so only the NMI sees it, and the run
+  ends with `WATCHDOG_STATUS` (98). On the AN521 core 1's hang spins unmasked above its watched task, and
+  its watch bites from its tick; core 0's watch stays fed while it waits to see core 1 stopped. This
+  replaces the BusFault that ended core 1 before.
+
 ## Open questions
 
 - **32 priorities, settled with no option.** The bitmap is one `u32` and the FIFOs cost two `u16` a
@@ -700,5 +994,5 @@ them. `grants` (usize, default 4, [0, 32]): objects one task may be granted.
   control data that must not be cached where two cores use them; its buffers may be. With `.shared`
   uncached they share it; a board that caches the buffers will need the pool's storage in a region of
   its own. Settled with the H747I (milestone 9).
-- **The H7's time base** in a two-image build: core 0's tick counter in `.shared` works; a shared
-  hardware timer may be better.
+- **The H7's time base** in a two-image build: the shared tick counter in `.shared` works (either core
+  advances it, "Time"); a shared hardware timer may be better.

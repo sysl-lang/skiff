@@ -1,0 +1,129 @@
+module skiff.kernel
+@tests
+
+// Deferred work on the host, over the recording port (kernel_tests.sysl). A post with no task running is
+// what an interrupt handler's post is. A test plays the service a turn at a time (`work_turn`), or blocks
+// a real service task in `serve_work_once` and does what it does when woken; every callback records the
+// work it was called for and its argument.
+
+private var works: [4]Work
+private var called_works: [16]*Work
+private var called_arguments: [16]u32
+private var calls: usize = 0
+
+private record(w: *Work, argument: u32)
+    called_works[calls] = w
+    called_arguments[calls] = argument
+    calls += 1
+
+// Work `i`, created on the running core, calling `record`.
+private make(r: *Recorder, i: usize) -> *Work
+    assert(create_work(r, &works[i], "w", &record).is_ok(), "created")
+    &works[i]
+
+// Whether the calls so far were for `called`, with `arguments`, in that order.
+private were(called: []const *Work, arguments: []const u32) -> bool
+    if calls != called.len then return false
+    for i in 0..<calls
+        if called_works[i] != called[i] || called_arguments[i] != arguments[i] then return false
+    true
+
+private serving() -> never
+    loop
+        ()
+
+private var serving_stacks: [2][128]u32
+
+@test("work an interrupt posts runs only when the service turns, in the order it was posted, with its arguments")
+work_posted_in_order()
+    var r = recorder(1, 0)
+    val a = make(&r, 0)
+    val b = make(&r, 1)
+    assert(defer_work(&r, a, 1).is_ok(), "posted")
+    assert(defer_work(&r, b, 2).is_ok(), "posted")
+    assert(defer_work(&r, a, 3).is_ok(), "posted")
+    assert_eq(calls, 0)
+    assert_eq(deferred_waiting(&r), 3)
+    assert_eq(work_turn(&r), 3)
+    assert(were([a, b, a], [1, 2, 3]), "oldest first")
+    assert_eq(deferred_waiting(&r), 0)
+    assert_eq(work_turn(&r), 0)
+    assert_eq(r.masked, 0)
+
+@test("a post to a full queue is refused and counted, and the items already queued are kept as they were")
+work_full_queue_refused()
+    var r = recorder(1, 0)
+    val w = make(&r, 0)
+    for i in 0..<option_work_items
+        assert(defer_work(&r, w, u32(i)).is_ok(), "room")
+    assert_eq(deferred_refused(&r), 0)
+    assert(defer_work(&r, w, 100) == Err(WorkError.Full), "full")
+    assert(defer_work(&r, w, 101) == Err(WorkError.Full), "still full")
+    assert_eq(deferred_refused(&r), 2)
+    assert_eq(work_turn(&r), u32(option_work_items))
+    for i in 0..<calls
+        assert_eq(called_arguments[i], u32(i))
+    assert(defer_work(&r, w, 7).is_ok(), "room again")
+    assert_eq(deferred_refused(&r), 2)
+    assert_eq(r.masked, 0)
+
+// The port the posting callback posts through, set by the test: module storage, since the callback
+// reaches it after the test's own frame has handed it on.
+private var posting: Recorder
+private var port: *Recorder = null
+
+// Record, then post the work again with one more, up to 3.
+private again(w: *Work, argument: u32)
+    record(w, argument)
+    if argument < 3 then assert(defer_work(port, w, argument + 1).is_ok(), "posted from its callback")
+
+@test("work posted from a callback runs after every item queued before it")
+work_posted_from_callback()
+    posting = recorder(1, 0)
+    port = &posting
+    assert(create_work(port, &works[0], "again", &again).is_ok(), "created")
+    val a = &works[0]
+    val b = make(port, 1)
+    assert(defer_work(port, a, 1).is_ok(), "posted")
+    assert(defer_work(port, b, 10).is_ok(), "posted")
+    assert_eq(work_turn(port), 4)
+    assert(were([a, b, a, a], [1, 10, 2, 3]), "each repost behind what was queued")
+
+@test("work is refused every post before it is created, and a second creation")
+work_refusals()
+    var r = recorder(1, 0)
+    assert(works[0].core() == None, "not created")
+    assert(defer_work(&r, &works[0], 1) == Err(WorkError.NotCreated), "post")
+    assert_eq(deferred_waiting(&r), 0)
+    assert_eq(deferred_refused(&r), 0)
+    val w = make(&r, 0)
+    assert(w.core() == Some(0), "core 0's")
+    assert(create_work(&r, w, "w", &again) == Err(WorkError.Created), "created once")
+    assert(w.callback == &record, "the first creation stands")
+    assert_eq(r.masked, 0)
+
+@test("the service waits on its items through their wait queue while there are none, and a post wakes it")
+work_service_waits()
+    var r = recorder(1, 0)
+    val service = create(&r, 0, serving_stacks[0], &serving, 3).unwrap()
+    val _ = create(&r, 0, serving_stacks[1], &serving, 1).unwrap()
+    here(&r).sched.first()
+    val w = make(&r, 0)
+    serve_work_once(&r)
+    assert(state(&r, service) == Ok(TaskState.Blocked), "waiting")
+    assert_eq(work_here(&r).items.w.queue.count, 1)
+    val _ = switch_context(&r, 0)
+    for _ in 0..<5
+        tick(&r)
+    assert(state(&r, service) == Ok(TaskState.Blocked), "still waiting: forever")
+    val before = r.switches
+    assert(defer_work(&r, w, 42).is_ok(), "posted")
+    assert_eq(calls, 0)
+    assert(state(&r, service) == Ok(TaskState.Ready), "woken by the post")
+    assert(waiter(waiter_index(0, service.slot())).outcome == Outcome.Given, "given the item")
+    assert(r.switches > before, "and the switch to it asked, since it outranks the running task")
+    val _ = switch_context(&r, 0)
+    assert(current(&r) == service, "the service runs")
+    run_item(work_here(&r).items.take_kept(&r))
+    assert(were([w], [42]), "and calls the work")
+    assert_eq(deferred_waiting(&r), 0)

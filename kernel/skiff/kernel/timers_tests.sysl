@@ -167,6 +167,8 @@ late_turn_interleaves()
 across_the_wrap()
     var r = recorder(1, 0)
     time_base().store(0xffff_fffe, Ordering.Relaxed)
+    // The core saw it there, so its next tick advances it rather than taking it as another core's.
+    here(&r).time_seen = 0xffff_fffe
     val y = make(&r, 0, 3, true)
     val x = make(&r, 1, 1, false)
     assert(y.start(&r, 0).is_ok(), "y, due on 1 after the wrap")
@@ -376,3 +378,133 @@ outside_callback_queues()
     assert(t.is_active(r) == Ok(true), "still active: the service has not taken it")
     turn_at(r, 10)
     assert_eq(calls, 0)
+
+// The service's list, front to back, in `listed`, checking on the way that each timer's `prev` names the
+// one before it and that none is pending; answers its length.
+private var listed: [8]*Timer
+
+private list_of(s: *TimerService) -> usize
+    var n: usize = 0
+    var before: *Timer = null
+    var at = s.head
+    while at != null
+        assert(at.prev == before, "linked back to the one before")
+        assert(!at.pending, "in the list, not pending")
+        listed[n] = at
+        n += 1
+        before = at
+        at = at.next
+    n
+
+// Whether the service's list holds `expected`, front to back, linked both ways.
+private lists(s: *TimerService, expected: []const *Timer) -> bool
+    val n = list_of(s)
+    if n != expected.len then return false
+    for i in 0..<n
+        if listed[i] != expected[i] then return false
+    true
+
+@test("many active timers with interleaved expiries are listed and called in deadline order, equal ones in start order")
+many_interleaved()
+    var r = recorder(1, 0)
+    val periods: [8]u32 = [7, 3, 5, 3, 8, 1, 6, 4]
+    for i in 0..<8
+        assert(make(&r, i, periods[i], false).start(&r, 0).is_ok(), "started")
+    turn_at(&r, 0)
+    assert(lists(timers_here(&r), [&timers[5], &timers[1], &timers[3], &timers[7], &timers[2], &timers[6], &timers[0], &timers[4]]), "by expiry")
+    turn_at(&r, 8)
+    assert(were([&timers[5], &timers[1], &timers[3], &timers[7], &timers[2], &timers[6], &timers[0], &timers[4]], [1, 3, 3, 4, 5, 6, 7, 8]), "soonest first")
+    assert(timers_here(&r).head == null, "none left")
+    assert_eq(r.masked, 0)
+
+@test("equal expiries started by commands the service takes together keep the order they were sent in")
+equal_expiries_sent_order()
+    var r = recorder(1, 0)
+    val a = make(&r, 0, 6, false)
+    val b = make(&r, 1, 4, false)
+    val c = make(&r, 2, 2, false)
+    assert(a.start(&r, 0).is_ok(), "a, due on 6")
+    advance_to(&r, 2)
+    assert(b.start(&r, 0).is_ok(), "b, due on 6")
+    advance_to(&r, 4)
+    assert(c.start(&r, 0).is_ok(), "c, due on 6")
+    turn_at(&r, 4)
+    assert(lists(timers_here(&r), [a, b, c]), "in the order sent")
+    turn_at(&r, 6)
+    assert(were([a, b, c], [6, 6, 6]), "called in that order")
+
+@test("a late turn of several periodic timers puts each back behind every timer due no later")
+bunched_several()
+    var r = recorder(1, 0)
+    val a = make(&r, 0, 3, true)
+    val b = make(&r, 1, 4, true)
+    assert(a.start(&r, 0).is_ok(), "a")
+    assert(b.start(&r, 0).is_ok(), "b")
+    turn_at(&r, 0)
+    turn_at(&r, 12)
+    assert(were([a, b, a, b, a, b, a], [3, 4, 6, 8, 9, 12, 12]), "b's 12 was put back before a's")
+    assert(lists(timers_here(&r), [a, b]), "a due on 15, b on 16")
+
+@test("a stop, a reset and a change of period in the middle of the list leave the rest linked and in order")
+middle_of_the_list()
+    var r = recorder(1, 0)
+    for i in 0..<5
+        assert(make(&r, i, u32(2 * i + 2), false).start(&r, 0).is_ok(), "started")
+    turn_at(&r, 0)
+    val s = timers_here(&r)
+    assert(lists(s, [&timers[0], &timers[1], &timers[2], &timers[3], &timers[4]]), "due on 2, 4, 6, 8, 10")
+    advance_to(&r, 1)
+    assert(timers[2].stop(&r, 0).is_ok(), "the middle one stopped")
+    assert(timers[1].reset(&r, 0).is_ok(), "the second reset, due on 5")
+    assert(timers[3].change_period(&r, 1, 0).is_ok(), "the fourth changed, due on 2")
+    turn_at(&r, 1)
+    assert(lists(s, [&timers[0], &timers[3], &timers[1], &timers[4]]), "re-sorted, the stopped one gone")
+    assert(timers[2].is_active(&r) == Ok(false), "stopped")
+    turn_at(&r, 10)
+    assert(were([&timers[0], &timers[3], &timers[1], &timers[4]], [2, 2, 5, 10]), "in deadline order")
+    assert(s.head == null && s.pending == null, "both lists empty")
+
+@test("the list keeps deadline order across the time base's wrap, a late command's expiry included")
+list_across_the_wrap()
+    var r = recorder(1, 0)
+    time_base().store(0xffff_fffc, Ordering.Relaxed)
+    val a = make(&r, 0, 2, false)
+    val b = make(&r, 1, 6, false)
+    val c = make(&r, 2, 4, false)
+    val d = make(&r, 3, 3, true)
+    val x = make(&r, 4, 4, false)
+    for t in [a, b, c, d]
+        assert(t.start(&r, 0).is_ok(), "started")
+    timer_turn(&r)
+    assert(lists(timers_here(&r), [a, d, c, b]), "due on 0xffff_fffe, 0xffff_ffff, 0, 2")
+    advance_to(&r, 0xffff_fffd)
+    assert(x.start(&r, 0).is_ok(), "x, due on 1, taken late")
+    turn_at(&r, 5)
+    assert(were([a, d, c, x, b, d, d], [0xffff_fffe, 0xffff_ffff, 0, 1, 2, 2, 5]), "by deadline across the wrap")
+    assert(lists(timers_here(&r), [d]), "d due on 8")
+
+// Record; at the first call start timer 1 as the service, and check that it waits among the pending
+// timers, active, while the list is as it was.
+private start_pending(t: *Timer, due: u32)
+    record(t, due)
+    if calls != 1 then return
+    val s = timers_here(port)
+    assert(timers[1].start(port, 0).is_ok(), "started from a callback")
+    assert(timers[1].is_active(port) == Ok(true), "active at once")
+    assert(timers[1].pending && s.pending == &timers[1] && s.last == &timers[1], "pending")
+    assert(lists(s, [t]), "the list untouched: only the timer itself, put back")
+
+@test("a command carried out at once during a callback does no work on the list: its timer is pending until the callback returns")
+at_once_is_pending()
+    val r = fresh_port()
+    val u = &timers[1]
+    assert(create_timer(r, u, "u", 2, false, &record).is_ok(), "u created")
+    assert(create_timer(r, &timers[0], "t", 3, true, &start_pending).is_ok(), "t created")
+    val t = &timers[0]
+    assert(t.start(r, 0).is_ok(), "started")
+    turn_at(r, 7)
+    assert(were([t, t], [3, 6]), "t's two missed expiries")
+    assert(lists(timers_here(r), [u, t]), "u, sent on 7 and due on 9, settled before t was put back for 9")
+    turn_at(r, 9)
+    assert(were([t, t, u, t], [3, 6, 9, 9]), "u first on 9")
+    assert_eq(r.masked, 0)

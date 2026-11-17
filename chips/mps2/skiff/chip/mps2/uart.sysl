@@ -15,7 +15,10 @@ private struct Uart
 @assert(offsetof(Uart, bauddiv) == 0x10, "BAUDDIV is at 0x10")
 
 const UART0: usize = 0x4000_4000
-private const STATE_TX_FULL: u32 = 1 << 0
+// Where the register whose bit `UART_TX_FULL` says the transmit buffer is full lies, from the base.
+const UART_FLAGS: u32 = 0x04
+const UART_TX_FULL: u32 = 1 << 0
+@assert(offsetof(Uart, state) == usize(UART_FLAGS), "UART_FLAGS is STATE")
 private const CTRL_TX_ENABLE: u32 = 1 << 0
 
 private uart() -> *Uart = ptr_cast(UART0)
@@ -29,7 +32,7 @@ console_init()
 // Send one byte, waiting while the transmit buffer is full.
 put_byte(b: u8)
     val u = uart()
-    while (u.state & STATE_TX_FULL) != 0 do ()
+    while (u.state & UART_TX_FULL) != 0 do ()
     u.data = u32(b)
 
 // Send every byte of `bytes`.

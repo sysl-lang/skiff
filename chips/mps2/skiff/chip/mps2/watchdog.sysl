@@ -1,0 +1,55 @@
+module skiff.chip.mps2
+
+import sysl.raw.ptr_cast
+
+// The CMSDK APB watchdog, at 0x4000_8000, on the 25 MHz clock: the core's hardware watchdog. It counts
+// down from its load; at zero it raises its interrupt, which QEMU's MPS2 wires to the core's NMI, and
+// reloads; at zero again with the interrupt still raised it resets the machine. A write to its interrupt
+// clear lowers the interrupt and reloads the count. Every write but the lock's is dropped while it is
+// locked, so each change unlocks it first and locks it again after.
+
+private struct WatchdogRegisters
+    load: volatile u32          // 0x00
+    value: volatile u32         // 0x04
+    control: volatile u32       // 0x08 bit 0 interrupt enable (and start), bit 1 reset enable
+    clear: volatile u32         // 0x0c any write: lower the interrupt, reload the count
+
+private struct WatchdogLock
+    key: volatile u32           // 0xc00
+
+private const WATCHDOG: usize = 0x4000_8000
+private const WATCHDOG_LOCK: usize = 0x4000_8c00
+private const UNLOCK: u32 = 0x1acc_e551
+private const INTERRUPT: u32 = 1
+private const RESET: u32 = 2
+
+private watchdog() -> *WatchdogRegisters = ptr_cast(WATCHDOG)
+
+// Open the watchdog to writes, or shut it again.
+private lock(open: bool)
+    val l: *WatchdogLock = ptr_cast(WATCHDOG_LOCK)
+    l.key = if open then UNLOCK else 0
+
+// Start the watchdog to warn after `cycles` of the 25 MHz clock unfed, and reset the machine `cycles`
+// after that.
+watchdog_start(cycles: u32)
+    lock(true)
+    val w = watchdog()
+    w.control = 0
+    w.load = cycles
+    w.control = INTERRUPT | RESET
+    lock(false)
+
+// Feed it: the full count again.
+watchdog_feed()
+    lock(true)
+    watchdog().clear = 1
+    lock(false)
+
+// Stop it, its interrupt lowered.
+watchdog_stop()
+    lock(true)
+    val w = watchdog()
+    w.control = 0
+    w.clear = 1
+    lock(false)
