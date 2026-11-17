@@ -24,7 +24,14 @@
 #     each. Almost every hold is under 1024 (the hammers' 267,000 gives and takes per core, behind each
 #     other's, are 512-1023; the ~2,800 ticks and ~10,000 switches are shorter). A path the boot takes
 #     often that grows past 1024 cycles, as a scan over the tasks or the waiters would make it, moves
-#     thousands of intervals past it, though its longest may stay under the first bound.
+#     thousands of intervals past it, though its longest may stay under the first bound. The count moves
+#     with the interleaving (the hammers' holds sit near 1024): core 0's was 382 in a run whose only
+#     change was a few hundred cycles more in each tick, so the bound leaves room for that.
+#
+# What it cannot see: a path that grows but stays under 1024 cycles and under the longest. A scan of
+# every task slot in the tick (~250 cycles more on each of ~2,800 ticks) passes both: benchtop's report
+# names only the eight longest intervals and buckets by powers of two, so a short path's own hold is not
+# in it.
 #   - The worst latency of the interrupts at the kernel's priority (KERNEL_IRQ_PRIORITY, below the mask):
 #     the doorbell (irq26) and the software-raised interrupt (irq46). Such an interrupt waits for the
 #     masked remainder and for any handler above it, so its bound is the masked one. Measured: irq26 214
