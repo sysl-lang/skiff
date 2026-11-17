@@ -33,7 +33,7 @@ impl Flags
         var at = self.w.queue.first()
         while at != NONE
             val r = waiter(at)
-            val next = r.next
+            val next = self.w.queue.after(at)
             if satisfied(self.bits, r.value, r.mode)
                 if r.mode & CLEAR_ON_EXIT != 0 then cleared |= r.value
                 r.value = self.bits
@@ -79,7 +79,7 @@ impl Flags
             l.release()
             return None
         val c = running_core(p)
-        enqueue_running(c, &self.w, timeout, mode, wanted)
+        enqueue_running(c, &self.w, timeout, 0, mode, wanted)
         p.request_switch()
         l.release()
         if wait_outcome(c) == Outcome.Woken then Some(wait_value(c)) else None

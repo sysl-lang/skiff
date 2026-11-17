@@ -86,7 +86,7 @@ impl[const N: usize, const SIZE: usize] Pool[N, SIZE]
             l.release()
             return None
         val c = running_core(p)
-        enqueue_running(c, &self.w, timeout, 0, 0)
+        enqueue_running(c, &self.w, timeout, 0, 0, 0)
         p.request_switch()
         l.release()
         if wait_outcome(c) != Outcome.Given then return None

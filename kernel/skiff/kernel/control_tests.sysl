@@ -32,7 +32,7 @@ private order(q: *WaitQueue) -> u32
     var at = q.first()
     while at != NONE
         digits = digits * 10 + u32(at) + 1
-        at = waiter(at).next
+        at = q.after(at)
     digits
 
 @test("suspending the running task switches away from it, and resuming it brings it back")

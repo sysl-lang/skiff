@@ -35,7 +35,7 @@ impl Semaphore
             l.release()
             return false
         val c = running_core(p)
-        enqueue_running(c, &self.w, timeout, 0, 0)
+        enqueue_running(c, &self.w, timeout, 0, 0, 0)
         p.request_switch()
         l.release()
         wait_outcome(c) == Outcome.Given
@@ -103,7 +103,7 @@ impl Mutex
             return false
         val owner = self.owner
         val mine = c.sched.tasks[i].priority
-        enqueue_running(c, &self.w, timeout, 0, 0)
+        enqueue_running(c, &self.w, timeout, 0, 0, 0)
         p.request_switch()
         l.release()
         // The core stays masked until the owner has inherited, or been asked to, so nothing runs in
@@ -132,7 +132,7 @@ impl Mutex
             self.owner = NO_TASK
         else
             // The best of those left waiting is the one behind the heir.
-            if self.w.queue.count > 1 then inherited = waiter(waiter(at).next).priority
+            if self.w.queue.count > 1 then inherited = waiter(self.w.queue.after(at)).priority
             val t = end_wait(p, &self.w, at, Outcome.Given, MessageKind.Hand, inherited)
             self.owner = t
             if !another_core(t.core(), c.id)
