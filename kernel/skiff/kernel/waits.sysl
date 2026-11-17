@@ -175,6 +175,9 @@ private[kernel] end_wait[P: Port](p: *P, w: *Waitable, at: u16, outcome: Outcome
         post(p, kind, r.task, priority, null)
     else if c.sched.wake(r.task.slot())
         p.request_switch()
+#if option_trace
+    if !another_core(r.task.core(), c.id) then trace_task(p, TraceKind.Ready, TraceObject.Nothing, usize(w), r.task, 0)
+#endif
     r.task
 
 // End the waits that `tick` found expired, each under its object's lock: one still `Waiting` leaves the
@@ -201,6 +204,10 @@ private time_out[P: Port](p: *P, c: *Core, w: *Waitable, i: usize) -> bool
         val _ = w.queue.remove(at)
         waiter(at).outcome = Outcome.TimedOut
         outranks = c.sched.wake(i)
+#if option_trace
+        trace_task(p, TraceKind.TimedOut, TraceObject.Nothing, usize(w), waiter(at).task, 0)
+        trace_task(p, TraceKind.Ready, TraceObject.Nothing, usize(w), waiter(at).task, 0)
+#endif
     l.release()
     outranks
 

@@ -113,6 +113,9 @@ private[kernel] take_ticks[P: Port](p: *P, c: *Core, count: u32)
         p.spin_unlock(time_lock())
     // Charged on every tick, so a task running alone for a long time is charged before the counter wraps.
     charge(p, c)
+#if option_trace
+    trace_running(p, TraceKind.Tick, TraceObject.Nothing, 0, count)
+#endif
     if c.sched.started() && c.sched.tick(ticks()) then p.request_switch()
 
 // Idle until the running core takes its next tick, and answer how many it has taken.
@@ -126,6 +129,9 @@ await_tick[P: Port](p: *P) -> u32
 // `.shared`, where the other cores can see it. The caller then stops this core; the others run on.
 fault[P: Port](p: *P, kind: string)
     val c = here(p)
+#if option_trace
+    trace_running(p, TraceKind.Fault, TraceObject.Nothing, 0, 0)
+#endif
     c.stopped = true
     p.write("skiff: core ".bytes)
     write_dec(p, c.id)

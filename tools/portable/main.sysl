@@ -25,6 +25,7 @@ impl Port for Nothing
     spin_lock(*self, word: *Atomic[u32]) = ()
     spin_try_lock(*self, word: *Atomic[u32]) -> bool = true
     spin_unlock(*self, word: *Atomic[u32]) = ()
+    override trace(*self, event: kernel.TraceEvent) = traced.record_masked(self, event)
 
 impl Doorbell for Nothing
     ring(*self, core: u32) = ()
@@ -65,6 +66,17 @@ private var blocks: Pool[2, 48] = Pool.new("blocks", 1)
 private var carried: Channel[2] = Channel.new("carried")
 private var bytes: StreamBuffer[8] = StreamBuffer.new("bytes", 1)
 private var framed: MessageBuffer[12] = MessageBuffer.new("framed")
+private var traced: kernel.TraceRing[8] = kernel.TraceRing.new()
+
+// A trace ring between a board's reports of an interrupt: whatever the kernel emitted in between, the
+// ring keeps no more than it holds.
+private tracing(m: *Nothing) -> bool
+    traced.start()
+    kernel.interrupt_entered(m, 1)
+    traced.record_masked(m, kernel.NO_EVENT)
+    kernel.interrupt_exited(m, 1)
+    traced.stop()
+    traced.count() >= 1 && traced.count() <= 8 && traced.event(0).task == kernel.NO_TASK
 
 // A message wider than a word, so a queue copies a struct in and out.
 struct Reading
@@ -216,7 +228,7 @@ probe() -> i32
     if !kernel.stopped(here.id) || kernel.expired(kernel.ticks(), 0) then return 1
     if t.is_err() || kernel.delete(&m, t.unwrap()).is_ok() then return 1
     if !control(&m, t.unwrap()) then return 1
-    if !protection(&m) || !timers(&m) || !deferred(&m) || !handshake() then return 1
+    if !protection(&m) || !timers(&m) || !deferred(&m) || !handshake() || !tracing(&m) then return 1
     if here.sched.started()
         kernel.sleep(&m, 1)
         kernel.sleep_until(&m, 1)

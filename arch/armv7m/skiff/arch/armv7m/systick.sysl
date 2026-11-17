@@ -11,6 +11,9 @@ private struct SysTick
     cvr: volatile u32           // 0x18 current value
 
 private const SYSTICK: usize = 0xE000_E010
+
+// SysTick's exception number, as IPSR reads it in its handler: what a board reports its tick by.
+const SYSTICK_EXCEPTION: u32 = 15
 private const CSR_ENABLE: u32 = 1 << 0
 private const CSR_TICKINT: u32 = 1 << 1
 private const CSR_CLKSOURCE: u32 = 1 << 2      // the processor clock, not the external reference

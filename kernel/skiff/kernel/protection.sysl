@@ -286,6 +286,9 @@ stop_running[P: Port](p: *P, why: Violation) -> Option[usize]
     val i = usize(c.sched.running)
     if c.sched.tasks[i].base == IDLE_PRIORITY then return None
     val state = p.mask()
+#if option_trace
+    trace_running(p, TraceKind.Stop, TraceObject.Nothing, 0, 1)
+#endif
     c.sched.stop()
     c.maps[i].calling = false
     p.request_switch()

@@ -525,6 +525,9 @@ run[P: Port](p: *P, idle_stack: []u32, idle: *extern() -> never) -> never
             c.sched.add_on(i, idle_stack, p.new_context(frames, idle), IDLE_PRIORITY)
         None -> panic("skiff: no slot left for the idle task")
     val sp = c.sched.first()
+#if option_trace
+    trace_running(p, TraceKind.SwitchIn, TraceObject.Nothing, 0, 0)
+#endif
     protect_running(p, c)
     start_counting(p, c)
     p.start_first(sp)
@@ -535,7 +538,16 @@ switch_context[P: Port](p: *P, sp: usize) -> usize
     val c = here(p)
     val state = p.mask()
     charge(p, c)
+#if option_trace
+    val from = c.sched.running
+    val leaving = c.sched.handle(c.id, usize(from))
+#endif
     val next = c.sched.switch(sp)
+#if option_trace
+    if c.sched.running != from
+        trace_task(p, TraceKind.SwitchOut, TraceObject.Nothing, 0, leaving, 0)
+        trace_running(p, TraceKind.SwitchIn, TraceObject.Nothing, 0, 0)
+#endif
     protect_running(p, c)
     p.restore(state)
     next

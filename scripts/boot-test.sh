@@ -93,6 +93,11 @@ mutexes_expected() {
     echo "skiff: core $1 a recursive mutex locked 3 times went to its waiter only at the third unlock, locked once
 skiff: core $1 a mutex of ceiling 6 kept a task of priority 5 out until it was unlocked, and one of ceiling 3 refused a task of priority 4"
 }
+# The kernel's trace, every core (boards/scenarios, tracing.sysl): a task's take, block, wake by a give,
+# timeout and switches found in the core's trace ring in order, every reported interrupt entered and left.
+tracing_expected() {
+    echo "skiff: core $1 traced a task blocking, woken by a give, timing out and switching back, every step in order"
+}
 # Software timers, every core (boards/scenarios, timers.sysl): a periodic timer called a period apart
 # with no drift though one call ran late, a one-shot called once, a timer stopped before its expiry never
 # called, a reset and a changed period counting from their commands, and every callback in its own core's
@@ -169,6 +174,7 @@ $(deferred_expected 0)
 $(control_expected 0)
 $(stats_expected 0)
 $(mutexes_expected 0)
+$(tracing_expected 0)
 $(traces_expected 0)
 $(protection_expected 0)
 $(grants_expected 0)
@@ -222,6 +228,7 @@ skiff: core 0 asked core 1 to suspend, resume, re-prioritize and stop a task of 
 $(stats_expected 0)
 skiff: core 0 is refused another core's task statistics and high-water marks
 $(mutexes_expected 0)
+$(tracing_expected 0)
 $(traces_expected 0)
 $(protection_expected 0)
 skiff: core 0 an unprivileged task on core 1 took a unit core 0 gave and set flags core 0 waited on, through its grants
@@ -258,6 +265,7 @@ $(control_expected 1)
 skiff: core 1 core 0 suspended, resumed, re-prioritized and stopped a task of core 1 through its inbox
 $(stats_expected 1)
 $(mutexes_expected 1)
+$(tracing_expected 1)
 $(traces_expected 1)
 $(protection_expected 1)
 skiff: core 1 an unprivileged task took a unit core 0 gave, through its grant

@@ -45,6 +45,9 @@ private[kernel] renew_note[P: Port](p: *P, core: u32, slot: usize, task: Task)
 notify[P: Port](p: *P, t: Task, value: u32, action: Action) -> Result[bool, TaskError]
     if usize(t.core()) >= option_cores || t.slot() >= option_tasks then return Err(TaskError.Stale)
     val n = note_of(t.core(), t.slot())
+#if option_trace
+    trace_running(p, TraceKind.Give, TraceObject.Note, usize(&n.w), value)
+#endif
     var l = n.w.lock.on(p)
     l.acquire()
     if n.task != t || t == NO_TASK
@@ -73,6 +76,9 @@ notify_give[P: Port](p: *P, t: Task) -> Result[bool, TaskError] = notify(p, t, 0
 notify_wait[P: Port](p: *P, clear_on_entry: u32, clear_on_exit: u32, timeout: u32) -> Option[u32]
     val c = running_core(p)
     val n = note_of(c.id, usize(c.sched.running))
+#if option_trace
+    trace_running(p, TraceKind.Take, TraceObject.Note, usize(&n.w), timeout)
+#endif
     var l = n.w.lock.on(p)
     l.acquire()
     if !n.pending
@@ -91,6 +97,9 @@ notify_wait[P: Port](p: *P, clear_on_entry: u32, clear_on_exit: u32, timeout: u3
 notify_take[P: Port](p: *P, clear: bool, timeout: u32) -> u32
     val c = running_core(p)
     val n = note_of(c.id, usize(c.sched.running))
+#if option_trace
+    trace_running(p, TraceKind.Take, TraceObject.Note, usize(&n.w), timeout)
+#endif
     var l = n.w.lock.on(p)
     l.acquire()
     if n.value == 0 && !wait_for_note(p, c, n, &l, timeout) then return 0
@@ -108,6 +117,9 @@ private wait_for_note[P: Port](p: *P, c: *Core, n: *Note, l: *Locking[P], timeou
         l.release()
         return false
     enqueue_running(c, &n.w, timeout, 0, 0, 0)
+#if option_trace
+    trace_running(p, TraceKind.Blocked, TraceObject.Note, usize(&n.w), timeout)
+#endif
     p.request_switch()
     l.release()
     if wait_outcome(c) != Outcome.Woken then return false

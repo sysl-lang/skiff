@@ -40,6 +40,9 @@ impl[T, const N: usize] Queue[T, N]
     // Send `m`, waiting up to `timeout` ticks for room. Answers whether it was sent. Only a task may
     // wait; with a timeout of 0 nothing waits.
     send[P: Port](*self, p: *P, m: T, timeout: u32) -> bool
+#if option_trace
+        trace_running(p, TraceKind.Send, TraceObject.Queue, usize(&self.w), timeout)
+#endif
         var l = self.w.lock.on(p)
         l.acquire()
         if self.count + self.kept_slots < u32(N)
@@ -51,6 +54,9 @@ impl[T, const N: usize] Queue[T, N]
             return false
         val c = running_core(p)
         enqueue_running(c, &self.w, timeout, SENDING, 0, 0)
+#if option_trace
+        trace_running(p, TraceKind.Blocked, TraceObject.Queue, usize(&self.w), timeout)
+#endif
         p.request_switch()
         l.release()
         if wait_outcome(c) != Outcome.Given then return false
@@ -63,6 +69,9 @@ impl[T, const N: usize] Queue[T, N]
     // Receive the oldest message, waiting up to `timeout` ticks for one. Answers None if none came. Only
     // a task may wait; with a timeout of 0 nothing waits.
     receive[P: Port](*self, p: *P, timeout: u32) -> Option[T]
+#if option_trace
+        trace_running(p, TraceKind.Receive, TraceObject.Queue, usize(&self.w), timeout)
+#endif
         var l = self.w.lock.on(p)
         l.acquire()
         if self.count > self.kept_messages
@@ -74,6 +83,9 @@ impl[T, const N: usize] Queue[T, N]
             return None
         val c = running_core(p)
         enqueue_running(c, &self.w, timeout, RECEIVING, 0, 0)
+#if option_trace
+        trace_running(p, TraceKind.Blocked, TraceObject.Queue, usize(&self.w), timeout)
+#endif
         p.request_switch()
         l.release()
         if wait_outcome(c) != Outcome.Given then return None

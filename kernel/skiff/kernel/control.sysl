@@ -122,6 +122,9 @@ private obey[P: Port](p: *P, c: *Core, t: Task, order: Order, priority: u8, mine
         Order.Stop ->
             if !stopped
                 c.sched.stop_at(i)
+#if option_trace
+                trace_task(p, TraceKind.Stop, TraceObject.Nothing, 0, c.sched.handle(c.id, i), 0)
+#endif
                 c.maps[i].calling = false
                 if mine && i == usize(c.sched.running) then p.request_switch()
     p.restore(state)

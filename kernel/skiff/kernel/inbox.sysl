@@ -39,6 +39,9 @@ private[kernel] post[P: Port](p: *P, kind: MessageKind, t: Task, priority: u8, m
         panic("skiff: an inbox is full")
     ring.slots[tail] = Message(kind, t, priority, if mutex == null then 0 else place_of(usize(mutex)))
     ring.tail.store(next, Ordering.Release)
+#if option_trace
+    trace_task(p, TraceKind.Post, TraceObject.Nothing, 0, t, u32(kind))
+#endif
     p.restore(mask)
     p.ring(to)
 
@@ -53,6 +56,9 @@ answer_doorbell[P: Port](p: *P)
     p.clear()
     val c = here(p)
     val state = p.mask()
+#if option_trace
+    var applied: u32 = 0
+#endif
     for from in 0..<INBOX_CORES
         val ring = inbox(c.id, u32(from))
         var head = ring.head.load(Ordering.Relaxed)
@@ -61,6 +67,12 @@ answer_doorbell[P: Port](p: *P)
             head = following(head)
             ring.head.store(head, Ordering.Release)
             apply(p, c, m)
+#if option_trace
+            applied += 1
+#endif
+#if option_trace
+    trace_running(p, TraceKind.Drain, TraceObject.Nothing, 0, applied)
+#endif
     if c.sched.preempted() then p.request_switch()
     p.restore(state)
 
@@ -78,6 +90,9 @@ private apply[P: Port](p: *P, c: *Core, m: Message)
         MessageKind.Wake ->
             if wait_ended(c, i)
                 val _ = c.sched.wake(i)
+#if option_trace
+                trace_task(p, TraceKind.Ready, TraceObject.Nothing, 0, m.task, 0)
+#endif
         MessageKind.Hand ->
             if wait_ended(c, i)
                 c.sched.tasks[i].held += 1
@@ -87,6 +102,9 @@ private apply[P: Port](p: *P, c: *Core, m: Message)
                 val e = c.sched.inherit(i, m.priority)
                 if e > c.sched.tasks[i].priority then c.sched.set_effective(i, e)
                 val _ = c.sched.wake(i)
+#if option_trace
+                trace_task(p, TraceKind.Ready, TraceObject.Mutex, usize(&mutex.w), m.task, 0)
+#endif
         MessageKind.Boost ->
             val mutex: *Mutex = ptr_cast(at_place(m.mutex))
             if mutex.owned_by(p, m.task) then inherit(p, c, i, m.priority)

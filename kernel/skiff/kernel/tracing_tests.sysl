@@ -1,0 +1,222 @@
+module skiff.kernel
+@tests
+
+// Tracing on the host, over the recording port (kernel_tests.sysl), whose `trace` keeps every event in a
+// ring the test starts. Each test acts the same with the `trace` option on or off: on, it checks the
+// events and their order; off, that the kernel emitted none. The gate runs both builds
+// (`sysl test kernel --option trace=true --filter skiff.kernel` is the one with it on).
+
+private body() -> never
+    loop
+        ()
+
+private var stacks: [3][128]u32
+
+// A task at `priority` on core 0 of `r`.
+private traced_task(r: *Recorder, n: usize, priority: u8) -> Task = create(r, 0, stacks[n], &body, priority).unwrap()
+
+// The switch the port was asked for: the scheduler's choice runs.
+private traced_switch(r: *Recorder)
+    val _ = switch_context(r, 0)
+
+// The events `r` kept are exactly `want`, by kind, oldest first.
+private kinds_are(r: *Recorder, want: []const TraceKind)
+    val n = if r.events.count() < want.len then r.events.count() else want.len
+    for i in 0..<n
+        assert_eq(u8(r.events.event(i).kind), u8(want[i]))
+    assert_eq(r.events.count(), want.len)
+
+// Event `n` is about `t` and, with `object`, the object whose waitable is at `at`.
+private about(r: *Recorder, n: usize, t: Task, object: TraceObject, at: usize) -> bool
+    val e = r.events.event(n)
+    e.task == t && e.object == object && e.at == at && e.core == 0
+
+// A ring with `count` events of values 0, 1, ... recorded.
+private ring_of(count: u32) -> TraceRing[4]
+    var ring: TraceRing[4] = TraceRing.new()
+    ring.start()
+    for v in 0..<count
+        ring.record(TraceEvent(TraceKind.Tick, TraceObject.Nothing, 0, NO_TASK, v, 0, 0))
+    ring
+
+@test("a trace ring keeps what was recorded, oldest first, and records nothing until started or once stopped")
+trace_ring_order()
+    var ring: TraceRing[4] = TraceRing.new()
+    ring.record(TraceEvent(TraceKind.Tick, TraceObject.Nothing, 0, NO_TASK, 9, 0, 0))
+    assert_eq(ring.count(), 0)
+    ring = ring_of(3)
+    assert_eq(ring.count(), 3)
+    assert_eq(ring.lost(), 0)
+    for i in 0..<3
+        assert_eq(ring.event(i).value, u32(i))
+    ring.stop()
+    ring.record(TraceEvent(TraceKind.Tick, TraceObject.Nothing, 0, NO_TASK, 9, 0, 0))
+    assert_eq(ring.count(), 3)
+    ring.start()
+    assert_eq(ring.count(), 0)
+
+@test("a full trace ring keeps the newest events in order and counts the ones they replaced")
+trace_ring_wraps()
+    var ring = ring_of(4)
+    assert_eq(ring.count(), 4)
+    assert_eq(ring.lost(), 0)
+    for i in 0..<4
+        assert_eq(ring.event(i).value, u32(i))
+    ring = ring_of(7)
+    assert_eq(ring.count(), 4)
+    assert_eq(ring.lost(), 3)
+    for i in 0..<4
+        assert_eq(ring.event(i).value, u32(i) + 3)
+    ring = ring_of(9)
+    for i in 0..<4
+        assert_eq(ring.event(i).value, u32(i) + 5)
+
+@test("a switch traces the task leaving and the task coming in; a switch that keeps the running task traces nothing")
+trace_switch()
+    var r = recorder(1, 0)
+    val high = traced_task(&r, 0, 2)
+    val low = traced_task(&r, 1, 1)
+    here(&r).sched.first()
+    r.clock = 70
+    r.events.start()
+    traced_switch(&r)
+    sleep(&r, FOREVER)
+    traced_switch(&r)
+#if option_trace
+    kinds_are(&r, [TraceKind.SwitchOut, TraceKind.SwitchIn])
+    assert(about(&r, 0, high, TraceObject.Nothing, 0), "the high task leaves")
+    assert(about(&r, 1, low, TraceObject.Nothing, 0), "the low task comes in")
+    assert_eq(r.events.event(1).stamp, 70)
+#else
+    assert_eq(r.events.count(), 0)
+#endif
+
+@test("a take that blocks, a give that wakes and the switches between them are traced in that order")
+trace_block_and_wake()
+    var r = recorder(1, 0)
+    var s = Semaphore.new("s", 0, 1)
+    val w = traced_task(&r, 0, 2)
+    val low = traced_task(&r, 1, 1)
+    here(&r).sched.first()
+    r.events.start()
+    val _ = s.take(&r, FOREVER)
+    traced_switch(&r)
+    assert(s.give(&r), "given")
+    traced_switch(&r)
+    assert(current(&r) == w, "the woken task runs")
+#if option_trace
+    kinds_are(&r, [TraceKind.Take, TraceKind.Blocked, TraceKind.SwitchOut, TraceKind.SwitchIn, TraceKind.Give, TraceKind.Ready, TraceKind.SwitchOut, TraceKind.SwitchIn])
+    val at = usize(&s.w)
+    assert(about(&r, 0, w, TraceObject.Semaphore, at), "the waiter takes")
+    assert_eq(r.events.event(0).value, FOREVER)
+    assert(about(&r, 1, w, TraceObject.Semaphore, at), "and blocks on the semaphore")
+    assert(about(&r, 3, low, TraceObject.Nothing, 0), "the low task runs")
+    assert(about(&r, 4, low, TraceObject.Semaphore, at), "and gives")
+    assert(about(&r, 5, w, TraceObject.Nothing, at), "which readies the waiter")
+    assert(about(&r, 6, low, TraceObject.Nothing, 0), "the giver leaves")
+    assert(about(&r, 7, w, TraceObject.Nothing, 0), "for the waiter")
+#else
+    assert_eq(r.events.count(), 0)
+#endif
+
+@test("a timed take nobody gives traces each tick, then its timeout and the task made ready, after the deadline's tick")
+trace_timeout()
+    var r = recorder(1, 0)
+    var s = Semaphore.new("s", 0, 1)
+    val w = traced_task(&r, 0, 2)
+    val _ = traced_task(&r, 1, 1)
+    here(&r).sched.first()
+    val _ = s.take(&r, 3)
+    traced_switch(&r)
+    r.events.start()
+    tick(&r)
+    tick(&r)
+    tick(&r)
+    traced_switch(&r)
+#if option_trace
+    kinds_are(&r, [TraceKind.Tick, TraceKind.Tick, TraceKind.Tick, TraceKind.TimedOut, TraceKind.Ready, TraceKind.SwitchOut, TraceKind.SwitchIn])
+    assert_eq(r.events.event(0).value, 1)
+    assert(about(&r, 3, w, TraceObject.Nothing, usize(&s.w)), "the waiter's wait timed out")
+    assert(about(&r, 4, w, TraceObject.Nothing, usize(&s.w)), "and it is ready")
+    assert(about(&r, 6, w, TraceObject.Nothing, 0), "and runs")
+#else
+    assert_eq(r.events.count(), 0)
+#endif
+
+@test("a mutex's lock that waits and its unlock that hands it over are traced as take, blocked, give and ready")
+trace_mutex()
+    var r = recorder(1, 0)
+    var m = Mutex.new("m")
+    val w = traced_task(&r, 0, 2)
+    val owner = traced_task(&r, 1, 1)
+    here(&r).sched.first()
+    sleep(&r, 1)
+    traced_switch(&r)
+    assert(m.lock(&r, FOREVER), "the owner has it")
+    tick(&r)
+    traced_switch(&r)
+    r.events.start()
+    val _ = m.lock(&r, 5)
+    traced_switch(&r)
+    m.unlock(&r)
+#if option_trace
+    kinds_are(&r, [TraceKind.Take, TraceKind.Blocked, TraceKind.SwitchOut, TraceKind.SwitchIn, TraceKind.Give, TraceKind.Ready])
+    val at = usize(&m.w)
+    assert(about(&r, 1, w, TraceObject.Mutex, at), "the waiter blocks on the mutex")
+    assert_eq(r.events.event(1).value, 5)
+    assert(about(&r, 4, owner, TraceObject.Mutex, at), "the owner unlocks")
+    assert(about(&r, 5, w, TraceObject.Nothing, at), "and the waiter is ready")
+#else
+    assert_eq(r.events.count(), 0)
+#endif
+
+@test("a board's interrupt entry and exit are traced with the interrupt's number, around what its handler does")
+trace_interrupt()
+    var r = recorder(1, 0)
+    var f = Flags.new("f", 0)
+    r.events.start()
+    interrupt_entered(&r, 15)
+    val _ = f.set(&r, 0x6)
+    interrupt_exited(&r, 15)
+#if option_trace
+    kinds_are(&r, [TraceKind.InterruptEnter, TraceKind.Set, TraceKind.InterruptExit])
+    assert_eq(r.events.event(0).value, 15)
+    assert_eq(r.events.event(1).value, 0x6)
+    assert(about(&r, 1, NO_TASK, TraceObject.Flags, usize(&f.w)), "before any task runs, no task")
+    assert_eq(r.events.event(2).value, 15)
+#else
+    assert_eq(r.events.count(), 0)
+#endif
+
+@test("a sleep with the tick stopped is traced with the ticks asked, the periods slept and the ticks taken")
+trace_tickless()
+    var r = recorder(1, 0)
+    r.skip_limit = 100
+    r.wake_after = 4
+    val _ = traced_task(&r, 0, 1)
+    val c = here(&r)
+    c.sched.add_on(c.sched.free_slot().unwrap(), stacks[2], 0, IDLE_PRIORITY)
+    c.sched.first()
+    sleep(&r, 10)
+    traced_switch(&r)
+    r.events.start()
+    rest(&r)
+#if option_trace
+    kinds_are(&r, [TraceKind.Sleep, TraceKind.Wake, TraceKind.Tick])
+    assert_eq(r.events.event(0).value, 10)
+    assert_eq(r.events.event(1).value, 4)
+    assert_eq(r.events.event(2).value, 4)
+#else
+    assert_eq(r.events.count(), 0)
+#endif
+
+@test("a fault on the core is traced before it is reported")
+trace_fault()
+    var r = recorder(1, 0)
+    r.events.start()
+    fault(&r, "BusFault")
+#if option_trace
+    kinds_are(&r, [TraceKind.Fault])
+#else
+    assert_eq(r.events.count(), 0)
+#endif

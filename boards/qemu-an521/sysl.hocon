@@ -8,7 +8,7 @@ package {
 }
 
 dependencies {
-  kernel { workspace = true, options = { cores = 2, tasks = 32 } }
+  kernel { workspace = true, options = { cores = 2, tasks = 32, trace = true } }
   armv7m { workspace = true }
   armv8m { workspace = true }
   an521 { workspace = true }

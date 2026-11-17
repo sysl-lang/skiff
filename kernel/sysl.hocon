@@ -16,9 +16,12 @@ options {
   work_items { type = usize, default = 8, range = [1, 256], doc = "how many posts of deferred work each core's work service queues before a post is refused" }
   watched { type = usize, default = 4, range = [1, 64], doc = "how many tasks each core's watchdog watches" }
   cache_line { type = usize, default = 32, range = [4, 256], doc = "the data cache's line in bytes, a power of two: every pool buffer starts on one and fills whole lines" }
+  trace { type = bool, default = false, doc = "emit the kernel's events to the port's trace (DESIGN, Tracing); off, no event is built and nothing is called" }
 }
 
 // The kernel's tests run in two builds. With one core, where no path between cores is in the build:
 // `sysl test kernel --filter skiff.kernel`. For the paths between cores, the kernel is built for three
 // and the tests of skiff.cores (skiff/cores/) play each core in turn over one port:
-// `sysl test kernel --option cores=3 --filter skiff.cores`.
+// `sysl test kernel --option cores=3 --filter skiff.cores`. The gate runs both again with `--option
+// trace=true`, where the tests of the events (`trace_…`) check what is emitted; without it they check
+// that nothing is.
