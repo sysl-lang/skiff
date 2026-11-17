@@ -102,6 +102,11 @@ skiff: core $1 a timer stopped before it expired was never called
 skiff: core $1 a reset timer and one whose period changed each counted from its command
 skiff: core $1 every timer callback ran in its own core's timer service"
 }
+# Deferred work, every core (boards/scenarios, deferred.sysl): an interrupt posts work once more than the
+# queue holds; the last post is refused and counted, and the core's work service runs the rest in order.
+deferred_expected() {
+    echo "skiff: core $1 work an interrupt deferred ran in the core's work service, in the order posted, and a full queue refused one post"
+}
 # Error traces, every core (boards/scenarios, traces.sysl): an interrupt's failure kept to the core's
 # handlers' trace, the interrupted task's untouched; two unprivileged tasks failing in turn, each finding
 # only its own sites in its trace.
@@ -148,6 +153,7 @@ $(tasks_expected 0 "f32 registers survived the switches")
 $(waits_expected 0)
 $(messages_expected 0)
 $(timers_expected 0)
+$(deferred_expected 0)
 $(control_expected 0)
 $(stats_expected 0)
 $(mutexes_expected 0)
@@ -170,7 +176,7 @@ $(grants_expected 0)"
 # and a task on core 0 waits on a mutex a task
 # of core 1 holds while a task of middling priority works on core 1, and must have it within a bound
 # through the boost core 1's inbox carries, which the owner gives up with the mutex. Each core runs its own
-# software timers, and core 0 may not command one of core 1's. Core 0 suspends, resumes, re-prioritizes
+# software timers and deferred work, and core 0 may not command a timer of core 1's nor post its work. Core 0 suspends, resumes, re-prioritizes
 # and stops a task of core 1 through core 1's inbox, and core 1 checks each step. Each core measures its
 # own tasks on its own counter, and core 0 is refused core 1's. Core 1 then faults
 # on purpose: it
@@ -192,6 +198,8 @@ skiff: core 0 had every buffer it sent core 1 back in the pool
 skiff: core 0 the high task had the mutex a task on core 1 held within 10 ticks
 $(timers_expected 0)
 skiff: core 0 may not command a timer of core 1
+$(deferred_expected 0)
+skiff: core 0 may not post work of core 1
 $(control_expected 0)
 skiff: core 0 asked core 1 to suspend, resume, re-prioritize and stop a task of its own, and core 1 did
 $(stats_expected 0)
@@ -225,6 +233,7 @@ skiff: core 1 read 3000 bytes core 0 wrote into a stream, every byte in order
 skiff: core 1 received 200 messages core 0 sent, each whole and in order
 skiff: core 1 the low task gave up the priority core 0's task lent it with the mutex
 $(timers_expected 1)
+$(deferred_expected 1)
 $(control_expected 1)
 skiff: core 1 core 0 suspended, resumed, re-prioritized and stopped a task of core 1 through its inbox
 $(stats_expected 1)
@@ -244,10 +253,10 @@ $an521_core1_run"
 # runs its own, built from the one board program, and the two meet at the handshake, agreeing on the
 # layout of `.shared`, before either creates a task. Then the run is the one image's, except that core
 # 1's image uses its FPU, so its floating-point tasks run too, and that core 0 cannot name core 1's
-# timers at all, which are core 1's own.
+# timers or work at all, which are core 1's own.
 split_core0_expected="$an521_core0_greeting
 skiff: core 0 and core 1 agree on the layout of .shared
-$(echo "$an521_core0_run" | grep -v -x -F "skiff: core 0 may not command a timer of core 1")"
+$(echo "$an521_core0_run" | grep -v -x -F -e "skiff: core 0 may not command a timer of core 1" -e "skiff: core 0 may not post work of core 1")"
 split_core1_expected="skiff: hello from core 1
 skiff: core 1 agrees with core 0 on the layout of .shared
 $an521_core1_ticks

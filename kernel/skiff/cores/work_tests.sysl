@@ -1,0 +1,58 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+import skiff.kernel.{Work, WorkError}
+
+// Deferred work on the host machine of three cores (machine.sysl): work is its creating core's, every
+// other core is refused its posts, and only its own core's service calls it.
+
+// The machine the test plays, in module storage, since the callback reads which core it runs on.
+private var played: Machine
+private var works: [2]Work
+private var cores_called: [4]u32
+private var arguments_called: [4]u32
+private var calls: usize = 0
+
+// A callback recording the core it runs on and its argument.
+private ran(w: *Work, argument: u32)
+    cores_called[calls] = played.me
+    arguments_called[calls] = argument
+    calls += 1
+
+@test("work is its creating core's: other cores are refused its posts, which queue nothing, and only its own core's service calls it")
+work_belongs_to_its_core()
+    played = machine()
+    val m = &played
+    begin(m)
+    on(m, 1)
+    val one = &works[0]
+    assert(kernel.create_work(m, one, "one", &ran).is_ok(), "created on core 1")
+    assert(one.core() == Some(1), "core 1's")
+    on(m, 0)
+    val zero = &works[1]
+    assert(kernel.create_work(m, zero, "zero", &ran).is_ok(), "created on core 0")
+    for other in [0u32, 2]
+        on(m, other)
+        assert(kernel.defer_work(m, one, 9) == Err(WorkError.Remote), "a remote post refused")
+        assert_eq(kernel.deferred_waiting(m), 0)
+        assert_eq(kernel.deferred_refused(m), 0)
+    on(m, 1)
+    assert(kernel.defer_work(m, zero, 9) == Err(WorkError.Remote), "core 1 may not post core 0's")
+    assert(kernel.defer_work(m, one, 1).is_ok(), "core 1 posts its own")
+    assert_eq(kernel.deferred_waiting(m), 1)
+    on(m, 0)
+    assert(kernel.defer_work(m, zero, 2).is_ok(), "core 0 posts its own")
+    on(m, 2)
+    assert_eq(kernel.work_turn(m), 0)
+    assert_eq(calls, 0)
+    on(m, 0)
+    assert_eq(kernel.work_turn(m), 1)
+    assert_eq(calls, 1)
+    assert_eq(cores_called[0], 0)
+    assert_eq(arguments_called[0], 2)
+    on(m, 1)
+    assert_eq(kernel.work_turn(m), 1)
+    assert_eq(calls, 2)
+    assert_eq(cores_called[1], 1)
+    assert_eq(arguments_called[1], 1)

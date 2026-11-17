@@ -548,6 +548,38 @@ A software timer calls a function once a period has passed (one-shot), or every 
   read of the owner's memory, written once at creation; on a core whose cache could hold a stale zero
   the answer is `NotCreated` instead of `Remote`, never an action.
 
+## Deferred work
+
+An interrupt handler hands a function and an argument to a task of its core, which calls it in task
+context, so the handler stays short: FreeRTOS's pended function calls, Zephyr's work queues.
+
+- **A `Work` is a plain struct the application declares**, as a `Timer` is; its zero is work not yet
+  created. `create_work(p, &w, name, callback)` creates it **on the running core, which owns it from then
+  on**; a second creation is refused (`Created`). A callback is `*extern(*Work, u32)`: the work and the
+  argument of the post, for the same reason a timer's is (a stored code address is a C one, and a closure
+  needs a heap). Work has no handle, so it cannot go stale; work never created is refused (`NotCreated`).
+- **Each core has a work service**: a `Queue[WorkItem, work_items]` (option, default 8) private to the
+  core, an item being the work and its argument. The board creates the service task on each core that
+  uses deferred work, at a priority it chooses, with the body `kernel.serve_work(p)`. **Callbacks run in
+  that task**, one at a time: never in the handler, and never on another core.
+- **`defer_work(p, &w, argument)` never waits**, from a handler or a task. A full queue refuses the post
+  (`Full`) and counts it (`deferred_refused(p)`, per core, wrapping); it never overwrites, so the items
+  already queued are kept and still run.
+- **Order is FIFO per core**: items run in the order their posts were accepted on that core, whoever
+  posted them. A post from a callback goes behind every item already queued. There is no order between
+  cores, since each core's items are its own.
+- **How long a post masks**: the queue's send, which is the queue's lock (the mask, and the spin word with
+  several cores, which no other core ever holds for this queue), a copy of two words, and, when the
+  service waits, the end of that one waiter's wait and a switch asked. The service is the queue's only
+  receiver, so its wait queue holds one waiter at most and the wake looks at one record. No loop over the
+  items, so the masked part of a post is O(1) and does not grow with `work_items`. The refusal count is
+  one more masked increment.
+- **The service waits through the one `WaitQueue`**: it receives on its queue with `FOREVER`, so a post
+  wakes it as any send wakes a receiver, and an item is kept for it until it runs.
+- **Only the owner posts its work; another core is refused (`Remote`)**, touching nothing, for the reason
+  a timer command is: the queue is the owner's private state, and the inbox carries only wakes, boosts and
+  task control. A handler that needs another core's work done notifies a task of that core.
+
 ## Placement, checked
 
 - Kernel objects are declared by the application. **In a build with more than one core, an object used
