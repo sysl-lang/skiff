@@ -142,8 +142,7 @@ private task_idle() -> never
         armv7m.wait_for_interrupt()
 
 // R: the handle checks, then the waits, the timers, deferred work, task control, the statistics, the
-// mutex options, the
-// protection and the grants, then the end of the run.
+// mutex options, the protection and the grants, then the end of the run.
 private task_r() -> never
     var board = Board()
     scenarios.check_handles(&board, &entries)
