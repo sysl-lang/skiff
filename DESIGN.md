@@ -1037,18 +1037,31 @@ on, as after a fault. `kernel/skiff/kernel/watchdog.sysl` is the kernel's side.
   interrupt wired to the core's NMI; at a second expiry with the interrupt standing, with RESEN, it
   resets. One core, so it is that core's own: the board arms it, and the NMI (`skiff_nmi`, now the arch's
   NMI vector) reports `watchdog` and halts. The AN521 (SSE-200): three CMSDK watchdogs, the S32K one
-  (0x5002_E000, 32 kHz) and the secure one (0x5008_1000, 20 MHz) both through an OR gate to **CPU 0's NMI
-  alone**, and the non-secure one (0x4008_1000, 20 MHz) on interrupt 1, which a splitter delivers to
-  **both** cores. None is a core's own, so the AN521's cores have no hardware stage yet: each core's watch
-  is the kernel's, checked on its own SysTick (which each M33 has). A hardware stage there would give
-  core 0 the secure watchdog's NMI and core 1 the non-secure one's interrupt 1, enabled in core 1's NVIC
-  alone above the kernel's mask (it would see a core 1 masked by BASEPRI, not by PRIMASK), with either
-  reset machine-wide.
+  (0x5002_E000, 32 kHz) and the Secure one (0x5008_1000) both through an OR gate to **CPU 0's NMI
+  alone**, and the Non-secure one (0x4008_1000) on interrupt 1, which a splitter raises on **both**
+  cores' NVICs. QEMU's source (`hw/arm/armsse.c`) says so, and a probe image (2026-11-17, QEMU 11.1.2)
+  showed it: both count 20 MHz (40.1 and 40.4 million in 2 s of semihosting's clock); the Secure one's
+  warning was taken on core 0 as an NMI and not on core 1; the Non-secure one's was taken on core 1, its
+  interrupt 1 at priority 0x40, while core 1 spun with BASEPRI at 0x80 (`mask`), and stood pending in
+  core 0's NVIC too, where it is not enabled; and the Secure one left unfed past its second expiry reset
+  the whole machine, core 0 booting again from the top. So the hardware stage is **core 0's the Secure
+  watchdog, core 1's the Non-secure one**: each core starts, feeds and stops its own (`chips/an521`
+  `watchdog.sysl`, `HardwareWatchdog`); core 0's warning is its NMI (`skiff_nmi`), core 1's is interrupt
+  1 (`skiff_watchdog`), enabled in core 1's NVIC alone at `WATCHDOG_IRQ_PRIORITY` (0x40), above the
+  kernel's mask, so it sees a core 1 spinning masked by BASEPRI (not one masked by PRIMASK, which only an
+  NMI would). Either watchdog's reset is the machine's, so a bite must stop the biting core's own stage
+  first, or a stopped core resets the cores still running. In two images the system description gives
+  each watchdog to its core (`OWNERS`: `SecureWatchdog` core 0, `NonSecureWatchdog` core 1); a resource
+  with two owners is refused at build, and the board asserts the wiring's assignment.
 - **Scenarios**: R's last on each core (`boards/scenarios/.../watchdog.sysl`): period 20, timeout 50, 60
-  healthy ticks. On the MPS2 the hang masks the kernel's interrupts, so only the NMI sees it, and the run
-  ends with `WATCHDOG_STATUS` (98). On the AN521 core 1's hang spins unmasked above its watched task, and
-  its watch bites from its tick; core 0's watch stays fed while it waits to see core 1 stopped. This
-  replaces the BusFault that ended core 1 before.
+  healthy ticks. The hang says first how it hangs. On the MPS2 the hang masks the kernel's interrupts,
+  so only the NMI sees it, and the run ends with `WATCHDOG_STATUS` (98). On the AN521 core 1 ends the run
+  by one stage or the other: in the one image its hang spins unmasked above its watched task, and its
+  watch bites from its tick; in two images its hang masks the kernel's interrupts (BASEPRI), its tick
+  stops, and its hardware stage's interrupt 1 bites. Core 0's watch and hardware stage stay fed while it
+  waits to see core 1 stopped; it then runs on 200 of its ticks, past the reset core 1's unstopped stage
+  would have made (at most 150 ticks after a software bite, 100 after a hardware one), and only then
+  stops the machine: a bite that did not stop the stage starts the run again, and the boot never ends.
 
 ## Tracing
 
