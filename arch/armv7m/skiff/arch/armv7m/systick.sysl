@@ -192,19 +192,20 @@ deep_wait()
 
 // After a frozen tick with `first` cycles left of its period, `elapsed` cycles slept as another clock
 // measured them: restart the tick in step and let interrupts through again. Answers the tick periods that
-// ended, whose interrupts are never delivered.
-systick_thaw(first: u32, elapsed: u64) -> u32
+// ended, whose interrupts are never delivered. 32-bit arithmetic: the hardware divides it in a few cycles
+// with the kernel masked, and 2^32 cycles is minutes at any clock a stop is armed against.
+systick_thaw(first: u32, elapsed: u32) -> u32
     val t: *SysTick = ptr_cast(SYSTICK)
     val icsr: *Register = ptr_cast(ICSR)
     val period = t.rvr + 1
     var ended: u32 = 0
     var next: u32 = 0
-    if elapsed >= u64(first)
-        val past = elapsed - u64(first)
-        ended = u32(1 + past / u64(period))
-        next = period - u32(past % u64(period))
+    if elapsed >= first
+        val past = elapsed - first
+        ended = 1 + past / period
+        next = period - past % period
     else
-        next = first - u32(elapsed)
+        next = first - elapsed
     if next < SHORTEST && next + period <= RELOAD_LIMIT
         ended += 1
         next += period

@@ -17,9 +17,12 @@ rest[P: Port](p: *P)
     val c = here(p)
     val state = p.mask()
     val step = take_part(p, c)
-    if step == STEP_DONE
+    if step == STEP_HOLD
+        hold_step(p, c, state)
+        return
+    if step == STEP_STOP
         p.restore(state)
-        if end_expired_waits(p, c) then p.request_switch()
+        stop_step(p, c)
         return
     val count = if step == STEP_WAIT then 0 else skippable(p, c)
     if count < 2

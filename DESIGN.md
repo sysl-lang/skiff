@@ -741,6 +741,12 @@ base corrected by a timer that kept running. `kernel/skiff/kernel/stop.sysl` is 
   latency of the leader its deadlines read early time; once the leader takes the slept periods, the
   core's next tick finds the time base moved and records it (DESIGN "Time"), losing the stop's periods
   from its own count only, as a masked core loses them.
+- **Masked time.** The idle step's decision is one masked stretch; the hold, the stop and the ticks taken
+  after each are masked pieces of their own (`hold_step`, `stop_step`), so the longest is the stop's own
+  entry and exit around the sleep (time asleep is not masked time), held to the gate's bound with 32-bit
+  arithmetic the hardware divides. Between the pieces interrupts are taken; a leader that leaves its idle
+  task between deciding and entering ends the stop as it leaves (`withdraw`), and one that finds something
+  to run when it comes to enter ends it there.
 - **Supervision.** A stop is bounded by every core's deadline, and each core's published deadline is
   bounded by what its watch allows (`watch_allows`), so no watch can come due during a stop; on waking,
   each core feeds its watch as of the last tick of the stop that every watched task was within its period
@@ -758,10 +764,13 @@ base corrected by a timer that kept running. `kernel/skiff/kernel/stop.sysl` is 
 - **The RP2350** (`chips/rp2350/stop.sysl`, `arch/armv7m/stop.sysl`): the always-on timer counts
   milliseconds from the LPOSC from boot. `hold` freezes SysTick (ENABLE cleared, the count kept), sets
   SLEEPDEEP and waits with PRIMASK set and BASEPRI open, then thaws it. `stop_machine` freezes SysTick,
-  arms the alarm `count` periods less what the current period had left, enables POWMAN_IRQ_TIMER in its
+  arms the alarm for what the current period had left plus `count - 1` periods, rounded up to the timer's
+  millisecond, enables POWMAN_IRQ_TIMER in its
   own NVIC, gates every clock but POWMAN's and the SIO's (SLEEP_EN0/1), sleeps deep, then restores them,
   clears and disables the alarm and its pending interrupt, and thaws SysTick by the milliseconds read
-  from the timer. Threshold 4 ticks, limit 6000 (a minute at 100 Hz).
+  from the timer. Threshold 4 ticks, limit 6000 (a minute at 100 Hz). The board scenario checks the time
+  base against the always-on timer over each core's wait, so a time base that stood still through a stop
+  is seen even though every deadline, read against that same time base, looks met.
 
 ## Software timers
 

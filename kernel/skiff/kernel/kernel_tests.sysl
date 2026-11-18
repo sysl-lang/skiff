@@ -226,7 +226,7 @@ deadline_across_wrap()
     assert(expired(5, 5), "the deadline, after the wrap")
     assert(expired(0xffff_ffff, 2), "a deadline before the wrap, seen after it")
 
-private[kernel] fresh_core(id: u32, own: u32, seen: u32) -> Core = Core(id, Atomic(own), seen, false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false, 0, 0, 0, 0, 0, 0, 0, 0)
+private[kernel] fresh_core(id: u32, own: u32, seen: u32) -> Core = Core(id, Atomic(own), seen, false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
 @test("a tick advances the time base unless another core's has since this core's last, whichever core it is")
 a_tick_advances_time_unless_another_did()

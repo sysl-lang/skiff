@@ -37,7 +37,10 @@ private const SLEEP_EN0_ALL: u32 = 0xffff_ffff
 private const SLEEP_EN1_ALL: u32 = 0x7fff_ffff
 private const KEPT_IN_SLEEP: u32 = (1 << 31) | (1 << 24) | (1 << 23)   // CLK_SYS_SIO, CLK_SYS_POWMAN, CLK_REF_POWMAN
 
-private const CYCLES_PER_MS: u64 = u64(CLOCK_HZ / 1000)
+private const CYCLES_PER_MS: u32 = CLOCK_HZ / 1000
+
+// The longest stop measured, in milliseconds: its cycles must fit 32 bits.
+private const LONGEST_MS: u32 = 0xffff_ffff / CYCLES_PER_MS
 
 // Start the always-on timer from 0, counting from the LPOSC. Core 0, once, at boot.
 start_wake_timer()
@@ -54,14 +57,15 @@ wake_timer_now() -> u64
 // With the kernel's handlers masked and the other core held: freeze the tick, arm the alarm for `count`
 // ticks after the last one (rounded up to the timer's millisecond), gate the clocks, sleep in the deep wait
 // until the alarm or any interrupt, then put the clocks back, disarm the alarm and thaw the tick by the
-// milliseconds the timer counted. Answers the tick periods that ended.
+// milliseconds the timer counted. Answers the tick periods that ended. Everything masked is 32-bit (the
+// hardware divides it), but for the timer's 64-bit count, which is only added to and subtracted from.
 stop_machine(count: u32) -> u32
     val first = armv7m.systick_freeze()
     if first == 0 then return 0
     val period = armv7m.systick_period()
-    val wanted = u64(first) + u64(count - 1) * u64(period)
+    val wanted = first + (count - 1) * period
     val start = wake_timer_now()
-    set_alarm(start + (wanted + CYCLES_PER_MS - 1) / CYCLES_PER_MS)
+    set_alarm(start + u64((wanted + CYCLES_PER_MS - 1) / CYCLES_PER_MS))
     reg(INTE).v = PASSWORD | INTE_TIMER
     armv7m.set_irq_priority(POWMAN_IRQ_TIMER, armv7m.KERNEL_IRQ_PRIORITY)
     armv7m.enable_irq(POWMAN_IRQ_TIMER)
@@ -76,7 +80,9 @@ stop_machine(count: u32) -> u32
     reg(INTE).v = PASSWORD
     armv7m.disable_irq(POWMAN_IRQ_TIMER)
     armv7m.unpend_irq(POWMAN_IRQ_TIMER)
-    armv7m.systick_thaw(first, (end - start) * CYCLES_PER_MS)
+    val slept = end - start
+    val ms = if slept > u64(LONGEST_MS) then LONGEST_MS else u32(slept)
+    armv7m.systick_thaw(first, ms * CYCLES_PER_MS)
 
 // Arm the alarm for the count `at`: disabled and cleared first, so an old latch cannot end the sleep.
 private set_alarm(at: u64)
