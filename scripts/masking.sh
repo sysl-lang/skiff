@@ -14,13 +14,17 @@
 # What is bounded, per core:
 #
 #   - The longest masked interval the kernel makes, from the instruction that masked to the one that
-#     unmasked, the chip lock's ticket wait inside it. Measured on dev 8b41e89: core 0 1360, core 1 1524.
-#     What dominates: a StreamBuffer[64] or MessageBuffer[64] send or receive copying up to 64 bytes
-#     under its object's lock (stream.sysl `fill`/`drain`, a loop per byte), behind the other core's hold
-#     of the same lock (the scenarios pour 3000 bytes and 200 messages between the cores, both blocking).
-#     Next come `add_task` (~1146: `free_slot`, `set_map`, the first frame and the note's renewal) and a
-#     semaphore's give behind the other core's hammer (~1114). The bound leaves about 30% over the worst.
-#   - How many masked intervals reach 1024 cycles: measured 1573 on core 0, 158 on core 1, of ~667,000
+#     unmasked, the chip lock's ticket wait inside it. Measured: core 0 1211, core 1 1146. Every hold is
+#     now a constant amount of work plus the ticket wait: a stream buffer copies its bytes with the lock
+#     let go (DESIGN "Stream buffers copy with the lock let go"); when it copied under the lock its
+#     StreamBuffer[64] sends and receives were the longest (1224-1360 and 1524-1534). The longest now:
+#     on core 0 a StreamBuffer[64] send's last hold before it blocks (commit, enqueue, trace event, behind
+#     the other core's hold of the same lock, ~1211); `add_task` (~1146: `free_slot`, `set_map`, the
+#     first frame and the note's renewal); a MessageBuffer[64] receive's hold (~1135); a semaphore's give
+#     behind the other core's hammer (~1114). The bound is the worst plus about 15%, under the ~1500 a
+#     64-byte copy under the lock takes again (control m7sc1).
+#   - How many masked intervals reach 1024 cycles: measured 363 on core 0, 83 on core 1 (1573 and 158
+#     while streams copied under the lock), of ~667,000
 #     each. Almost every hold is under 1024 (the hammers' 267,000 gives and takes per core, behind each
 #     other's, are 512-1023; the ~2,800 ticks and ~10,000 switches are shorter). A path the boot takes
 #     often that grows past 1024 cycles, as a scan over the tasks or the waiters would make it, moves
@@ -54,7 +58,7 @@ addr2line=${SKIFF_ADDR2LINE:-arm-none-eabi-addr2line}
 scratch="$root/scratch"
 mkdir -p "$scratch"
 
-masked_bound=2000
+masked_bound=1400
 tail_from=1024
 tail_bound=2500
 irq_bound=$masked_bound
