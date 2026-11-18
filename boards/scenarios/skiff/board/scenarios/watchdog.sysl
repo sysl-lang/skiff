@@ -11,7 +11,9 @@ import skiff.kernel.Port
 //   - unmasked (`masked` false), the core's tick still runs, and the watch bites from it: the board
 //     reports `watchdog` and stops the core alone;
 //   - masked, the tick runs no more, so no software watch can see the hang: the hardware watchdog's warning
-//     (an NMI) is what reports it.
+//     is what reports it (an NMI, or an interrupt above the kernel's mask).
+//
+// The hang says which before it starts, so a console shows which stage was to see it.
 //
 // The core's own ticks come late and in bunches under multi-threaded TCG on a loaded host (up to 5 at
 // once on the AN521's core 1), so the period and the timeout are generous: 20 and 50 ticks.
@@ -46,6 +48,9 @@ beat_task[P: Port](p: *P) -> never
 // The hang: spin for ever above the watched task, with the kernel's interrupts masked or not.
 hang_task[P: Port](p: *P, masked: bool) -> never
     if masked
+        say(p, "hangs with the kernel's interrupts masked\n")
         val _ = p.mask()
+    else
+        say(p, "hangs above its watched task with interrupts open\n")
     loop
         ()

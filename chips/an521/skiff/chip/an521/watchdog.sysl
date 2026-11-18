@@ -1,0 +1,79 @@
+module skiff.chip.an521
+
+import sysl.raw.ptr_cast
+
+// The SSE-200's CMSDK watchdogs on its 20 MHz main clock, one a core's hardware watchdog (DESIGN
+// "Supervision"). QEMU wires them as the SSE-200 does:
+//
+//   - the Secure one (0x5008_1000) to an OR gate, with the S32K one, into **CPU 0's NMI alone**: core 0's;
+//   - the Non-secure one (0x4008_1000) to interrupt 1, which a splitter raises on **both** cores' NVICs:
+//     core 1's, enabled in core 1's NVIC alone, at a priority `mask` does not hold off.
+//
+// Each counts down from its load; at zero it raises its interrupt and reloads; at zero again with the
+// interrupt still raised it resets the whole machine, both cores. A write to its interrupt clear lowers
+// the interrupt and reloads the count. Every write but the lock's is dropped while it is locked, so each
+// change unlocks it first and locks it again after.
+
+private struct WatchdogRegisters
+    load: volatile u32          // 0x00
+    value: volatile u32         // 0x04
+    control: volatile u32       // 0x08 bit 0 interrupt enable (and start), bit 1 reset enable
+    clear: volatile u32         // 0x0c any write: lower the interrupt, reload the count
+
+private struct WatchdogLock
+    key: volatile u32           // 0xc00
+
+@assert(offsetof(WatchdogRegisters, clear) == 0x0c, "WDOGINTCLR is at 0x0c")
+
+// The two watchdogs a core may own.
+enum HardwareWatchdog: u8
+    Secure = 0          // its warning is CPU 0's NMI
+    NonSecure = 1       // its warning is interrupt 1, on both cores
+
+// The Non-secure watchdog's interrupt.
+const WATCHDOG_IRQ: u32 = 1
+
+// The clock both count on: the SSE-200's main clock, the cores' own.
+const WATCHDOG_CLOCK_HZ: u32 = CLOCK_HZ
+
+private const LOCK_OFFSET: usize = 0xc00
+private const UNLOCK: u32 = 0x1acc_e551
+private const INTERRUPT: u32 = 1
+private const RESET: u32 = 2
+
+private base(w: HardwareWatchdog) -> usize = w match
+    HardwareWatchdog.Secure -> 0x5008_1000
+    HardwareWatchdog.NonSecure -> 0x4008_1000
+
+private registers(w: HardwareWatchdog) -> *WatchdogRegisters = ptr_cast(base(w))
+
+// Open the watchdog to writes, or shut it again.
+private lock(w: HardwareWatchdog, open: bool)
+    val l: *WatchdogLock = ptr_cast(base(w) + LOCK_OFFSET)
+    l.key = if open then UNLOCK else 0
+
+// Start `w` to warn after `cycles` of the main clock unfed, and reset the machine `cycles` after that.
+watchdog_start(w: HardwareWatchdog, cycles: u32)
+    lock(w, true)
+    val r = registers(w)
+    r.control = 0
+    r.load = cycles
+    r.control = INTERRUPT | RESET
+    lock(w, false)
+
+// Feed `w`: the full count again.
+watchdog_feed(w: HardwareWatchdog)
+    lock(w, true)
+    registers(w).clear = 1
+    lock(w, false)
+
+// Stop `w`, its interrupt lowered.
+watchdog_stop(w: HardwareWatchdog)
+    lock(w, true)
+    val r = registers(w)
+    r.control = 0
+    r.clear = 1
+    lock(w, false)
+
+// What `w` has left to count before it next expires.
+watchdog_value(w: HardwareWatchdog) -> u32 = registers(w).value

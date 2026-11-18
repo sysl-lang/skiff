@@ -3,14 +3,16 @@
 // Core 0 creates both cores' tasks and releases core 1; each core greets, watches three of its own ticks
 // and runs its own tasks (skiff.board.scenarios) at once with the other. Then core 1 hangs on purpose,
 // and its watchdog, checked on its own tick, stops it alone. Core 0 sees it stopped, ticks on, checks that
-// the time base still moves a period for each of its own ticks with core 1 gone, and stops the machine
+// the time base still moves a period for each of its own ticks with core 1 gone, runs on long enough for
+// core 1's hardware watchdog to have reset the machine had the bite not stopped it, and stops the machine
 // with status 0.
 //
 // Built as two images (the `core0` and `core1` features), each core runs its own, and the system
 // description (system.sysl) is what the two share: each core takes the peripherals and interrupts it
 // owns, core 0 creates its own tasks and offers its layout fingerprint, and core 1, once released,
 // compares it with its own before it creates its tasks. Core 1's image may use its FPU, so its tasks
-// include the floating-point ones. From there the run is the one image's.
+// include the floating-point ones. From there the run is the one image's, but for core 1's hang: it masks
+// the kernel's interrupts, so its tick stops and only its hardware watchdog sees it.
 
 import sysl.debug.ErrorTraceStore
 import sysl.sync.Atomic
@@ -52,6 +54,16 @@ private const TIMER_IRQ: u32 = if system.owns(IMAGE_CORE, Resource.DualTimer) th
 #else
 private const TIMER_IRQ: u32 = an521.TIMER0_IRQ
 #endif
+
+// Each core's hardware watchdog is fixed by the wiring (an521 watchdog.sysl): the Secure one warns through
+// CPU 0's NMI alone, and the Non-secure one's interrupt is the one core 1 enables.
+@assert(system.owns(0, Resource.SecureWatchdog), "the Secure watchdog warns through CPU 0's NMI alone, so core 0 owns it")
+@assert(system.owns(1, Resource.NonSecureWatchdog), "core 1's hardware watchdog is the Non-secure one, so core 1 owns it")
+
+// How many of core 0's own ticks it runs on once it sees core 1 stopped, before it stops the machine:
+// more than the 150 a hardware watchdog unfed since a software bite still counts before its reset (twice
+// `HARDWARE_STAGE` times the scenario's timeout of 50, less the 50 that bite came after).
+private const OUTLIVE: u32 = 200
 
 // The status core 0 stops the machine with when the images disagree at the handshake.
 private const HANDSHAKE_REFUSED: i32 = 3
@@ -105,13 +117,17 @@ impl Isolation for Board
 impl RunCounter for Board
     run_count(*self) -> u32 = an521.counter_now()
 
-// No hardware stage: QEMU's SSE-200 wires its two secure watchdogs to CPU 0's NMI alone and its
-// non-secure one to interrupt 1 of both cores, so no hardware watchdog is a core's own (DESIGN
-// "Supervision"). Each core's watch is the kernel's, checked on its own tick.
+// Each core's hardware stage (DESIGN "Supervision"): core 0's the Secure CMSDK watchdog, whose warning is
+// its NMI; core 1's the Non-secure one, whose warning is interrupt 1, enabled in core 1's NVIC alone above
+// what `mask` holds off. Both count on the cores' 20 MHz clock. Either one's reset is the whole machine's,
+// so a bite stops the biting core's.
 impl Watchdog for Board
-    start_watchdog(*self, ticks: u32) = ()
-    feed_watchdog(*self) = ()
-    stop_watchdog(*self) = ()
+    start_watchdog(*self, ticks: u32) = an521.watchdog_start(own_watchdog(), ticks * (an521.WATCHDOG_CLOCK_HZ / kernel.TICK_HZ))
+    feed_watchdog(*self) = an521.watchdog_feed(own_watchdog())
+    stop_watchdog(*self) = an521.watchdog_stop(own_watchdog())
+
+// The running core's hardware watchdog.
+private own_watchdog() -> an521.HardwareWatchdog = if an521.core_id() == 0 then an521.HardwareWatchdog.Secure else an521.HardwareWatchdog.NonSecure
 
 // The bounds of the code and its constants, on 32-byte boundaries (link.ld): what every unprivileged
 // task runs.
@@ -152,6 +168,7 @@ private start_both(board: *Board, me: u32)
     val answer = kernel.boot(board)
     enable(an521.TIMER0_IRQ)
     enable(an521.MHU0_IRQ)
+    if me == 1 then enable_watchdog_irq()
     if me == 0
         status = answer
         place_shared(board)
@@ -207,11 +224,19 @@ private take(what: Resource)
         Resource.Doorbell0 -> enable(an521.MHU0_IRQ)
         Resource.Doorbell1 -> enable(an521.MHU0_IRQ)
         Resource.Security -> an521.open_uarts_to_unprivileged()
+        Resource.SecureWatchdog -> ()       // its warning is the NMI, which nothing masks
+        Resource.NonSecureWatchdog -> enable_watchdog_irq()
 
 // Interrupt `irq` on the running core's NVIC, at the kernel's priority.
 private enable(irq: u32)
     armv7m.set_irq_priority(irq, armv7m.KERNEL_IRQ_PRIORITY)
     armv7m.enable_irq(irq)
+
+// The Non-secure watchdog's interrupt on the running core's NVIC, above what `mask` holds off: it is taken
+// from a core spinning with the kernel's handlers masked, whose tick no longer runs.
+private enable_watchdog_irq()
+    armv7m.set_irq_priority(an521.WATCHDOG_IRQ, armv7m.WATCHDOG_IRQ_PRIORITY)
+    armv7m.enable_irq(an521.WATCHDOG_IRQ)
 
 // Core 0: check and give the kernel `.shared`'s bounds, make core 0's console the machine's, and give the
 // scenarios the system's structure.
@@ -255,7 +280,9 @@ private task_subject() -> never = scenarios.subject_task(&Board())
 private task_measured() -> never = scenarios.measured_task(&Board())
 private task_locker() -> never = scenarios.locker_task(&Board())
 private task_beat() -> never = scenarios.beat_task(&Board())
-private task_hang() -> never = scenarios.hang_task(&Board(), false)
+// One image: the hang leaves the kernel's interrupts unmasked, so the core's own tick bites. Two images:
+// it masks them, so only the hardware watchdog's interrupt does.
+private task_hang() -> never = scenarios.hang_task(&Board(), SPLIT)
 private task_traced() -> never = scenarios.traced_task(&Board())
 private task_selector() -> never = scenarios.selector_task(&Board())
 private task_console() -> never = kernel.serve_console(&Board())
@@ -279,7 +306,8 @@ private task_idle() -> never
 // mutex options, the queue sets, the kernel's trace, the error traces, the protection, the grants, the time base without core 0, a sleep with the tick
 // stopped and the watchdog, then the
 // end of the run. Core 1 hangs, and its watchdog stops it; core 0, its own watch still fed, waits until
-// it sees core 1 stopped, ticks on, and stops the machine.
+// it sees core 1 stopped, ticks on, outlives the reset core 1's hardware watchdog would have made had its
+// bite not stopped it, and stops the machine.
 private task_r() -> never
     var board = Board()
     scenarios.check_handles(&board, &entries)
@@ -311,6 +339,9 @@ private task_r() -> never
     val took = kernel.here(&board).own_ticks() -% own
     if moved >= 3 && took >= moved && took <= moved + 1
         board.write("skiff: core 0 keeps the time base alone\n".bytes)
+    val since = kernel.here(&board).own_ticks()
+    while kernel.here(&board).own_ticks() -% since < OUTLIVE do kernel.sleep(&board, 10)
+    board.write("skiff: core 0 ran on 200 ticks after core 1 stopped, and no watchdog reset the machine\n".bytes)
     kernel.console_flush(&board)
     armv7m.halt(status)
 
@@ -331,9 +362,18 @@ board_tick()
     if kernel.supervise(&board) then armv7m.stop_core()
     kernel.interrupt_exited(&board, armv7m.SYSTICK_EXCEPTION)
 
-// The NMI, which only core 0 takes, from a watchdog no core arms: the kernel's verdict all the same.
+// The NMI, which only core 0 takes: its hardware watchdog's warning (or the S32K watchdog's, which no
+// core arms). The kernel's verdict, as from core 0's tick.
 @export("skiff_nmi")
 board_nmi()
+    var board = Board()
+    kernel.bite(&board)
+    armv7m.stop_core()
+
+// Interrupt 1, the Non-secure watchdog's warning, which only core 1's NVIC takes: core 1's hardware stage,
+// above the kernel's mask, so it sees a core 1 spinning masked. The kernel's verdict, as from its tick.
+@export("skiff_watchdog")
+board_watchdog()
     var board = Board()
     kernel.bite(&board)
     armv7m.stop_core()
