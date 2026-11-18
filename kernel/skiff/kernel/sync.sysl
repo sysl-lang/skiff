@@ -238,6 +238,10 @@ impl Mutex
             // The best of those left waiting is the one behind the heir.
             if self.w.queue.count > 1 then inherited = waiter(self.w.queue.after(at)).priority
             val t = waiter(at).task
+            // The heir is the owner before anything tells it so: a heir of another core may run as soon
+            // as the `Hand` is posted, and read `holder` and `depth`, which take no lock.
+            self.owner = t
+            self.locks = 1
             if another_core(t.core(), c.id)
                 // The heir's core counts it held and takes up the ceiling, which the `Hand` reads from
                 // the mutex it names.
@@ -249,8 +253,6 @@ impl Mutex
                 heir = u16(t.slot())
                 c.sched.tasks[t.slot()].held += 1
                 if self.ceiling != 0 then c.sched.hold_ceiling(t.slot(), self.ceiling)
-            self.owner = t
-            self.locks = 1
         l.release()
         if heir != NONE then inherit(p, c, usize(heir), inherited)
         if c.sched.tasks[i].held == 0 then c.sched.tasks[i].boost = IDLE_PRIORITY
