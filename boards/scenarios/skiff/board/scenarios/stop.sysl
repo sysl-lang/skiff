@@ -9,17 +9,20 @@ import skiff.kernel.{Port, Semaphore}
 // sleeps on past the other's deadline. With every other task waiting, both cores are idle long enough, so
 // the machine stops until the soonest deadline, its wake timer ends the stop, and both cores take the
 // ticks it slept. Each wait must end on its deadline (within `LATE`), and each core must have been part of
-// a stop and have taken, from stops, most of the ticks the waits spanned. Then both forbid the stop again.
+// a stop and have taken, from stops, most of the ticks the waits spanned. The board's `clock` (milliseconds, from
+// a timer that runs through the stop) must agree with the time base over the wait, so a time base that
+// stood still while the machine slept is seen however its deadlines read. Then both forbid the stop again.
 
 private const NAP: u32 = 40         // core 0's timed take
 private const SLEEP: u32 = 60       // core 1's sleep
 private const AFTER: u32 = 70       // where both sleep to once their own wait has ended
 private const LATE: u32 = 2
+private const MS_LATE: u64 = 2 * 1000 / u64(kernel.TICK_HZ)   // how far the wake timer may differ from the time base
 
 private var stop_naps = [Semaphore.new("stop nap", 0, 1); kernel.CORES]
 
 // R's part, on the running core.
-deep_stop[P: Port](p: *P)
+deep_stop[P: Port](p: *P, clock: *extern() -> u64)
     val me = kernel.here_id(p)
     kernel.allow_stop(p, true)
     val stops = kernel.machine_stops(p)
@@ -34,6 +37,7 @@ deep_stop[P: Port](p: *P)
         while common.stop_ready[0].load() == 0 do kernel.sleep(p, 1)
     val start = common.stop_from.load()
     kernel.sleep_until(p, start)
+    val began = clock()
     var right = true
     var ended: u32 = 0
     if me == 0
@@ -44,6 +48,9 @@ deep_stop[P: Port](p: *P)
         kernel.sleep_until(p, start +% SLEEP)
         ended = kernel.ticks()
         right = stop_on_time(start +% SLEEP, ended)
+    val spent = clock() - began
+    val expected = u64(ended -% start) * 1000 / u64(kernel.TICK_HZ)
+    right = right && spent + MS_LATE >= expected && spent <= expected + MS_LATE
     kernel.sleep_until(p, start +% AFTER)
     val took = kernel.stopped_ticks(p) -% stopped
     val count = kernel.machine_stops(p) -% stops
@@ -57,7 +64,9 @@ deep_stop[P: Port](p: *P)
         kernel.write_dec(p, count)
         p.write(" stops and ".bytes)
         kernel.write_dec(p, took)
-        p.write(" ticks taken from them\n".bytes)
+        p.write(" ticks taken from them; the wake timer counted ".bytes)
+        kernel.write_dec(p, u32(spent))
+        p.write(" ms\n".bytes)
 
 // Whether `now` is at or after `deadline`, by no more than `LATE`.
 private stop_on_time(deadline: u32, now: u32) -> bool = kernel.expired(deadline, now) && now -% deadline <= LATE
