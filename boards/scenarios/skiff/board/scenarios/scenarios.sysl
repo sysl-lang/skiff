@@ -97,6 +97,8 @@ private var overtaken: [kernel.CORES]bool
 private var arrived: [kernel.CORES]Atomic[u32]
 private var finished: [kernel.CORES]Atomic[u32]
 private var kept: [kernel.CORES]Atomic[u32]
+private var turn: [kernel.CORES]Atomic[u32]
+private var turned: [kernel.CORES]Atomic[u32]
 
 // Create core `core`'s tasks. Core 0 calls it for every core before any other core starts.
 create_tasks[P: Port](p: *P, core: u32, e: *Entries)
@@ -136,19 +138,23 @@ run_tasks[P: Port](p: *P, e: *Entries) -> never
     epochs[me] = kernel.ticks()
     kernel.run(p, stacks[me][IDLE_STACK], e.idle)
 
-// A and B: wait for tick 2, print three lines, each followed by a wait for the core's next tick, then
-// exit, or spin until tick 40 first.
+// A and B: wait for tick 2, print three lines, A's and B's alternating, then exit, or spin until tick 40
+// first. Neither ever yields, so each line waits for the other task's, which only the tick's round-robin
+// rotation can bring about. The order is the turn counter's, not the tick's: ticks delivered late and in
+// bunches can give one task two quanta running, and a line per tick would then be out of order.
 take_turns[P: Port](p: *P, label: string, spin: bool) -> never
     val me = kernel.here_id(p)
     kernel.sleep_until(p, epochs[me] + 2)
     for n in 1u32..3
+        val mine = 2 * (n - 1) + (if spin then 1u32 else 0u32)
+        while turn[me].load() != mine do ()
         say(p, "task ")
         p.write(label.bytes)
         p.write(" ".bytes)
         kernel.write_dec(p, n)
         p.write("\n".bytes)
-        val t = kernel.here(p).own_ticks()
-        while kernel.here(p).own_ticks() == t do ()
+        val _ = turn[me].add(1)
+    val _ = turned[me].add(1)
     if spin
         while kernel.ticks() - epochs[me] < 40
             if kernel.state(p, high[me]) == Ok(TaskState.Ready) then overtaken[me] = true
@@ -178,6 +184,9 @@ fp_task[P: Port](p: *P, base: u32, e: *Entries) -> never
     kernel.sleep_until(p, epochs[me] + 15)
     val _ = kept[me].add(fp_probe(base, e.meet))
     if finished[me].add(1) == 1
+        // A and B's lines come first: they take a round-robin turn per tick delivered, and ticks delivered
+        // in bunches run the time base on faster than the turns. Bounded, so a lost turn still reports.
+        while turned[me].load() < 2 && kernel.ticks() - epochs[me] < 65 do kernel.sleep(p, 1)
         if kept[me].load() == 32
             say(p, "f32 registers survived the switches\n")
         else

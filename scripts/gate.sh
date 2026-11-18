@@ -11,7 +11,10 @@
 #      kernel/ fails here on the first target that cannot have it;
 #   3. the boot test, at the default optimisation and at -O0. The boards build the kernel with `trace`;
 #   4. the bound on masked time: the Pico 2 boot on benchtop with its masking report, each core's longest
-#      masked interval and its kernel interrupts' worst latency held to a bound (scripts/masking.sh).
+#      masked interval and its kernel interrupts', PendSV's and core 1's SysTick's worst latency held to
+#      a bound (scripts/masking.sh);
+#   5. seeded boots: the Pico 2 boot under 12 seeds of benchtop's schedule and fault knobs, each held to
+#      the boot test's lines (scripts/seeded.sh; larger sweeps are `seeded.sh <n> <first seed>`).
 
 set -u
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -39,6 +42,7 @@ done
 step "$root/scripts/boot-test.sh"
 step env SKIFF_OPT=-O0 "$root/scripts/boot-test.sh"
 step "$root/scripts/masking.sh"
+step env SKIFF_JOBS=4 "$root/scripts/seeded.sh" 12 1
 
 if [ "$failed" -eq 0 ]; then echo "GATE: green"; else echo "GATE: red"; fi
 exit $failed

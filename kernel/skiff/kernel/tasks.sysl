@@ -92,6 +92,58 @@ struct Tcb
 // An empty slot, in its first generation.
 private[kernel] val FREE_TCB: Tcb = Tcb(0, 0, TaskState.Free, 1, NONE, NONE, 0, NONE, 0, 0, None, 0, 0, false, 0, 0, [0; PRIORITIES], 0)
 
+// The words of a core's `SlotSet`s: one bit per slot, and one bit per slot word. `option_tasks` is at
+// most 4096, so there are at most 128 slot words and 4 group words.
+private const SLOT_WORDS: usize = (option_tasks + 31) / 32
+private const SLOT_GROUPS: usize = (SLOT_WORDS + 31) / 32
+
+// A set of slots whose lowest member is found in constant time: `W` words of a bit per slot, and `G`
+// group words of a bit per slot word, set while that word has a member. Adding and removing a slot touch
+// one word of each; finding the lowest member reads at most the `G` group words and two slot words, which
+// is 4 and 2 at the largest table, whatever the slots hold.
+struct SlotSet[const W: usize, const G: usize]
+    words: [W]u32
+    groups: [G]u32
+
+// The bit for slot (or slot word) `i` in its word.
+private slot_bit(i: usize) -> u32 = 1 << u32(i % 32)
+
+impl[const W: usize, const G: usize] SlotSet[W, G]
+    // Whether slot `i` is in the set.
+    has(*self, i: usize) -> bool = (self.words[i / 32] & slot_bit(i)) != 0
+
+    add(*self, i: usize)
+        self.words[i / 32] |= slot_bit(i)
+        self.groups[i / 1024] |= slot_bit(i / 32)
+
+    remove(*self, i: usize)
+        val w = i / 32
+        self.words[w] &= ~slot_bit(i)
+        if self.words[w] == 0 then self.groups[w / 32] &= ~slot_bit(w)
+
+    // The lowest slot in the set other than `skip`, or None. Only `skip`'s word can come up empty once
+    // `skip` is left out, so at most two slot words are read.
+    lowest_except(*self, skip: usize) -> Option[usize]
+        for g in 0..<G
+            var words = self.groups[g]
+            while words != 0
+                val w = g * 32 + usize(words.trailing_zeros())
+                var bits = self.words[w]
+                if w == skip / 32 then bits &= ~slot_bit(skip)
+                if bits != 0 then return Some(w * 32 + usize(bits.trailing_zeros()))
+                words &= words - 1
+        None
+
+// A core's set of no slots.
+private val NO_SLOTS: SlotSet[SLOT_WORDS, SLOT_GROUPS] = SlotSet[SLOT_WORDS, SLOT_GROUPS]([0; SLOT_WORDS], [0; SLOT_GROUPS])
+
+// A core's set of every slot of its table.
+private every_slot() -> SlotSet[SLOT_WORDS, SLOT_GROUPS]
+    var s = NO_SLOTS
+    for i in 0..<option_tasks
+        s.add(i)
+    s
+
 // One core's table and the choices made over it. It holds no hardware state, so the host tests drive
 // one directly; each core's is in its `Core`.
 struct Scheduler
@@ -102,36 +154,68 @@ struct Scheduler
     running: u16                // NONE until the core runs its first task
     timeouts: u16               // the first sleeper, in deadline order
     expiring: u16               // the waits whose deadline has come, for the kernel to end under their objects' locks
+    free: SlotSet[SLOT_WORDS, SLOT_GROUPS]      // the `Free` slots but those taken by a creation not yet finished
+    stopped: SlotSet[SLOT_WORDS, SLOT_GROUPS]   // the `Stopped` slots
 
 // A table with no tasks in it.
-private[kernel] val EMPTY_SCHEDULER: Scheduler = Scheduler([FREE_TCB; option_tasks], 0, [NONE; PRIORITIES], [NONE; PRIORITIES], NONE, NONE, NONE)
+private[kernel] val EMPTY_SCHEDULER: Scheduler = Scheduler([FREE_TCB; option_tasks], 0, [NONE; PRIORITIES], [NONE; PRIORITIES], NONE, NONE, NONE, every_slot(), NO_SLOTS)
 
 impl Scheduler
     // Whether the core runs its tasks.
     started(*self) -> bool = self.running != NONE
 
-    // The first free slot other than the running task's, else the first slot of a stopped task other
+    // The lowest free slot other than the running task's, else the lowest slot of a stopped task other
     // than the running task's, or None when there is neither. The running task's slot is free or stopped
     // only between its exit or stop and the switch away from it, which still saves its stack pointer
     // there, so it is never given out. A stopped task's slot is taken only when no slot is free, so its
-    // handle answers `Stopped` for as long as it can.
+    // handle answers `Stopped` for as long as it can. Constant time (`SlotSet`).
     free_slot(*self) -> Option[usize]
-        for i in 0..<option_tasks
-            if self.tasks[i].state == TaskState.Free && i != usize(self.running) then return Some(i)
-        for i in 0..<option_tasks
-            if self.tasks[i].state == TaskState.Stopped && i != usize(self.running) then return Some(i)
-        None
+        val r = usize(self.running)
+        self.free.lowest_except(r) match
+            Some(i) -> Some(i)
+            None -> self.stopped.lowest_except(r)
+
+    // Take the slot `free_slot` answers for a task being created, or answer None. From here the slot is
+    // in neither set, so no other creation is given it, and it is `Free`, so no handle names it: a
+    // stopped task's slot changes generation here, and that task's handle is stale from now. Its record
+    // and map are then the creator's to fill, unmasked, until `publish`.
+    reserve(*self) -> Option[usize]
+        val i = self.free_slot() match
+            Some(i) -> i
+            None -> return None
+        self.claim(i)
+        Some(i)
+
+    // Take slot `i` out of the free and stopped sets, ending a stopped task's handle.
+    claim(*self, i: usize)
+        if self.tasks[i].state == TaskState.Stopped
+            self.tasks[i].generation = next_generation(self.tasks[i].generation)
+            self.tasks[i].state = TaskState.Free
+        self.free.remove(i)
+        self.stopped.remove(i)
 
     // Put a ready task in free slot `i`, on `stack`, its saved stack pointer `sp`.
     add_on(*self, i: usize, stack: []u32, sp: usize, priority: u8)
-        self.tasks[i].stack = usize(&stack[0])
-        self.tasks[i].stack_bytes = stack.len * 4
-        self.add_at(i, sp, priority)
+        self.claim(i)
+        self.prepare_on(i, stack, sp, priority)
+        self.publish(i)
 
     // Put a ready task in free slot `i`, its saved stack pointer `sp`. A stopped task's slot is freed
     // first, so its handle goes stale.
     add_at(*self, i: usize, sp: usize, priority: u8)
-        if self.tasks[i].state == TaskState.Stopped then self.tasks[i].generation = next_generation(self.tasks[i].generation)
+        self.claim(i)
+        self.prepare(i, sp, priority)
+        self.publish(i)
+
+    // Fill reserved slot `i`'s record for a task on `stack`, its saved stack pointer `sp`. It writes only
+    // the slot's own record, so it may run unmasked.
+    prepare_on(*self, i: usize, stack: []u32, sp: usize, priority: u8)
+        self.tasks[i].stack = usize(&stack[0])
+        self.tasks[i].stack_bytes = stack.len * 4
+        self.prepare(i, sp, priority)
+
+    // Fill reserved slot `i`'s record, its saved stack pointer `sp`; it stays `Free` until `publish`.
+    prepare(*self, i: usize, sp: usize, priority: u8)
         self.tasks[i].sp = sp
         self.tasks[i].priority = priority
         self.tasks[i].base = priority
@@ -141,6 +225,9 @@ impl Scheduler
         self.tasks[i].ceiling_bits = 0
         self.tasks[i].suspended = false
         self.tasks[i].run_time = 0
+
+    // Make the task filled into reserved slot `i` ready: from here its handle names it and it may run.
+    publish(*self, i: usize)
         self.tasks[i].state = TaskState.Ready
         self.push(i)
 
@@ -166,6 +253,8 @@ impl Scheduler
             self.remove_timeout(i)
         self.tasks[i].state = TaskState.Free
         self.tasks[i].generation = next_generation(self.tasks[i].generation)
+        self.stopped.remove(i)
+        self.free.add(i)
         Ok(i == usize(self.running))
 
     // The task to run: the first in the FIFO of the highest priority with a ready task, or NONE when no
@@ -217,6 +306,7 @@ impl Scheduler
         self.remove_timeout(i)
         self.tasks[i].state = TaskState.Stopped
         self.tasks[i].suspended = false
+        self.stopped.add(i)
 
     // Whether task `i` is in its priority's FIFO: ready and not suspended.
     queued(*self, i: usize) -> bool = self.tasks[i].state == TaskState.Ready && !self.tasks[i].suspended
@@ -417,19 +507,28 @@ private[kernel] add_task[P: Port](p: *P, core: u32, stack: []u32, entry: *extern
     // it yet.
     paint(stack)
     val frames = reserve_trace(stack)
-    val state = p.mask()
-    val result = c.sched.free_slot() match
-        Some(i) ->
-            // The map goes in before the task can run: a reused slot never keeps its last task's.
-            set_map(p, &c.maps[i], user, stack, regions, grants)
-            c.sched.add_on(i, stack, p.new_context(frames, entry), priority)
-            // Its note is the new task's before the task can run, and before anyone has the handle.
-            renew_note(p, core, i, c.sched.handle(core, i))
-            if core == me && c.sched.outranks_running(i) then p.request_switch()
-            Ok(c.sched.handle(core, i))
-        None -> Err(TaskError.Full)
-    p.restore(state)
-    result
+    // Two masked holds of constant length: one takes the slot, the other makes the task ready. Between
+    // them the slot is the creator's alone: in neither of the table's sets, so no other creation is
+    // given it, and `Free`, so no handle names it and no request, wake or delete reaches it.
+    val taking = p.mask()
+    val reserved = c.sched.reserve()
+    p.restore(taking)
+    val i = reserved match
+        Some(i) -> i
+        None -> return Err(TaskError.Full)
+    // The map goes in before the task can run: a reused slot never keeps its last task's.
+    set_map(p, &c.maps[i], user, stack, regions, grants)
+    c.sched.prepare_on(i, stack, p.new_context(frames, entry), priority)
+    // Its note is the new task's before the task can run, and before anyone has the handle. A request or
+    // a notification for the slot's last task that comes before this is dropped with the note.
+    val t = c.sched.handle(core, i)
+    renew_note(p, core, i, t)
+    val readying = p.mask()
+    c.sched.publish(i)
+    if core == me && c.sched.outranks_running(i) then p.request_switch()
+    p.restore(readying)
+    // Not read back from the slot: once unmasked, the task may already have run and gone.
+    Ok(t)
 
 // Delete the task `t` names: it never runs again, and its slot is free for another. A task deleting
 // itself is switched away from at once. A waiting task's wait is withdrawn first, under its object's
