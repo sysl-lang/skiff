@@ -20,7 +20,7 @@ enum Action: u8
 
 // One task's notification. A note of zeros, which is what start-up leaves in `.shared`, is for no task.
 struct Note
-    w: Waitable
+    w: LoneWaitable     // its lock, and its task while the task waits for it: no other task ever does
     task: Task          // the task it is for, or `NO_TASK` while its slot is free
     value: u32
     pending: bool       // a notification has come since the task last took one
