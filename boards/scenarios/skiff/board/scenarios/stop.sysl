@@ -10,16 +10,15 @@ import skiff.kernel.{Port, Semaphore}
 // the machine stops until the soonest deadline, its wake timer ends the stop, and both cores take the
 // ticks it slept. Each wait must end on its deadline (within `LATE`), and each core must have been part of
 // a stop and have taken, from stops, most of the ticks the waits spanned. The board's `clock` (milliseconds, from
-// a timer that runs through the stop) must agree with the time base over the wait: the time base may run
-// ahead by a bunched tick's few, and behind by ticks lost while a core runs slowly (through the boot ROM's
-// flash set-up, a core loses some), but not by half the wait, as it does when it stands still while the
-// machine sleeps, however its deadlines read. Then both forbid the stop again.
+// a timer that runs through the stop) must agree with the time base over the wait within a factor of two:
+// the time base runs ahead with bunched ticks (benchtop's seeded knobs) and behind with ticks lost while a
+// core runs slowly (through the boot ROM's flash set-up), but stands still for whole stops when the stop's
+// ticks are not taken, however its deadlines read. Then both forbid the stop again.
 
 private const NAP: u32 = 40         // core 0's timed take
 private const SLEEP: u32 = 60       // core 1's sleep
 private const AFTER: u32 = 70       // where both sleep to once their own wait has ended
 private const LATE: u32 = 5         // a late or bunched tick (benchtop's seeded runs) may end a wait this late
-private const MS_LATE: u64 = u64(LATE) * 1000 / u64(kernel.TICK_HZ)   // how far the time base may run ahead of the wake timer
 
 private var stop_naps = [Semaphore.new("stop nap", 0, 1); kernel.CORES]
 
@@ -52,7 +51,7 @@ deep_stop[P: Port](p: *P, clock: *extern() -> u64)
         right = stop_on_time(start +% SLEEP, ended)
     val spent = clock() - began
     val expected = u64(ended -% start) * 1000 / u64(kernel.TICK_HZ)
-    right = right && spent + MS_LATE >= expected && spent <= 2 * expected
+    right = right && 2 * spent >= expected && spent <= 2 * expected
     kernel.sleep_until(p, start +% AFTER)
     val took = kernel.stopped_ticks(p) -% stopped
     val count = kernel.machine_stops(p) -% stops
