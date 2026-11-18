@@ -3,7 +3,7 @@ module skiff.cores
 
 import sysl.sync.{Atomic, Ordering}
 import skiff.kernel
-import skiff.kernel.{Cache, Doorbell, Isolation, Port, Protection, Region, RegionError, RunCounter, Semaphore, Slot, Task, TraceEvent, TraceRing, Watchdog}
+import skiff.kernel.{Cache, Doorbell, Isolation, Mutex, Port, Protection, Region, RegionError, RunCounter, Semaphore, Slot, Task, TraceEvent, TraceRing, Watchdog}
 
 // A machine of `kernel.CORES` cores on the host, played one core at a time: `me` says which core is
 // running, and a test changes it to act as another. Its doorbell rings nothing; it counts the rings each
@@ -42,6 +42,11 @@ struct Machine
     plays_count: usize              // how many there are
     plays_next: usize               // the next to play
     given: *Semaphore               // what a `PLAY_GIVE` gives (null: nothing)
+    answering: bool                 // whether a rung core answers at once, inside the call that rang it
+    watched: *Mutex                 // the mutex such a core's chosen task looks at (null: none)
+    seen_running: [kernel.CORES]Task   // the task each answering core chose to run
+    seen_holder: [kernel.CORES]Task    // the watched mutex's holder as that task saw it
+    seen_depth: [kernel.CORES]u16      // and its depth
 
 // Each core reads its own counter.
 impl RunCounter for Machine
@@ -188,9 +193,25 @@ impl Machine
                 val _ = self.given.give(self)
 
 impl Doorbell for Machine
+    // With `answering` on, the rung core answers its doorbell at once and switches to its scheduler's
+    // choice, while the ringing core is still inside the call that rang it, as a second core may on a
+    // board: the chosen task then reads `watched` with no lock, as `holder` and `depth` do.
     ring(*self, core: u32)
         self.rung[core] += 1
         self.pending[core] = true
+        if self.answering
+            val ringer = self.me
+            val masking = self.masked
+            self.me = core
+            self.masked = 0
+            kernel.answer_doorbell(self)
+            val _ = kernel.switch_context(self, 0)
+            self.seen_running[core] = kernel.current(self)
+            if self.watched != null
+                self.seen_holder[core] = self.watched.holder()
+                self.seen_depth[core] = self.watched.depth()
+            self.me = ringer
+            self.masked = masking
 
     clear(*self)
         self.pending[self.me] = false
@@ -224,7 +245,7 @@ impl Isolation for Machine
 // every one of them may be used by two cores, so the whole address space counts as `.shared`.
 machine() -> Machine
     kernel.shared_bounds(0, 0xffff_ffff_ffff_ffff)
-    Machine(0, [0; kernel.CORES], [0; kernel.CORES], 0, [false; kernel.CORES], null, [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], 0, kernel.FOREVER, 0, 0, [0; kernel.CORES], 0, 0, TraceRing.new(), 0, 0, 0, 0, 0, 0, [0; kernel.CORES], [false; kernel.CORES], [0; 16], 0, 0, null)
+    Machine(0, [0; kernel.CORES], [0; kernel.CORES], 0, [false; kernel.CORES], null, [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], 0, kernel.FOREVER, 0, 0, [0; kernel.CORES], 0, 0, TraceRing.new(), 0, 0, 0, 0, 0, 0, [0; kernel.CORES], [false; kernel.CORES], [0; 16], 0, 0, null, false, null, [kernel.NO_TASK; kernel.CORES], [kernel.NO_TASK; kernel.CORES], [0; kernel.CORES])
 
 // Act as core `core` from now on.
 on(m: *Machine, core: u32)
