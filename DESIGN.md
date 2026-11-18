@@ -65,6 +65,23 @@ Core (private, one per core)          .shared
   core's private state, and becomes a message (milestone 4).
 - A task ends by `exit`, which deletes it. The running task's freed slot is not handed out again until
   the switch away from it, which still saves its stack pointer there.
+- **Which slot a creation takes**: the lowest free slot, else (no slot free) the lowest stopped one, never
+  the running task's ("Task control"). Each core's table keeps two `SlotSet`s, its free slots and its
+  stopped slots: a bit per slot, and a bit per 32 slots set while any of them is in the set. Delete adds
+  to the free set, stop to the stopped set, and taking a slot removes it from both, each one word of
+  each level. Finding the lowest member reads every group word (`ceil(option_tasks / 1024)`, so at most
+  4 at the 4096 the option allows) and at most two slot words (the running task's word can come up empty
+  without it), with one count-trailing-zeros each. So finding a slot is bounded by the option's range,
+  not by how the table is filled; two levels are what keep 4096 slots at four words rather than 128.
+- **Creation masks twice, each for a constant time**, and does the rest unmasked. The first hold takes
+  the slot (`reserve`): out of both sets, so no other creation is given it, and `Free` with a stopped
+  task's generation already changed, so no handle names it: a delete, a request or a wake for the
+  slot's last task is refused as stale, or dropped. Unmasked, the stack is painted and its error trace
+  reserved before that hold; after it, the map is written into the slot, the first frame built, the
+  record filled and the note renewed (under its own lock). The second hold makes the task ready and asks for a switch
+  if it outranks the running one. A creation on another core does the same in that core's table while
+  it is offline, when nothing else touches it. Nothing after the first hold can fail, so a reserved slot
+  is never handed back.
 - A `Tcb` is private: saved stack pointer, base, inherited and effective priority, state, suspended, the stack's
   bounds, its run time ("Statistics"), the MPU map. Nothing in `.shared` points at one.
 
