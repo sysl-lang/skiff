@@ -131,6 +131,12 @@ owner_task[P: Port](p: *P) -> never
     common.contended_held.store(1)
     busy(OWNER_WORK)
     common.contended.unlock(p)
+    // The worker polls once a tick, so on a late tick it can start after the owner's work is over. Sleep
+    // until it has: the owner's next run is then the judgment, which at its own priority comes only after
+    // the worker has finished, and still raised would come in the middle of the worker's work. Bounded, so
+    // a worker that never starts still gives a verdict.
+    val since = kernel.ticks()
+    while common.worker_started.load() == 0 && kernel.ticks() - since < 60 do kernel.sleep(p, 1)
     if common.worker_done.load() != 0
         say(p, "the low task gave up the priority core 0's task lent it with the mutex\n")
     else
@@ -142,6 +148,7 @@ owner_task[P: Port](p: *P) -> never
 worker_task[P: Port](p: *P) -> never
     await_crossed(p)
     while common.contended_held.load() == 0 do kernel.sleep(p, 1)
+    common.worker_started.store(1)
     busy(WORKER_WORK)
     common.worker_done.store(1)
     kernel.exit(p)
