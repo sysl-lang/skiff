@@ -1,0 +1,38 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+import skiff.kernel.TaskError
+
+// Creating on another core: before that core starts, a creation takes a slot from that core's table;
+// once it runs, only it creates there (machine.sysl plays every core).
+
+private body() -> never
+    loop
+        ()
+
+private var ft_stack: [128]u32
+
+@test("a task created on a core not yet started takes that core's slot, and once it runs only it creates there")
+ft_remote_creation()
+    var m = machine()
+    val a = task_on(&m, 1, 0, 2)
+    val b = task_on(&m, 1, 1, 2)
+    assert_eq(a.core(), 1)
+    assert_eq(a.slot(), 0)
+    assert_eq(b.slot(), 1)
+    on(&m, 1)
+    assert(kernel.here(&m).sched.free_slot() == Some(2), "core 1's table holds them")
+    on(&m, 0)
+    assert(kernel.here(&m).sched.free_slot() == Some(0), "core 0's holds none")
+    begin(&m)
+    assert(kernel.create(&m, 1, ft_stack, &body, 1) == Err(TaskError.Remote), "core 1 runs")
+    on(&m, 1)
+    assert(kernel.here(&m).sched.free_slot() == Some(2), "the refusal took no slot")
+    val c = kernel.create(&m, 1, ft_stack, &body, 1).unwrap()
+    assert_eq(c.slot(), 2)
+    assert(kernel.delete(&m, b).is_ok(), "core 1 deletes its own")
+    assert(kernel.here(&m).sched.free_slot() == Some(1), "and its slot is free in core 1's table")
+    on(&m, 0)
+    assert(kernel.here(&m).sched.free_slot() == Some(0), "core 0's table untouched")
+    assert_eq(m.masked, 0)
