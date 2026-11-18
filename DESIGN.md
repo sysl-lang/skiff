@@ -1050,6 +1050,70 @@ on, as after a fault. `kernel/skiff/kernel/watchdog.sysl` is the kernel's side.
   its watch bites from its tick; core 0's watch stays fed while it waits to see core 1 stopped. This
   replaces the BusFault that ended core 1 before.
 
+## The console service: faults reported from a task, on one console
+
+A fault handler runs above every interrupt the kernel takes, so whatever it writes to a UART, a byte at
+a time behind the UART's FIFO, holds off the tick, the switch and the kernel's interrupts for the whole
+line: on the Pico 2, 56,000-64,000 cycles for each task its protection stopped, which left SysTick's and
+PendSV's latency unbounded. So a handler no longer writes a report: it **records** it and a task writes
+it. `kernel/skiff/kernel/console.sysl` is the kernel's side.
+
+- **A report is a record, not text**: what happened (`ReportKind`: a fault that stopped the core, or a
+  task stopped for overflowing its stack, breaking its memory protection or making a trap the kernel
+  does not take) and, for a fault, its name, kept as `NAME_BYTES` bytes as a lock keeps an object's. No
+  pointer, so it may lie in `.shared` and be read by a core of another image. The core it came from is
+  the ring it lies in. The line it becomes is exactly the line the handler used to write, `skiff: core
+  <n> stopped a task that ...` or `skiff: core <n> fault <kind>`, so every console reads as before. The
+  task and the faulting address are not kept: no line names them.
+- **Each core has one ring of reports in `.shared`**, `option_console_reports` (default 8) long with one
+  slot more kept empty: one producer, the core itself, which appends under its mask (a copy of one
+  record and two indices: constant time, from a handler or a task), and one consumer, the console
+  service that writes the core's reports. As the inboxes, it needs no read-modify-write.
+- **A full ring drops the newest report and counts it**, never overwriting one already queued (the
+  first report of a cascade is the one that explains it). The count is the core's, wrapping; when the
+  service has written every report the ring kept and finds the count moved since it last looked, it
+  writes `skiff: core <n> dropped <k> reports`. So a loss is always stated, after the reports that were
+  kept.
+- **The console service is a task the board creates**, at a priority it chooses, whose body is
+  `kernel.serve_console(p)`: it records its handle in `.shared`, then waits on its notification for
+  ever; a report gives it one. It writes one line at a time, and **raises itself to the top priority
+  for each line**, lowering itself again after it. The boards create it at priority 1, the lowest a task
+  may have, so it starts a line only when no other task is ready, and no line of another task is half
+  written: a task writes its console a byte at a time and never blocks in the middle of a line, so a task
+  in mid-line is always ready. Raised, no task preempts it in the middle of its own line. What it costs
+  the other tasks is one line's write per report, as the handler cost before; what it costs interrupts is
+  nothing. Not the idle task, which may not raise itself (and, with tickless idle, sleeps), and not the
+  deferred work service, whose queue is the application's to fill and whose refusals count the
+  application's posts. A task at priority 1 that writes may still have its line cut by the service at a
+  tick's turn between equals; the boards' tasks at priority 1 write only before any report is made.
+- **One console for the machine, the board's choice** (`console_on(core)`, from core 0 before it
+  releases the others). A core's report goes to the **console core's service** if that core is ready
+  (started, not stopped) and its service is recorded, else to its **own service**, else it is written
+  **at once from where it was made**, as before: a core whose console core has stopped keeps reporting,
+  on its own UART. Before the service's first run, and on a board that creates none, every report is
+  written at once. Either way the line names the core it came from. A forwarded report is the ring in
+  `.shared` and a notification given to the console core's service, which crosses as any wake does,
+  through that core's inbox: no new message kind. The console core's service writes every core's
+  reports, its own ring first, each ring in the order it was filled. Its lines fall among the console
+  core's own lines wherever that core was idle, so **a forwarded line's place among the console core's
+  lines is not fixed; its place among the lines of the core it came from is**.
+- **A fault that stops a core** (`fault(p, kind)`, the watchdog's bite among them) is forwarded the same
+  way when another core is the console; on the console core itself, or with one core, its own service
+  will never run again, so it writes its pending reports and then its own line at once: the core is
+  stopping and nothing else may run on it. So does a panic, and so does the machine's halt: a board
+  calls `console_flush(p)` before it stops the machine, which writes every report still queued, every
+  core's, at once.
+- **A service that is gone is not waited for.** When the task a report would be given to no longer
+  exists (deleted), the report is written at once. A console service that a fault stops is taken off
+  before its report is made, so that report and every later one goes elsewhere (the console core's
+  service, or at once); a report forwarded to a console core that stops before writing it is written by
+  the console flush at the halt, or not at all if the machine never halts. A service the application
+  stops (`stop`, "Task control") keeps its handle and is still given reports, which then wait for the
+  flush: the service is the kernel's, and nothing else should stop it.
+- **What a report costs a handler now**: the mask for one append, and a notification's give (the note's
+  lock, the wake of one waiter and, across cores, one post to the console core's inbox). Constant, and
+  the same as any give from a handler: the bound on masked time covers it.
+
 ## Tracing
 
 The kernel tells the port what it does, one event at a time, in the spirit of FreeRTOS's trace macros,

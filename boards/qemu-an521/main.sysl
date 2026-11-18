@@ -121,7 +121,7 @@ extern __code_end: u8
 // The status `boot` answered on core 0, which core 0's last task stops the machine with.
 private var status: i32 = 0
 
-private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject, &task_measured, &task_locker, &task_work, &worked, &task_beat, &task_hang, &task_traced, &task_selector)
+private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject, &task_measured, &task_locker, &task_work, &worked, &task_beat, &task_hang, &task_traced, &task_selector, &task_console)
 
 @export("skiff_main")
 skiff_main() -> never
@@ -213,11 +213,13 @@ private enable(irq: u32)
     armv7m.set_irq_priority(irq, armv7m.KERNEL_IRQ_PRIORITY)
     armv7m.enable_irq(irq)
 
-// Core 0: check and give the kernel `.shared`'s bounds, and give the scenarios the system's structure.
+// Core 0: check and give the kernel `.shared`'s bounds, make core 0's console the machine's, and give the
+// scenarios the system's structure.
 private place_shared(board: *Board)
     if kernel.shared_within(usize(&__shared_start), usize(&__shared_end))
         board.write("skiff: .shared holds the shared state\n".bytes)
     kernel.shared_bounds(usize(&__shared_start), usize(&__shared_end))
+    kernel.console_on(0)
     scenarios.share(&system.placed.scenarios, SPLIT)
 
 // A line `skiff: core <n><rest>` on the running core's console.
@@ -256,6 +258,7 @@ private task_beat() -> never = scenarios.beat_task(&Board())
 private task_hang() -> never = scenarios.hang_task(&Board(), false)
 private task_traced() -> never = scenarios.traced_task(&Board())
 private task_selector() -> never = scenarios.selector_task(&Board())
+private task_console() -> never = kernel.serve_console(&Board())
 
 // Raise the running core's timer interrupt from software; the timer itself never runs.
 private raise() = armv7m.pend_irq(TIMER_IRQ)
@@ -308,6 +311,7 @@ private task_r() -> never
     val took = kernel.here(&board).own_ticks() -% own
     if moved >= 3 && took >= moved && took <= moved + 1
         board.write("skiff: core 0 keeps the time base alone\n".bytes)
+    kernel.console_flush(&board)
     armv7m.halt(status)
 
 // MHU0's doorbell, on either core: that core's kernel clears it and drains its inboxes.
@@ -340,8 +344,8 @@ board_switch(sp: usize) -> usize
     var board = Board()
     kernel.switch_context(&board, sp)
 
-// A fault stops only the core that took it, once the kernel has reported it on that core's console. The
-// other core runs on.
+// A fault stops only the core that took it, once the kernel has reported it: core 1's on core 0's
+// console, through core 0's console service. The other core runs on.
 @export("skiff_fault_entry")
 board_fault(exception: u32, exc_return: u32) -> usize
     var board = Board()

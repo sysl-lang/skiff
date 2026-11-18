@@ -214,7 +214,7 @@ skiff: core 0 fault watchdog"
 # own tasks on its own counter, and core 0 is refused core 1's. Core 0 then masks its interrupts, taking
 # no tick, while core 1 alone moves the time base on and sleeps on it. Each core's watchdog holds off
 # while a watched task checks in; then a task on core 1 spins above it, and core 1's watchdog, checked
-# on its own tick, reports on core 1's console and stops core 1 alone. Core 0 sees it stopped, takes
+# on its own tick, reports on core 0's console and stops core 1 alone. Core 0 sees it stopped, takes
 # more ticks, finds that the time base moves a period for each of its own ticks without core 1, and
 # stops the machine with status 0.
 an521_core0_greeting="skiff: hello from core 0
@@ -295,10 +295,17 @@ skiff: core 1 kept the time base moving while core 0 took no tick
 $(tickless_expected 1)
 $(watchdog_expected 1)
 skiff: core 1 fault watchdog"
+# Core 0's console is the machine's (DESIGN "The console service"): core 1's reports, the tasks its
+# protection stopped and its watchdog's fault, are written there by core 0's console service, in core 1's
+# order but wherever core 0 was idle among its own lines. So they are checked on core 0's console, among
+# its lines that name core 1, and core 1's console is checked without them.
+forwarded_pattern="^skiff: core 1 (stopped a task that |fault )"
+an521_forwarded=$(echo "$an521_core1_run" | grep -E "$forwarded_pattern")
+an521_core1_own=$(echo "$an521_core1_run" | grep -v -E "$forwarded_pattern")
 an521_core1_expected="skiff: hello from core 1
 $an521_core1_ticks
 $(tasks_expected 1)
-$an521_core1_run"
+$an521_core1_own"
 
 # The AN521 as two images (boards/qemu-an521 with `--features core0` and `--features core1`): each core
 # runs its own, built from the one board program, and the two meet at the handshake, agreeing on the
@@ -312,7 +319,7 @@ split_core1_expected="skiff: hello from core 1
 skiff: core 1 agrees with core 0 on the layout of .shared
 $an521_core1_ticks
 $(tasks_expected 1 "f32 registers survived the switches")
-$an521_core1_run"
+$an521_core1_own"
 
 failed=0
 
@@ -335,6 +342,13 @@ check() {
         after=$at
     done
     IFS=$old_ifs
+}
+
+# check_forwarded <label> <core 0's log>: core 1's reports, in core 1's order, among the lines of core 0's
+# console that name core 1. Sets `missing` as `check` does.
+check_forwarded() {
+    grep -E "^skiff: core 1 " "$2" > "$2.core1"
+    check "$1, core 1's reports on core 0's console" "$2.core1" "$an521_forwarded"
 }
 
 # run <log> <qemu arguments…>: boot once under the watchdog; sets `code` and `took`.
@@ -399,6 +413,9 @@ check "mps2-an521 core 0" "$scratch/an521-core0.log" "$an521_core0_expected"
 if [ -z "$missing" ]; then
     check "mps2-an521 core 1" "$scratch/an521-core1.log" "$an521_core1_expected"
 fi
+if [ -z "$missing" ]; then
+    check_forwarded "mps2-an521" "$scratch/an521-core0.log"
+fi
 verdict mps2-an521 0
 
 # The AN521 as two images: core 0's is the kernel QEMU starts, and core 1's is loaded beside it, where
@@ -413,6 +430,9 @@ run "$scratch/an521-split-core0.log" -M mps2-an521 -accel tcg,thread=multi -kern
 check "mps2-an521 two images, core 0" "$scratch/an521-split-core0.log" "$split_core0_expected"
 if [ -z "$missing" ]; then
     check "mps2-an521 two images, core 1" "$scratch/an521-split-core1.log" "$split_core1_expected"
+fi
+if [ -z "$missing" ]; then
+    check_forwarded "mps2-an521 two images" "$scratch/an521-split-core0.log"
 fi
 verdict "mps2-an521 two images" 0
 
@@ -449,7 +469,7 @@ $(dual_core0_run "f32 registers survived the switches" | grep -v -x -F "$(tickle
 pico2_core1_expected="skiff: hello from core 1
 $an521_core1_ticks
 $(tasks_expected 1 "f32 registers survived the switches")
-$(echo "$an521_core1_run" | grep -v -x -F "$(tickless_expected 1)")"
+$(echo "$an521_core1_own" | grep -v -x -F "$(tickless_expected 1)")"
 pico2_image="$scratch/pico2.elf"
 build thumb-freestanding pico2 "$pico2_image"
 if [ ! -x "$benchtop" ]; then
@@ -467,6 +487,9 @@ else
         check "pico2 ($entry entry) core 0" "$scratch/pico2-$entry-core0.log" "$pico2_core0_expected"
         if [ -z "$missing" ]; then
             check "pico2 ($entry entry) core 1" "$scratch/pico2-$entry-core1.log" "$pico2_core1_expected"
+        fi
+        if [ -z "$missing" ]; then
+            check_forwarded "pico2 ($entry entry)" "$scratch/pico2-$entry-core0.log"
         fi
         verdict "pico2 ($entry entry)" 0
     done

@@ -84,7 +84,7 @@ private var objects: scenarios.Across
 // The status `boot` answered, which the last task stops the machine with.
 private var status: i32 = 0
 
-private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject, &task_measured, &task_locker, &task_work, &worked, &task_beat, &task_hang, &task_traced, &task_selector)
+private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &task_p1, &task_p2, &task_h, &task_r, &scenarios.again, &task_idle, &meet, &task_low, &task_middle, &task_high, &task_timed, &task_raiser, &task_hammer, &raise, &task_receiver, &task_sender, &task_owner, &task_worker, &task_waiter, &task_echo, &task_timers, &task_hog, &fired, &task_subject, &task_measured, &task_locker, &task_work, &worked, &task_beat, &task_hang, &task_traced, &task_selector, &task_console)
 
 // Called by the chip's reset handler once there is a stack and `.bss` and `.shared` are zero.
 @export("skiff_main")
@@ -142,6 +142,7 @@ private task_beat() -> never = scenarios.beat_task(&Board())
 private task_hang() -> never = scenarios.hang_task(&Board(), true)
 private task_traced() -> never = scenarios.traced_task(&Board())
 private task_selector() -> never = scenarios.selector_task(&Board())
+private task_console() -> never = kernel.serve_console(&Board())
 
 // Raise timer 0's interrupt from software; the timer itself never runs.
 private raise() = armv7m.pend_irq(mps2.TIMER0_IRQ)
@@ -177,6 +178,7 @@ private task_r() -> never
     scenarios.grants(&board, CODE)
     scenarios.tickless(&board)
     scenarios.watchdog(&board, &entries, true)
+    kernel.console_flush(&board)
     armv7m.halt(status)
 
 // SysTick: one tick for the kernel, then its supervision. A bite stops the one core, and the machine

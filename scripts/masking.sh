@@ -37,10 +37,16 @@
 #     masked remainder and for any handler above it, so its bound is the masked one. Measured: irq26 214
 #     on core 0, 206 on core 1; irq46 2 on each.
 #
-# Not bounded, reported: SysTick's and PendSV's latencies. They sit at the lowest priority, so they wait
-# for every other handler's whole run, not for a mask: on both cores the scenarios' deliberate task
-# faults report on the console from a fault handler (~56,000-64,000 cycles), and on core 0 the time
-# scenario's own mask (below) holds the tick off ~500,000.
+#   - The worst latency of PendSV on both cores and of SysTick on core 1. They sit at the lowest
+#     priority, so they wait for the masked remainder and for every other handler's whole run: the
+#     doorbell's drain, the tick's own supervision, a fault handler's report. A fault handler no longer
+#     writes its report (DESIGN "The console service": it records it, and a task writes it), so that run
+#     is short. Measured: PendSV 2101 on each core, SysTick 928 on core 1 (each ~56,000-64,000 when a
+#     task fault's report was written from the handler). The bound leaves about twice the worst, since a
+#     handler's run is longer than a masked hold.
+#
+# Not bounded, reported: core 0's SysTick latency, which the time scenario's own mask (below) holds off
+# ~510,000 cycles; benchtop's latency report has no interval to leave out.
 #
 # Left out of the bound: the one interval a scenario masks on purpose, core 0's in `time_alone`
 # (boards/scenarios/.../time.sysl), which masks its core while core 1 keeps the time base (~621,000
@@ -59,6 +65,7 @@ tail_from=1024
 tail_bound=2500
 irq_bound=$masked_bound
 irqs="irq26 irq46"
+lowest_bound=4000
 deliberate='scenarios$time_alone.'
 
 image="$scratch/pico2-masking.elf"
@@ -173,7 +180,20 @@ for core in 0 1; do
     done
     for exception in systick pendsv; do
         line=$(grep -E "^latency core=$core exception=$exception taken=" "$report")
-        if [ -n "$line" ]; then echo "  $exception latency: worst $(field "$line" max), mean $(field "$line" mean) (not bounded)"; fi
+        if [ "$core" -eq 0 ] && [ "$exception" = systick ]; then
+            if [ -n "$line" ]; then echo "  $exception latency: worst $(field "$line" max), mean $(field "$line" mean) (not bounded: the time scenario's mask)"; fi
+            continue
+        fi
+        if [ -z "$line" ]; then
+            fail "core $core: $exception was never taken, so its latency was not measured"
+            continue
+        fi
+        worst=$(field "$line" max)
+        if [ "$worst" -gt "$lowest_bound" ]; then
+            fail "core $core: $exception waited $worst cycles, over the bound of $lowest_bound"
+        else
+            echo "  $exception latency: worst $worst, mean $(field "$line" mean) (bound $lowest_bound)"
+        fi
     done
 done
 
