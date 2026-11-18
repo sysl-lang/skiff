@@ -80,7 +80,7 @@ struct Tcb
     later: u16          // the next sleeper in the timeout list, or in the list of waits timing out
     base: u8            // the priority the task was given
     held: u8            // how many mutexes it holds
-    on: Option[*Waitable]   // what its last wait was on
+    on: Option[*Waited]     // what its last wait was on
     stack: usize        // where its stack starts, and how many bytes it has: what the guard protects
     stack_bytes: usize
     suspended: bool     // kept out of its FIFO whatever its state, until resumed
@@ -299,7 +299,7 @@ impl Scheduler
     // task's record holds `on` only while the task waits: the wake, the timeout or the withdrawal that
     // ends the wait clears it before the blocked call returns, so the object may be the caller's own.
     @scoped(on)
-    block(*self, on: *Waitable, timeout: u32, now: u32)
+    block(*self, on: *Waited, timeout: u32, now: u32)
         val i = usize(self.running)
         self.unlink(i)
         self.tasks[i].state = TaskState.Blocked

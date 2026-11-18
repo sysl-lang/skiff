@@ -106,12 +106,21 @@ waiter.
   best of all (`first`; on a tie of priorities, side 0's). The order is still priority first, first
   come within a priority, among waiters of every core alike. A head is read only when its bit is set,
   so a zeroed queue is empty. The price is size: a queue is 140 bytes (two bitmaps, 64 heads of 16
-  bits, a count), in every object and in every task's note, so `.shared` holds
-  `option_cores * option_tasks` of them besides the application's objects. One walk is left, a flags
-  set's, since one set may satisfy every waiter; it takes the lock once per waiter (below, "Event flags:
-  a set walks in steps").
-- An object holds a `Waitable`: its `KernelLock` and its `WaitQueue`. A blocked task's private `Tcb.on`
-  names it, which is how a timeout, a priority change or a delete reaches the queue under the lock.
+  bits, a count), in every object. One walk is left, a flags set's, since one set may satisfy every
+  waiter; it takes the lock once per waiter (below, "Event flags: a set walks in steps").
+- An object holds a `Waitable`: its `KernelLock` and its `WaitQueue`. **A task's note holds a
+  `LoneWaitable` instead**: its `KernelLock` and room for one waiter (the waiter's index and whether it
+  is there, 4 bytes), since only the note's own task ever waits on it and a task waits on one thing at a
+  time; a second waiter while one waits is the kernel's own error and stops it. Both implement the trait
+  `Waited` (`guard`, `enter`, `leave`, `best`), and the one primitive is written once against it:
+  `enqueue_running`, `wake_first`, `wake_at` and `end_wait` take any `Waited` (statically, so an
+  object's wake calls its queue directly), and a timeout, a withdrawal and a re-queueing reach it
+  through the blocked task's private `Tcb.on`, a `*Waited`. The lock is each one's first field, so a
+  trace names a note's wait by the note's address as it names an object's by the object's. A note was
+  184 bytes with a queue and is 48 with the slot, so `.shared` holds 136 bytes less per task:
+  `option_cores * option_tasks` of them. Measured on the boards (`tasks = 32`): the MPS2's `.shared`
+  went from 12,800 to 8,448 bytes, the AN521's from 25,600 to 16,896, the Pico 2's from 25,568 to
+  16,864.
 - A change of a waiter's priority while it waits (inheritance, `set_priority`) re-inserts it, under the
   object's lock.
 
@@ -151,7 +160,7 @@ the object hands itself over, as a semaphore or a mutex does), and releases the 
   record's `value`), and clears the bits each woken wait asked to clear as it is woken, judging every
   waiter by the bits as the set left them, so two waiters for one bit are both woken. It looks at them
   one per hold of the lock ("Event flags: a set walks in steps").
-- **Task notifications**: each task's note (value, pending mark, `Waitable`) is in `.shared` at
+- **Task notifications**: each task's note (value, pending mark, `LoneWaitable`) is in `.shared` at
   `notes[core][slot]`, so any core may send to any task. The note names its task by handle: it is
   renewed when a task is created in its slot (before the task can run) and cleared when the task is
   deleted (before it goes), and a send whose handle does not match it is refused as stale. Only the
