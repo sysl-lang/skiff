@@ -120,8 +120,11 @@ skiff_main() -> never
         rp2350.launch_core1(usize(&__vectors_start), usize(&_stack_top1))
     armv8m.enable_protection_v8()
     kernel.start(&board)
-    for _ in 0..<3
-        val n = kernel.await_tick(&board)
+    for i in 0..<3
+        // Wait until the core has counted tick n, not for the next one: ticks delivered late and in a bunch
+        // run back to back before this thread looks, so "the next tick" may be tick 2.
+        val n = u32(i) + 1
+        while kernel.here(&board).own_ticks() < n do board.idle()
         board.write("skiff: core ".bytes)
         kernel.write_dec(&board, me)
         board.write(" tick ".bytes)

@@ -37,6 +37,7 @@ struct Across
     crossed: Atomic[u32]           // how many hammers have finished their waits across cores
     contended_held: Atomic[u32]    // whether the owner holds `contended`
     worker_done: Atomic[u32]       // whether the worker has finished
+    worker_started: Atomic[u32]    // whether the worker has begun its work
     // The buffers core 0 streams to core 1 (buffers.sysl); `origins[n]` is where in `stream` core 0
     // filled buffer `n`, as a distance from the pool's start.
     stream: Pool[STREAM_BUFFERS, 256]
