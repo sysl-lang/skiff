@@ -1,0 +1,87 @@
+module skiff.chip.rp2350
+
+import sysl.raw.ptr_cast
+import skiff.arch.armv7m
+
+// Stopping the machine (DESIGN "Stopping the machine"): POWMAN's always-on timer is the wake timer. It
+// counts milliseconds from the LPOSC from boot, through the chip's sleep, which gates every clock but
+// POWMAN's and the SIO's while both cores are in their deep wait. Its alarm latches POWMAN_IRQ_TIMER, which
+// the leading core enables in its own NVIC for the stop alone and clears before letting interrupts
+// through, so it is never taken and its vector stays the table's `skiff_exception`.
+
+private struct Reg
+    v: volatile u32
+
+private reg(at: usize) -> *Reg = ptr_cast(at)
+
+private const POWMAN: usize = 0x4010_0000
+private const PASSWORD: u32 = 0x5afe << 16          // every POWMAN write carries it in bits 31:16
+private const READ_TIME_UPPER: usize = POWMAN + 0x70
+private const READ_TIME_LOWER: usize = POWMAN + 0x74
+private const ALARM_TIME_63TO48: usize = POWMAN + 0x78   // then 47TO32, 31TO16, 15TO0, a word each
+private const TIMER: usize = POWMAN + 0x88
+private const INTE: usize = POWMAN + 0xe4
+private const TIMER_RUN: u32 = 1 << 1
+private const TIMER_ALARM_ENAB: u32 = 1 << 4
+private const TIMER_ALARM: u32 = 1 << 6             // latched; a 1 written clears it
+private const TIMER_USE_LPOSC: u32 = 1 << 8
+private const INTE_TIMER: u32 = 1 << 1
+
+// POWMAN_IRQ_TIMER: the always-on timer's alarm.
+const POWMAN_IRQ_TIMER: u32 = 45
+
+// CLOCKS' sleep enables: the clocks that run while both cores are in their deep wait.
+private const SLEEP_EN0: usize = 0x4001_00b4
+private const SLEEP_EN1: usize = 0x4001_00b8
+private const SLEEP_EN0_ALL: u32 = 0xffff_ffff
+private const SLEEP_EN1_ALL: u32 = 0x7fff_ffff
+private const KEPT_IN_SLEEP: u32 = (1 << 31) | (1 << 24) | (1 << 23)   // CLK_SYS_SIO, CLK_SYS_POWMAN, CLK_REF_POWMAN
+
+private const CYCLES_PER_MS: u64 = u64(CLOCK_HZ / 1000)
+
+// Start the always-on timer from 0, counting from the LPOSC. Core 0, once, at boot.
+start_wake_timer()
+    reg(TIMER).v = PASSWORD | TIMER_USE_LPOSC
+    reg(TIMER).v = PASSWORD | TIMER_RUN
+
+// The always-on timer's count, in milliseconds: the upper word read again until it did not move.
+wake_timer_now() -> u64
+    loop
+        val upper = reg(READ_TIME_UPPER).v
+        val lower = reg(READ_TIME_LOWER).v
+        if reg(READ_TIME_UPPER).v == upper then return (u64(upper) << 32) | u64(lower)
+
+// With the kernel's handlers masked and the other core held: freeze the tick, arm the alarm for `count`
+// ticks after the last one (rounded up to the timer's millisecond), gate the clocks, sleep in the deep wait
+// until the alarm or any interrupt, then put the clocks back, disarm the alarm and thaw the tick by the
+// milliseconds the timer counted. Answers the tick periods that ended.
+stop_machine(count: u32) -> u32
+    val first = armv7m.systick_freeze()
+    if first == 0 then return 0
+    val period = armv7m.systick_period()
+    val wanted = u64(first) + u64(count - 1) * u64(period)
+    val start = wake_timer_now()
+    set_alarm(start + (wanted + CYCLES_PER_MS - 1) / CYCLES_PER_MS)
+    reg(INTE).v = PASSWORD | INTE_TIMER
+    armv7m.set_irq_priority(POWMAN_IRQ_TIMER, armv7m.KERNEL_IRQ_PRIORITY)
+    armv7m.enable_irq(POWMAN_IRQ_TIMER)
+    reg(SLEEP_EN0).v = KEPT_IN_SLEEP
+    reg(SLEEP_EN1).v = 0
+    armv7m.deep_wait()
+    reg(SLEEP_EN0).v = SLEEP_EN0_ALL
+    reg(SLEEP_EN1).v = SLEEP_EN1_ALL
+    val end = wake_timer_now()
+    reg(TIMER).v = PASSWORD | TIMER_RUN
+    reg(TIMER).v = PASSWORD | TIMER_RUN | TIMER_ALARM
+    reg(INTE).v = PASSWORD
+    armv7m.disable_irq(POWMAN_IRQ_TIMER)
+    armv7m.unpend_irq(POWMAN_IRQ_TIMER)
+    armv7m.systick_thaw(first, (end - start) * CYCLES_PER_MS)
+
+// Arm the alarm for the count `at`: disabled and cleared first, so an old latch cannot end the sleep.
+private set_alarm(at: u64)
+    reg(TIMER).v = PASSWORD | TIMER_RUN
+    reg(TIMER).v = PASSWORD | TIMER_RUN | TIMER_ALARM
+    for i in 0..<4
+        reg(ALARM_TIME_63TO48 + 4 * usize(i)).v = PASSWORD | u32((at >> u64(48 - 16 * i)) & 0xffff)
+    reg(TIMER).v = PASSWORD | TIMER_RUN | TIMER_ALARM_ENAB

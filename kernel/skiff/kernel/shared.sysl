@@ -48,6 +48,7 @@ const INBOX_CORES: usize = if option_cores > 1 then option_cores else 0
 //   - `waiters[core][slot]` is the wait record of that task (waits.sysl): a task waits on one thing at
 //     a time, so one record each is all there is.
 //   - `notes[core][slot]` is the notification of that task (notify.sysl), which any core may send to.
+//   - `stop` is the cores' agreement on stopping the machine (stop.sysl).
 //   - `start` and `end` are `.shared`'s bounds, as the board found them in its link script, for the
 //     check that an object two cores use lies inside them.
 struct Shared
@@ -57,6 +58,7 @@ struct Shared
     inboxes: [INBOX_CORES][INBOX_CORES]Ring
     waiters: [option_cores][option_tasks]Waiter
     notes: [option_cores][option_tasks]Note
+    stop: Stop
     start: usize
     end: usize
 
@@ -88,6 +90,9 @@ private[kernel] time_base() -> *Atomic[u32] = &shared.time
 
 // The spin word a core holds while it reads and advances the time base.
 private[kernel] time_lock() -> *Atomic[u32] = &shared.time_lock
+
+// The cores' agreement on stopping the machine.
+private[kernel] machine_stop() -> *Stop = &shared.stop
 
 // Whether everything another core can reach lies in [start, end): the bounds the link script gives
 // `.shared`, which the board reads from `__shared_start` and `__shared_end`. The inboxes, the wait

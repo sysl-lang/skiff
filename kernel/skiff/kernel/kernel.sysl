@@ -136,6 +136,26 @@ trait Port: Doorbell + Cache + Protection + Isolation + RunCounter + Watchdog
     // `tickless_limit()`.
     sleep_ticks(*self, count: u32) -> u32 = 0
 
+    // The fewest ticks a stop of the whole machine is worth (DESIGN "Stopping the machine"): its deep
+    // state, where the clocks every core and the time base run on stop. A machine with no such state keeps
+    // this default of 0, and the idle step never asks the cores to agree on one.
+    stop_threshold(*self) -> u32 = 0
+
+    // The most ticks one stop of the machine may span: what its wake timer can be armed for.
+    stop_limit(*self) -> u32 = 0
+
+    // With the kernel's interrupts masked, while another core gathers the machine for a stop: freeze this
+    // core's tick and sleep in the chip's deep wait until any interrupt is pending, then let the tick go on
+    // from where it froze. The time held is the kernel's to take, from the time base.
+    hold(*self) = self.idle()
+
+    // With the kernel's interrupts masked and every other core held: freeze this core's tick, arm the
+    // wake timer for `count` ticks after the last one, enter the deep state until it fires or any
+    // interrupt is pending, and answer how many tick periods the wake timer measured, restarting the tick
+    // in step with what remains of the current one. The kernel takes them at once. `count` is
+    // `stop_threshold()` to `stop_limit()`.
+    stop_machine(*self, count: u32) -> u32 = 0
+
     // Take one event the kernel emits (DESIGN "Tracing"), on the core it happened on: from a task, from
     // an interrupt handler, inside a masked region or under an object's lock. So it allocates nothing,
     // waits for nothing and takes no lock, and its cost is bounded. Only a kernel built with the `trace`

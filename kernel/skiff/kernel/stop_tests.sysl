@@ -1,0 +1,219 @@
+module skiff.kernel
+@tests
+
+import sysl.sync.Ordering
+
+// Stopping the machine with one core (DESIGN "Stopping the machine"), over the recording port
+// (kernel_tests.sysl), whose stop spans what it was asked, or `wake_after` ticks when an interrupt comes
+// sooner. One core has no other to agree with: its idle step leads and enters at once. No task runs: a
+// test makes a task wait as the running one, switches to the idle task and takes its step by hand.
+
+private cs_body() -> never
+    loop
+        ()
+
+private var cs_stacks: [3][128]u32
+
+private cs_task(r: *Recorder, n: usize, priority: u8) -> Task = create(r, 0, cs_stacks[n], &cs_body, priority).unwrap()
+
+// A recorder of one core with a deep state worth 4 ticks and spanning up to 100, a task at priority 2 and
+// the idle task, the task running.
+private cs_port() -> Recorder
+    var r = recorder(1, 0)
+    r.stop_min = 4
+    r.stop_most = 100
+    r
+
+private cs_begin(r: *Recorder) -> Task
+    val t = cs_task(r, 0, 2)
+    val c = here(r)
+    val i = c.sched.free_slot().unwrap()
+    c.sched.add_on(i, cs_stacks[2], 0, IDLE_PRIORITY)
+    c.sched.first()
+    t
+
+private cs_switch(r: *Recorder)
+    val _ = switch_context(r, 0)
+
+@test("one core idle long enough stops the machine until its deadline, and takes the ticks slept at once")
+cs_one_core_stops()
+    var r = cs_port()
+    val sleeper = cs_begin(&r)
+    allow_stop(&r, true)
+    sleep(&r, 15)
+    cs_switch(&r)
+    rest(&r)
+    assert_eq(r.stop_asked, 15)
+    assert_eq(ticks(), 15)
+    assert_eq(here(&r).own_ticks(), 15)
+    assert_eq(stopped_ticks(&r), 15)
+    assert_eq(machine_stops(&r), 1)
+    assert_eq(skipped_ticks(&r), 0)
+    assert(state(&r, sleeper) == Ok(TaskState.Ready), "the sleeper woke on its deadline")
+    assert_eq(machine_stop().phase, STOP_OFF)
+
+@test("no stop until the application allows it, nor once it forbids it again")
+cs_one_core_must_allow()
+    var r = cs_port()
+    val _ = cs_begin(&r)
+    sleep(&r, 15)
+    cs_switch(&r)
+    rest(&r)
+    assert_eq(r.stop_asked, 0)
+    assert_eq(ticks(), 1)
+    allow_stop(&r, true)
+    allow_stop(&r, false)
+    rest(&r)
+    assert_eq(r.stop_asked, 0)
+    assert_eq(machine_stops(&r), 0)
+
+@test("a deadline nearer than the threshold leaves the idle step sleeping tick by tick")
+cs_one_core_below_threshold()
+    var r = cs_port()
+    val sleeper = cs_begin(&r)
+    allow_stop(&r, true)
+    sleep(&r, 3)
+    cs_switch(&r)
+    for _ in 0..<3 do rest(&r)
+    assert_eq(r.stop_asked, 0)
+    assert_eq(ticks(), 3)
+    assert_eq(machine_stops(&r), 0)
+    assert(state(&r, sleeper) == Ok(TaskState.Ready), "woke on its deadline")
+
+@test("a port with no deep state never stops, however long the core is idle")
+cs_one_core_no_deep_state()
+    var r = recorder(1, 0)
+    val _ = cs_begin(&r)
+    allow_stop(&r, true)
+    sleep(&r, 40)
+    cs_switch(&r)
+    rest(&r)
+    assert_eq(r.stop_asked, 0)
+    assert_eq(r.holds, 0)
+    assert_eq(ticks(), 1)
+    assert_eq(machine_stop().phase, STOP_OFF)
+
+@test("the port's limit bounds a stop, and the next one goes on to the deadline")
+cs_one_core_limit()
+    var r = cs_port()
+    val sleeper = cs_begin(&r)
+    allow_stop(&r, true)
+    sleep(&r, 150)
+    cs_switch(&r)
+    rest(&r)
+    assert_eq(r.stop_asked, 100)
+    assert_eq(ticks(), 100)
+    rest(&r)
+    assert_eq(r.stop_asked, 50)
+    assert_eq(ticks(), 150)
+    assert_eq(machine_stops(&r), 2)
+    assert(state(&r, sleeper) == Ok(TaskState.Ready), "woke on its deadline")
+
+@test("a stop an interrupt ends early takes only the ticks the wake timer measured")
+cs_one_core_early_wake()
+    var r = cs_port()
+    val sleeper = cs_begin(&r)
+    allow_stop(&r, true)
+    sleep(&r, 20)
+    cs_switch(&r)
+    r.wake_after = 6
+    rest(&r)
+    assert_eq(r.stop_asked, 20)
+    assert_eq(ticks(), 6)
+    assert_eq(stopped_ticks(&r), 6)
+    assert(state(&r, sleeper) == Ok(TaskState.Sleeping), "6 of 20")
+    r.wake_after = FOREVER
+    rest(&r)
+    assert_eq(r.stop_asked, 14)
+    assert_eq(ticks(), 20)
+    assert(state(&r, sleeper) == Ok(TaskState.Ready), "woke on its deadline")
+
+@test("a stop ends on the last tick the watch is fed on, the next on the last before its bite, and the watch is fed as the ticks would have")
+cs_one_core_watch_bounds_stop()
+    var r = cs_port()
+    val watched = cs_begin(&r)
+    allow_stop(&r, true)
+    arm_watchdog(&r, 20)
+    assert(watch(&r, watched, 6).is_ok(), "watched")
+    assert(check_in(&r), "checked in at 0")
+    sleep(&r, FOREVER)
+    cs_switch(&r)
+    rest(&r)
+    assert_eq(r.stop_asked, 6)
+    assert_eq(watch_here(&r).fed, 6)
+    assert_eq(r.feeds, 1)
+    rest(&r)
+    assert_eq(r.stop_asked, 20)
+    assert_eq(here(&r).own_ticks(), 26)
+    assert_eq(watch_here(&r).fed, 6)
+    assert(!supervise(&r), "no bite on 26")
+    tick(&r)
+    assert(supervise(&r), "the bite on 27")
+
+@test("a stop that measured nothing takes nothing, and the next idle step stops again")
+cs_one_core_nothing_slept()
+    var r = cs_port()
+    val _ = cs_begin(&r)
+    allow_stop(&r, true)
+    sleep(&r, 10)
+    cs_switch(&r)
+    r.wake_after = 0
+    rest(&r)
+    assert_eq(r.stop_asked, 10)
+    assert_eq(ticks(), 0)
+    assert_eq(stopped_ticks(&r), 0)
+    assert_eq(machine_stop().phase, STOP_OFF)
+    r.wake_after = FOREVER
+    rest(&r)
+    assert_eq(ticks(), 10)
+    assert_eq(machine_stops(&r), 2)
+
+@test("a held core woken by an interrupt of its own while the machine is stopped leaves the stop, counts it, and takes nothing yet; once the leader has moved the time base, it takes that")
+cs_holder_leaves_entered_stop()
+    var r = cs_port()
+    val _ = cs_begin(&r)
+    val c = here(&r)
+    val s = machine_stop()
+    // As if core 0 held for a stop core 1 leads, now entered.
+    s.phase = STOP_ENTERED
+    s.leader = 1
+    s.asked = 1
+    s.held = 1
+    s.idle = 0b11
+    s.entered = 1
+    c.held_from = ticks()
+    c.held_count = 0
+    after_hold(&r, c)
+    assert_eq(s.held, 0)
+    assert_eq(s.idle, 0b10)
+    assert_eq(s.phase, STOP_ENTERED)
+    assert_eq(machine_stops(&r), 1)
+    assert_eq(stopped_ticks(&r), 0)
+    assert_eq(c.own_ticks(), 0)
+    // The leader ends the stop and takes 7 periods; the core's next look takes them, and counts no second stop.
+    clear_stop(s)
+    time_base().store(7, Ordering.Release)
+    after_hold(&r, c)
+    assert_eq(machine_stops(&r), 1)
+    assert_eq(stopped_ticks(&r), 7)
+    assert_eq(c.own_ticks(), 7)
+
+@test("a held core released by a cancel takes exactly the periods the time base moved while it held, and counts no stop")
+cs_holder_released_by_cancel()
+    var r = cs_port()
+    val _ = cs_begin(&r)
+    val c = here(&r)
+    val s = machine_stop()
+    s.phase = STOP_GATHERING
+    s.leader = 1
+    s.asked = 1
+    s.held = 1
+    c.held_from = ticks()
+    c.held_count = s.entered
+    // The leader ticked 3 times, then cancelled.
+    clear_stop(s)
+    time_base().store(3, Ordering.Release)
+    after_hold(&r, c)
+    assert_eq(machine_stops(&r), 0)
+    assert_eq(stopped_ticks(&r), 3)
+    assert_eq(c.own_ticks(), 3)

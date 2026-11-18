@@ -59,6 +59,9 @@ struct Across
     // masked (time.sysl).
     time_stage: Atomic[u32]
     time_from: Atomic[u32]
+    // The machine stopped: each core is ready to go idle, and the time base both start from (stop.sysl).
+    stop_ready: [kernel.CORES]Atomic[u32]
+    stop_from: Atomic[u32]
     // The queue set in `.shared` core 0 waits on, its two members core 1 fills, and the step the two
     // are at (sets.sysl).
     gathering: QueueSet
