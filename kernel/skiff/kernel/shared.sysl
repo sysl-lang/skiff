@@ -49,6 +49,7 @@ const INBOX_CORES: usize = if option_cores > 1 then option_cores else 0
 //     a time, so one record each is all there is.
 //   - `notes[core][slot]` is the notification of that task (notify.sysl), which any core may send to.
 //   - `stop` is the cores' agreement on stopping the machine (stop.sysl).
+//   - `consoles` holds each core's reports and console service, and the console core (console.sysl).
 //   - `start` and `end` are `.shared`'s bounds, as the board found them in its link script, for the
 //     check that an object two cores use lies inside them.
 struct Shared
@@ -59,6 +60,7 @@ struct Shared
     waiters: [option_cores][option_tasks]Waiter
     notes: [option_cores][option_tasks]Note
     stop: Stop
+    consoles: Consoles
     start: usize
     end: usize
 
@@ -124,6 +126,9 @@ private[kernel] waiter(index: u16) -> *Waiter = &shared.waiters[usize(index) / o
 
 // The ring core `from` posts to core `to` through.
 private[kernel] inbox(to: u32, from: u32) -> *Ring = &shared.inboxes[to][from]
+
+// The machine's consoles: the console core, each core's service and each core's reports.
+private[kernel] consoles() -> *Consoles = &shared.consoles
 
 // The notification of task `slot` of core `core`.
 private[kernel] note_of(core: u32, slot: usize) -> *Note = &shared.notes[core][slot]

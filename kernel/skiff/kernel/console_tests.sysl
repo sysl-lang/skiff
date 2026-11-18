@@ -1,0 +1,158 @@
+module skiff.kernel
+@tests
+
+// The console service on one core, over the recording port (kernel_tests.sysl). A report made with no
+// service is written at once, as a handler wrote it before; with one, it waits in the core's ring until
+// the service writes it, and a full ring drops the newest and says how many it dropped.
+
+private var stacks: [3][128]u32
+
+private body() -> never
+    loop
+        ()
+
+// A service task and a task below it, the service running and recorded as the core's.
+private serviced(r: *Recorder) -> (Task, Task)
+    val service = create(r, 0, stacks[0], &body, 3).unwrap()
+    val other = create(r, 0, stacks[1], &body, 1).unwrap()
+    val _ = here(r).sched.first()
+    assert(current(r) == service, "the service runs")
+    assert(start_console(r) == service, "recorded")
+    (service, other)
+
+// The service waits for a report on its notification, and the task below it runs.
+private service_waits(r: *Recorder, service: Task, other: Task)
+    assert_eq(notify_take(r, true, FOREVER), 0)
+    assert(state(r, service) == Ok(TaskState.Blocked), "the service waits")
+    val _ = switch_context(r, 0)
+    assert(current(r) == other, "the other runs")
+
+private val BREACH: string = "skiff: core 0 stopped a task that broke its memory protection\n"
+
+@test("cn: with no console service a report is written at once, as the handler wrote it")
+cn_written_at_once()
+    var r = recorder(1, 0)
+    report(&r, ReportKind.Breach, "")
+    assert(recorded(&r, BREACH), "the breach")
+    r.used = 0
+    fault(&r, "BusFault")
+    assert(recorded(&r, "skiff: core 0 fault BusFault\n"), "the fault")
+    assert_eq(r.masked, 0)
+
+@test("cn: with a service a report waits in the ring, written only when the service turns, oldest first")
+cn_service_writes()
+    var r = recorder(1, 0)
+    val _ = serviced(&r)
+    report(&r, ReportKind.Breach, "")
+    report(&r, ReportKind.Overflow, "")
+    assert_eq(r.used, 0)
+    assert_eq(r.masked, 0)
+    assert(console_line(&r), "a line")
+    assert(recorded(&r, BREACH), "the first first")
+    r.used = 0
+    assert_eq(console_turn(&r), 1)
+    assert(recorded(&r, "skiff: core 0 stopped a task that overflowed its stack\n"), "then the second")
+    assert_eq(console_turn(&r), 0)
+
+@test("cn: a report wakes the service waiting on its notification, and asks the switch to it")
+cn_report_wakes_service()
+    var r = recorder(1, 0)
+    val (service, other) = serviced(&r)
+    service_waits(&r, service, other)
+    val before = r.switches
+    report(&r, ReportKind.Trap, "")
+    assert(state(&r, service) == Ok(TaskState.Ready), "woken")
+    assert(r.switches > before, "and the switch asked, since it outranks the running task")
+    assert_eq(r.used, 0)
+
+@test("cn: a full ring drops the newest reports, keeps the rest, and the service says how many it dropped")
+cn_full_ring_counts_drops()
+    var r = recorder(1, 0)
+    val _ = serviced(&r)
+    report(&r, ReportKind.Overflow, "")
+    for _ in 1..<CONSOLE_REPORTS
+        report(&r, ReportKind.Breach, "")
+    report(&r, ReportKind.Trap, "")
+    report(&r, ReportKind.Trap, "")
+    report(&r, ReportKind.Trap, "")
+    assert(console_line(&r), "the first kept")
+    assert(recorded(&r, "skiff: core 0 stopped a task that overflowed its stack\n"), "the oldest kept")
+    for _ in 1..<CONSOLE_REPORTS
+        r.used = 0
+        assert(console_line(&r), "kept")
+        assert(recorded(&r, BREACH), "every one kept is a breach: no trap overwrote one")
+    r.used = 0
+    assert(console_line(&r), "the drops")
+    assert(recorded(&r, "skiff: core 0 dropped 3 reports\n"), "said once the kept ones are written")
+    r.used = 0
+    assert(!console_line(&r), "said once")
+    report(&r, ReportKind.Trap, "")
+    assert(console_line(&r), "room again")
+    assert(recorded(&r, "skiff: core 0 stopped a task that made a trap the kernel does not take\n"), "the next report kept")
+    r.used = 0
+    assert(!console_line(&r), "no drop since")
+
+@test("cn: a fault stopping the core writes what its ring holds and then its own line, at once")
+cn_fault_writes_at_once()
+    var r = recorder(1, 0)
+    val _ = serviced(&r)
+    report(&r, ReportKind.Breach, "")
+    fault(&r, "watchdog")
+    assert(recorded(&r, "skiff: core 0 stopped a task that broke its memory protection\nskiff: core 0 fault watchdog\n"), "in order")
+    assert(stopped(0), "the core is stopped")
+    r.used = 0
+    assert_eq(console_turn(&r), 0)
+
+@test("cn: a fault's name is kept to NAME_BYTES bytes")
+cn_fault_name_kept()
+    var r = recorder(1, 0)
+    fault(&r, "a fault named at great length")
+    assert(recorded(&r, "skiff: core 0 fault a fault named at\n"), "16 bytes")
+
+@test("cn: the service stopped by a fault is taken off first, so its own report is written at once")
+cn_service_stopped_by_fault()
+    var r = recorder(1, 0)
+    val (service, _) = serviced(&r)
+    report(&r, ReportKind.Breach, "")
+    assert(stop_running(&r, Violation.Overflow).is_some(), "stopped")
+    assert(recorded(&r, "skiff: core 0 stopped a task that broke its memory protection\nskiff: core 0 stopped a task that overflowed its stack\n"), "what was queued, then its own")
+    assert(state(&r, service) == Ok(TaskState.Stopped), "the service is stopped")
+    r.used = 0
+    report(&r, ReportKind.Trap, "")
+    assert(recorded(&r, "skiff: core 0 stopped a task that made a trap the kernel does not take\n"), "and later reports are written at once")
+
+@test("cn: a deleted service is not waited for: the report is written at once and the service forgotten")
+cn_service_deleted()
+    var r = recorder(1, 0)
+    val (service, other) = serviced(&r)
+    service_waits(&r, service, other)
+    report(&r, ReportKind.Overflow, "")
+    assert(delete(&r, service).is_ok(), "deleted")
+    report(&r, ReportKind.Breach, "")
+    assert(recorded(&r, "skiff: core 0 stopped a task that overflowed its stack\nskiff: core 0 stopped a task that broke its memory protection\n"), "the queued one, then the new")
+    r.used = 0
+    report(&r, ReportKind.Trap, "")
+    assert(recorded(&r, "skiff: core 0 stopped a task that made a trap the kernel does not take\n"), "the next at once, with no give tried")
+
+@test("cn: the flush before a halt writes every report still queued")
+cn_flush()
+    var r = recorder(1, 0)
+    val _ = serviced(&r)
+    report(&r, ReportKind.Breach, "")
+    report(&r, ReportKind.Trap, "")
+    console_flush(&r)
+    assert(recorded(&r, "skiff: core 0 stopped a task that broke its memory protection\nskiff: core 0 stopped a task that made a trap the kernel does not take\n"), "both, in order")
+    r.used = 0
+    assert_eq(console_turn(&r), 0)
+
+@test("cn: a report masks once to append and restores the mask it found")
+cn_append_masked()
+    var r = recorder(1, 0)
+    val _ = serviced(&r)
+    val before = r.masks
+    report(&r, ReportKind.Breach, "")
+    assert(r.masks > before, "masked")
+    assert_eq(r.masked, 0)
+    r.masked = 5
+    report(&r, ReportKind.Breach, "")
+    assert_eq(r.masked, 5)

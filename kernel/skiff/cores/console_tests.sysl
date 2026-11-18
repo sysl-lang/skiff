@@ -1,0 +1,112 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+import skiff.kernel.{Task, TaskState, Violation}
+
+// The console service on several cores: core 0 is the console, and every core's reports reach its
+// service through the core's ring in `.shared` and a notification that crosses by the inbox. A core whose
+// console core has stopped reports on its own console.
+
+// A console service at priority 3 and a task at 1 on each of `cores` cores, each service recorded and
+// waiting for a report, each core running its task at 1. Core 0 is the console.
+private serviced(m: *Machine, cores: u32) -> [kernel.CORES]Task
+    var services: [kernel.CORES]Task
+    for core in 0u32..<u32(kernel.CORES)
+        services[core] = task_on(m, core, usize(core) * 2, 3)
+        val _ = task_on(m, core, usize(core) * 2 + 1, 1)
+    begin(m)
+    kernel.console_on(0)
+    for core in 0u32..<cores
+        on(m, core)
+        assert(kernel.start_console(m) == services[core], "recorded")
+        assert_eq(kernel.notify_take(m, true, kernel.FOREVER), 0)
+        switch_now(m)
+    on(m, 0)
+    hush()
+    services
+
+private is(m: *Machine, t: Task, s: TaskState) -> bool
+    on(m, t.core())
+    kernel.state(m, t) == Ok(s)
+
+private val BREACH_1: string = "skiff: core 1 stopped a task that broke its memory protection\n"
+
+@test("cn: a core's report goes to the console core's service, through its inbox, and is written there")
+cn_forwarded_to_console_core()
+    var m = machine()
+    val services = serviced(&m, 2)
+    on(&m, 1)
+    assert(kernel.stop_running(&m, Violation.Breach).is_some(), "stopped")
+    assert(said_on(1, ""), "nothing written on core 1")
+    assert(is(&m, services[1], TaskState.Blocked), "core 1's own service is not asked")
+    assert_eq(m.rung[0], 1)
+    on(&m, 0)
+    kernel.answer_doorbell(&m)
+    assert(is(&m, services[0], TaskState.Ready), "the console core's service is woken")
+    on(&m, 0)
+    assert_eq(kernel.console_turn(&m), 1)
+    assert(said_on(0, BREACH_1), "written on core 0's console, naming core 1")
+    assert(said_on(1, ""), "and still nothing on core 1's")
+
+@test("cn: each core's reports are written in the order it made them")
+cn_forwarded_in_order()
+    var m = machine()
+    val _ = serviced(&m, 1)
+    on(&m, 2)
+    kernel.fault(&m, "UsageFault")
+    on(&m, 1)
+    assert(kernel.stop_running(&m, Violation.Breach).is_some(), "stopped")
+    switch_now(&m)
+    assert(kernel.stop_running(&m, Violation.Overflow).is_some(), "the next stopped too")
+    on(&m, 0)
+    assert_eq(kernel.console_turn(&m), 3)
+    assert(said_on(0, "skiff: core 1 stopped a task that broke its memory protection\nskiff: core 1 stopped a task that overflowed its stack\nskiff: core 2 fault UsageFault\n"), "lowest core first, each in its order")
+    assert(said_on(1, "") && said_on(2, ""), "nothing elsewhere")
+
+@test("cn: a fault stopping a core that is not the console is forwarded, and the core is stopped")
+cn_core_fault_forwarded()
+    var m = machine()
+    val services = serviced(&m, 2)
+    on(&m, 1)
+    kernel.fault(&m, "watchdog")
+    assert(kernel.stopped(1), "core 1 stopped")
+    assert(said_on(1, ""), "nothing on core 1")
+    on(&m, 0)
+    kernel.answer_doorbell(&m)
+    assert(is(&m, services[0], TaskState.Ready), "woken")
+    on(&m, 0)
+    assert_eq(kernel.console_turn(&m), 1)
+    assert(said_on(0, "skiff: core 1 fault watchdog\n"), "on core 0's console")
+
+@test("cn: with the console core stopped a core writes its reports itself, through its own service or at once")
+cn_console_core_stopped()
+    var m = machine()
+    val services = serviced(&m, 2)
+    kernel.fault(&m, "BusFault")
+    assert(said_on(0, "skiff: core 0 fault BusFault\n"), "the console core's own fault, at once")
+    hush()
+    on(&m, 1)
+    assert(kernel.stop_running(&m, Violation.Breach).is_some(), "stopped")
+    assert(is(&m, services[1], TaskState.Ready), "core 1's own service is woken")
+    on(&m, 1)
+    assert(said_on(1, ""), "not yet written")
+    assert_eq(kernel.console_turn(&m), 1)
+    assert(said_on(1, BREACH_1), "written on core 1's console")
+    on(&m, 2)
+    assert(kernel.stop_running(&m, Violation.Trap).is_some(), "stopped")
+    assert(said_on(2, "skiff: core 2 stopped a task that made a trap the kernel does not take\n"), "core 2 has no service: at once")
+    assert(said_on(0, ""), "nothing reaches the stopped console")
+
+@test("cn: reports forwarded to the console core before it stopped are written by the flush before the halt")
+cn_flush_every_core()
+    var m = machine()
+    val _ = serviced(&m, 1)
+    on(&m, 2)
+    assert(kernel.stop_running(&m, Violation.Overflow).is_some(), "stopped")
+    on(&m, 1)
+    kernel.fault(&m, "watchdog")
+    on(&m, 0)
+    kernel.console_flush(&m)
+    assert(said_on(0, "skiff: core 1 fault watchdog\nskiff: core 2 stopped a task that overflowed its stack\n"), "every core's, at once")
+    assert_eq(kernel.console_turn(&m), 0)

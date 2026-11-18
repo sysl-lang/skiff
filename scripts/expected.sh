@@ -290,11 +290,19 @@ skiff: core 1 an unprivileged task received notes and a filled buffer an unprivi
 skiff: core 1 kept the time base moving while core 0 took no tick
 $(tickless_expected 1)
 $(watchdog_expected 1)"
+# Core 0's console is the machine's (DESIGN "The console service"): core 1's reports, the tasks its
+# protection stopped and its watchdog's fault (whichever stage bit), are written there by core 0's console
+# service, in core 1's order but wherever core 0 was idle among its own lines. So they are checked on core
+# 0's console, among its lines that name core 1 (`check_forwarded`), and core 1's console is checked
+# without them (`core1_own`). The hang's two kinds report the same forwarded lines.
+forwarded_pattern="^skiff: core 1 (stopped a task that |fault )"
+core1_own() { echo "$1" | grep -v -E "$forwarded_pattern"; }
+an521_forwarded=$(printf '%s\n%s\n' "$an521_core1_run" "$(hang_expected 1 open)" | grep -E "$forwarded_pattern")
 an521_core1_expected="skiff: hello from core 1
 $an521_core1_ticks
 $(tasks_expected 1)
-$an521_core1_run
-$(hang_expected 1 open)"
+$(core1_own "$an521_core1_run
+$(hang_expected 1 open)")"
 
 # The AN521 as two images (boards/qemu-an521 with `--features core0` and `--features core1`): each core
 # runs its own, built from the one board program, and the two meet at the handshake, agreeing on the
@@ -309,8 +317,8 @@ split_core1_expected="skiff: hello from core 1
 skiff: core 1 agrees with core 0 on the layout of .shared
 $an521_core1_ticks
 $(tasks_expected 1 "f32 registers survived the switches")
-$an521_core1_run
-$(hang_expected 1 masked)"
+$(core1_own "$an521_core1_run
+$(hang_expected 1 masked)")"
 
 
 # check <label> <log> <expected>: every expected line must appear in the log after the one before it.
@@ -342,12 +350,19 @@ stop_expected() {
 before_line() {
     awk -v at="$1" -v line="$2" '$0 == at { print line } { print }'
 }
+# check_forwarded <label> <core 0's log>: core 1's reports, in core 1's order, among the lines of core 0's
+# console that name core 1. Sets `missing` as `check` does.
+check_forwarded() {
+    grep -E "^skiff: core 1 " "$2" > "$2.core1"
+    check "$1, core 1's reports on core 0's console" "$2.core1" "$an521_forwarded"
+}
+
 pico2_core0_expected="$an521_core0_greeting
 $(dual_core0_run "f32 registers survived the switches" | grep -v -x -F -e "$(tickless_expected 0)" -e "$an521_outlived" \
     | before_line "skiff: core 0 took no tick while masked, and the time base moved on without it" "$(stop_expected 0)")"
 pico2_core1_expected="skiff: hello from core 1
 $an521_core1_ticks
 $(tasks_expected 1 "f32 registers survived the switches")
-$(echo "$an521_core1_run" | grep -v -x -F "$(tickless_expected 1)" \
+$(core1_own "$(echo "$an521_core1_run" | grep -v -x -F "$(tickless_expected 1)" \
     | before_line "skiff: core 1 kept the time base moving while core 0 took no tick" "$(stop_expected 1)")
-$(hang_expected 1 open)"
+$(hang_expected 1 open)")"

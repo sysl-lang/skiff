@@ -27,6 +27,8 @@ import skiff.kernel.{Port, Task, TaskError, TaskState}
 //     traces (traces.sysl), the protection scenarios (protection.sysl),
 //     the grants (grants.sysl), a sleep with the tick stopped (tickless.sysl) and the watchdog
 //     (watchdog.sysl), whose hang ends the core it is run with.
+//   - The console service, at priority 1 on every core, writes the reports of the tasks the protection
+//     stops and of the faults that stop a core: on several cores, every core's on core 0's console.
 
 // How many words each task's stack holds: 2 KiB, enough for a kernel call at -O0.
 const STACK_WORDS: usize = 512
@@ -75,6 +77,11 @@ struct Entries
     hang: *extern() -> never        // the task that hangs its core (watchdog.sysl)
     traced: *extern() -> never      // the task whose waits and switches the trace follows (tracing.sysl)
     selector: *extern() -> never    // the task that waits on a queue set (sets.sysl)
+    console: *extern() -> never     // the console service, which writes the kernel's reports
+
+// The console service's priority: the lowest a task may have, so that it starts a line only when no
+// other task is ready, and so in the middle of no other task's line (DESIGN "The console service").
+private const CONSOLE_PRIORITY: u8 = 1
 
 private var stacks: [kernel.CORES][STACKS][STACK_WORDS]u32
 
@@ -82,6 +89,7 @@ private var stacks: [kernel.CORES][STACKS][STACK_WORDS]u32
 // 2 KiB.
 private const R_STACK_WORDS: usize = 2048
 private var r_stacks: [kernel.CORES][R_STACK_WORDS]u32
+private var console_stacks: [kernel.CORES][STACK_WORDS]u32
 private[scenarios] var epochs: [kernel.CORES]u32
 private var handles: [kernel.CORES]Task
 private var high: [kernel.CORES]Task
@@ -118,6 +126,7 @@ create_tasks[P: Port](p: *P, core: u32, e: *Entries)
     else if kernel.CORES > 1 && core == 1
         val _ = created(kernel.create(p, core, stacks[core][14], e.owner, 1))
         val _ = created(kernel.create(p, core, stacks[core][15], e.worker, 2))
+    val _ = created(kernel.create(p, core, console_stacks[core], e.console, CONSOLE_PRIORITY))
 
 private[scenarios] created(result: Result[Task, TaskError]) -> Task = result match
     Ok(t) -> t

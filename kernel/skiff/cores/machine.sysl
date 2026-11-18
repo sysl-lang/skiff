@@ -65,7 +65,12 @@ impl Watchdog for Machine
 // A tick is taken by hand. A new task's context is only its stack's address. The chip's lock is a word
 // that is never contended, since one core acts at a time: finding it taken is a lock left held.
 impl Port for Machine
-    write(*self, bytes: []const u8) = ()
+    write(*self, bytes: []const u8)
+        for b in bytes
+            if said_len[self.me] < SAID_BYTES
+                said[self.me][said_len[self.me]] = b
+                said_len[self.me] += 1
+
     cores(*self) -> u32 = u32(kernel.CORES)
     core_id(*self) -> u32 = self.me
     start_ticks(*self, hz: u32) = ()
@@ -264,6 +269,25 @@ begin(m: *Machine)
 // The switch the running core asked for: its scheduler's choice runs.
 switch_now(m: *Machine)
     val _ = kernel.switch_context(m, 0)
+
+// What each core's console was written, as far as `SAID_BYTES`: module storage, since the cores' consoles
+// outlive any one port value a test hands on.
+private const SAID_BYTES: usize = 512
+private var said: [kernel.CORES][SAID_BYTES]u8
+private var said_len: [kernel.CORES]usize
+
+// Whether core `core`'s console has been written exactly `want` since it was last emptied.
+said_on(core: u32, want: string) -> bool
+    val w = want.bytes
+    if said_len[core] != w.len then return false
+    for i in 0..<w.len
+        if said[core][i] != w[i] then return false
+    true
+
+// Empty every core's console.
+hush()
+    for core in 0..<kernel.CORES
+        said_len[core] = 0
 
 // A task's body: no task runs on the host.
 private body() -> never

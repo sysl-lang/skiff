@@ -188,6 +188,16 @@ private deferred(m: *Nothing) -> bool
     if m.cores() > 3 then kernel.serve_work(m)
     true
 
+// The console service: the console core chosen, a report written, the queue flushed, the service run.
+private console(m: *Nothing) -> bool
+    kernel.console_on(0)
+    if kernel.console_turn(m) != 0 then return false
+    kernel.console_flush(m)
+    if m.cores() > 3
+        val _ = kernel.start_console(m)
+        kernel.serve_console(m)
+    true
+
 private var user_stack: [64]u32 = [0; 64]
 
 // Unprivileged tasks, their calls, and stopping a task, over the port.
@@ -241,7 +251,7 @@ probe() -> i32
     if !kernel.stopped(here.id) || kernel.expired(kernel.ticks(), 0) then return 1
     if t.is_err() || kernel.delete(&m, t.unwrap()).is_ok() then return 1
     if !control(&m, t.unwrap()) then return 1
-    if !protection(&m) || !timers(&m) || !deferred(&m) || !handshake() || !tracing(&m) then return 1
+    if !protection(&m) || !timers(&m) || !deferred(&m) || !console(&m) || !handshake() || !tracing(&m) then return 1
     if here.sched.started()
         kernel.sleep(&m, 1)
         kernel.sleep_until(&m, 1)

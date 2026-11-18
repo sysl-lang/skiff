@@ -41,7 +41,7 @@ impl KernelLock
     on[P: Port](*self, p: *P) -> Locking[P] = Locking(self, p)
 
 // The first `NAME_BYTES` bytes of `name`, zeros after.
-private const kept_name(name: string) -> [NAME_BYTES]u8
+private[kernel] const kept_name(name: string) -> [NAME_BYTES]u8
     var kept: [NAME_BYTES]u8
     for i in 0..<NAME_BYTES
         if i < name.len then kept[i] = name[i]

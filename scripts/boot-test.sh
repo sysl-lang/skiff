@@ -91,6 +91,9 @@ check "mps2-an521 core 0" "$scratch/an521-core0.log" "$an521_core0_expected"
 if [ -z "$missing" ]; then
     check "mps2-an521 core 1" "$scratch/an521-core1.log" "$an521_core1_expected"
 fi
+if [ -z "$missing" ]; then
+    check_forwarded "mps2-an521" "$scratch/an521-core0.log"
+fi
 verdict mps2-an521 0
 
 # The AN521 as two images: core 0's is the kernel QEMU starts, and core 1's is loaded beside it, where
@@ -105,6 +108,9 @@ run "$scratch/an521-split-core0.log" -M mps2-an521 -accel tcg,thread=multi -kern
 check "mps2-an521 two images, core 0" "$scratch/an521-split-core0.log" "$split_core0_expected"
 if [ -z "$missing" ]; then
     check "mps2-an521 two images, core 1" "$scratch/an521-split-core1.log" "$split_core1_expected"
+fi
+if [ -z "$missing" ]; then
+    check_forwarded "mps2-an521 two images" "$scratch/an521-split-core0.log"
 fi
 verdict "mps2-an521 two images" 0
 
@@ -153,6 +159,9 @@ else
         check "pico2 ($entry entry) core 0" "$scratch/pico2-$entry-core0.log" "$pico2_core0_expected"
         if [ -z "$missing" ]; then
             check "pico2 ($entry entry) core 1" "$scratch/pico2-$entry-core1.log" "$pico2_core1_expected"
+        fi
+        if [ -z "$missing" ]; then
+            check_forwarded "pico2 ($entry entry)" "$scratch/pico2-$entry-core0.log"
         fi
         verdict "pico2 ($entry entry)" 0
     done
