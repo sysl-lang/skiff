@@ -160,13 +160,60 @@ the object hands itself over, as a semaphore or a mutex does), and releases the 
   either in `.shared` carries bytes between cores; a zeroed one is empty with a trigger level of 1):
   readers and writers wait on the two sides of the one `WaitQueue`, as a queue's do, and a writer's
   `value` is the room it needs (1 for a stream, the message and its 4-byte length prefix for a
-  message). Nothing is kept: a change of bytes wakes the best reader with `Woken` once the trigger
-  level is met, and the best writers in order while the room each needs is there (one needing more
-  than there is holds back those behind it, so a long message is not starved); a woken task takes the
-  lock again and looks, and waits again for what its deadline leaves if another got there first. A
-  stream send writes what fits and waits for room for the rest; a receive whose timeout comes first
+  message). Nothing is kept: a commit of bytes wakes the best reader with `Woken` once the trigger
+  level is met, and room given back wakes the best writer if the room it needs is there (one needing
+  more than there is holds back those behind it, so a long message is not starved); a woken task takes
+  the lock again and looks, and waits again for what its deadline leaves if another got there first.
+  A stream send writes what fits and waits for room for the rest; a receive whose timeout comes first
   takes whatever is there. A message goes in whole or not at all, and one longer than `N - 4`, or
-  empty, is refused at once.
+  empty, is refused at once. No byte is copied under the lock ("Stream buffers copy with the lock let
+  go").
+
+### Stream buffers copy with the lock let go
+
+A stream's bytes were once copied in and out under the object's lock, so its masked hold grew with the
+bytes moved, up to `N`: on the Pico 2 the 64-byte streams' sends and receives were the longest holds the
+kernel made (1224 and 1534 cycles). **Every hold of a stream's lock is now a constant number of steps,
+whatever the length and whatever `N`**; the copy is the caller's own time, preemptible and unmasked.
+
+- **Claim, copy, commit.** A writer takes the lock, claims the room for what fits of its bytes behind
+  every byte written and every byte claimed before it (`writing` grows, `writers` counts it), lets the
+  lock go, copies, then takes the lock again to commit. A reader likewise claims the oldest committed
+  bytes nobody has claimed (`reading`, `readers`), copies them out, and takes the lock to finish. A
+  claim, a commit and a finish are each a few additions and at most one wake; a message reader's claim
+  also reads the 4-byte length prefix. Two holds where there was one: the price of the bound.
+- **What a claim excludes.** Claimed room lies past every committed byte, so no reader reaches it; claimed
+  bytes stay counted as there, so no writer reaches their room. So no reader ever sees a byte a writer
+  has yet to copy, and no writer writes over a byte a reader is still copying out.
+- **Visible in claim order, all at once.** Several writers may be copying at once: tasks on several
+  cores, or an interrupt handler's `try_send` during a task's copy on the same core. The bytes claimed
+  for writing are committed together when the last writer copying commits (`writers` back to 0), never
+  one claim's before an earlier claim's, since the earlier one's room may still hold old bytes. Readers
+  give room back the same way, when the last reader copying finishes. This needs no record per claim,
+  and a commit made from an interrupt handler, which cannot wait for an earlier writer, simply leaves
+  its bytes to the last one to commit.
+- **Messages stay whole.** A message's room, its prefix and its bytes, is claimed all at once or not at
+  all, and committed with the rest, so committed bytes are always whole messages; a message reader
+  claims one whole message, prefix and all, or none. The queue set hears of the bytes at the commit that
+  makes them visible, once their length and bytes are both in.
+- **One wake per hold.** A commit wakes the best reader if the trigger level is met; room given back
+  wakes the best writer if the room it needs is there. The woken task's own claim, when it runs, wakes
+  the next on its side if what is left still meets the level or that writer's need, so the wakes go on
+  one per hold instead of a walk over the waiters. A woken task that is stopped before it claims breaks
+  that chain; the next commit or room given back starts it again.
+- **What it costs.** Bytes are not visible, and room not given back, until the slowest copier then
+  under way finishes. A task preempted, suspended or stopped in the middle of a copy holds them back
+  that long: a stream behaves as if its writers (or readers) shared a lock that has no priority
+  inheritance, which is why the copy is kept as short as a loop of byte moves. A task stopped mid-copy
+  (task control's `stop`, or a fault) leaves the stream unable to commit for ever, as a stopped task
+  keeps its mutex. A reset is refused while anyone copies, as it is while anyone waits.
+- **Caches.** Every board's `Cache` is a no-op and a stream asks none: its storage is the object's own.
+  Where a port needs it, a writer would clean its room after the copy and before the commit, and a
+  reader invalidate its claimed bytes after the claim and before the copy; neither is under the lock.
+- **How the others do it.** FreeRTOS's stream and message buffers copy outside any critical section,
+  but allow one writer and one reader at a time and leave the rest to the application; Zephyr's
+  `k_pipe` copies under its spinlock. skiff keeps several writers and readers, on several cores, and
+  takes the copy out from under the lock with the claim.
 
 ### Event flags: a set walks in steps
 
@@ -213,8 +260,9 @@ masked: **a set masks its core for one waiter's worth of work at a time, and tak
   waiting during the walk; since a set wakes every waiter it satisfies whatever their order, this changes
   only which of one set's wakes is made first.
 - **The bound.** Masked, per lock acquisition: a constant number of instructions plus the chip lock's
-  wait, at most `cores - 1` holders ahead, each also holding for a constant (every other user of the
-  object's lock holds it for a constant now too). Unmasked, a set's whole length is one step per waiter
+  wait, at most `cores - 1` holders ahead, each also holding for a constant (every other user of an
+  object's lock holds it for a constant too; a stream buffer's copies are made with the lock let go,
+  "Stream buffers copy with the lock let go"). Unmasked, a set's whole length is one step per waiter
   per walk, and one walk more for each set made during it.
 
 ### Timeouts race with wakes, and the outcome decides

@@ -257,3 +257,31 @@ Status: fixed in sysl 0.5.2 by a weak hook, `sysl_error_trace_here() -> *ErrorTr
 runtime calls on every failure path and every read of the trace and an OS overrides. skiff's hook (DESIGN
 "Error traces") answers each core's handlers' trace in handler mode, and the running task's, kept at the
 top of its own stack, in thread mode; both boards build with traces on.
+
+## FINDINGS 13 — a `private[m]` generic method is callable from outside `m`
+
+A generic method declared `private[inner]` is called from a sibling module with no diagnostic; the same
+call to a non-generic `private[inner]` method is refused, as the reference page (modules.md, the
+`private[own_module]` row: "every file of this module") says both should be. sysl 0.11.11:
+
+```
+module top.inner
+struct Box
+    v: int
+impl Box
+    private[inner] plain(*self) -> int = self.v
+    private[inner] generic[T](*self, t: T) -> int = self.v
+
+module top.other
+import top.inner.Box
+main()
+    var b = Box(1)
+    val _ = b.generic(2)      // builds
+    val _ = b.plain()         // error: method 'plain' of 'top.inner.Box' is private to module 'top.inner'
+```
+
+skiff met it in the stream cores tests (`skiff.cores`), which reached `StreamBuffer.claim_write` and
+`commit_write` (generic, `private[kernel]`) but were refused `write_at` and `read_at` (not generic). Those
+steps are `private[skiff]` now, which is what was meant; nothing depends on the bug.
+
+Status: open; a compiler bug, sent to the sysl session.
