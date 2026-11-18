@@ -275,8 +275,8 @@ running_stack[P: Port](p: *P) -> (usize, usize)
     val t = &c.sched.tasks[usize(c.sched.running)]
     (t.stack, t.stack_bytes)
 
-// For a fault handler: stop the running task for good, for having done `why`, and report it on the
-// core's console. A switch away from it is asked for; the task keeps its slot, and its handle answers
+// For a fault handler: stop the running task for good, for having done `why`, and report it to the
+// console service (console.sysl), which writes it from a task. A switch away from it is asked for; the task keeps its slot, and its handle answers
 // `Stopped`. Answers the address just past the top of its frames, below its error trace, where the port
 // may lay a frame to return on until the switch, or None when the running task cannot be stopped (the idle task, or no task
 // before the core runs its first): the port then stops the core.
@@ -289,19 +289,16 @@ stop_running[P: Port](p: *P, why: Violation) -> Option[usize]
 #if option_trace
     trace_running(p, TraceKind.Stop, TraceObject.Nothing, 0, 1)
 #endif
+    retire_console_service(p)
     c.sched.stop()
     c.maps[i].calling = false
     p.request_switch()
     p.restore(state)
-    p.write("skiff: core ".bytes)
-    write_dec(p, c.id)
-    p.write(" stopped a task that ".bytes)
-    p.write(violation_text(why).bytes)
-    p.write("\n".bytes)
+    report(p, report_kind(why), "")
     Some(usize(trace_at(c.sched.tasks[i].stack, c.sched.tasks[i].stack_bytes)))
 
-// What a stopped task did, as its report says it.
-private violation_text(why: Violation) -> string = why match
-    Violation.Overflow -> "overflowed its stack"
-    Violation.Breach -> "broke its memory protection"
-    Violation.Trap -> "made a trap the kernel does not take"
+// What a stopped task did, as its report records it.
+private report_kind(why: Violation) -> ReportKind = why match
+    Violation.Overflow -> ReportKind.Overflow
+    Violation.Breach -> ReportKind.Breach
+    Violation.Trap -> ReportKind.Trap

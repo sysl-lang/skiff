@@ -84,6 +84,9 @@ one() {
     if [ -z "$missing" ]; then
         check "core 1" "$core1" "$pico2_core1_expected"
     fi
+    if [ -z "$missing" ]; then
+        check_forwarded "core 0" "$core0"
+    fi
     if [ -f "$scratch/$seed.hung" ]; then
         why="HANG: killed after ${wall}s of wall time"
     elif [ -n "$missing" ]; then

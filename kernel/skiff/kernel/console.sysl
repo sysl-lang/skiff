@@ -1,7 +1,17 @@
 module skiff.kernel
 
-// Numbers written to a core's console, with no allocation: for boot messages and for fault reports,
-// which run when nothing else can be trusted.
+import sysl.sync.{Atomic, Ordering}
+
+// A core's console: numbers written with no allocation, and the console service, which writes the
+// kernel's reports from a task rather than from the handler that made them (DESIGN "The console
+// service").
+//
+// A fault handler runs above every interrupt the kernel takes, so a line it wrote a byte at a time held
+// the tick, the switch and the kernel's interrupts off for the whole line. A handler now records a
+// report in its core's ring in `.shared` (constant time under the core's mask) and gives the console
+// service a notification; the service, a task, writes the line. With several cores, every core's
+// reports go to the service of one console core, the board's choice, while that core runs; a core whose
+// console core has stopped writes its own.
 
 // Write `n` in decimal.
 write_dec[P: Port](p: *P, n: u32)
@@ -26,3 +36,190 @@ write_hex[P: Port](p: *P, n: u32)
         digits[k] = if d < 10 then u8('0') + d else u8('a') + d - 10
         if shift > 0 then shift -= 4
     p.write(digits[0..<10])
+
+// What a report says happened. `Empty` is a zeroed slot's.
+enum ReportKind: u8
+    Empty = 0
+    Fault = 1           // a fault stopped the core: `name` says which
+    Overflow = 2        // the core stopped a task that overflowed its stack, and runs on
+    Breach = 3          // the core stopped a task that broke its memory protection
+    Trap = 4            // the core stopped a task that made a trap the kernel does not take
+
+// One report as it waits in its core's ring: no pointer, so a core of another image reads it as it was
+// written. The core it came from is the ring it lies in.
+struct Report
+    kind: ReportKind
+    name: [NAME_BYTES]u8    // for a `Fault`, what the fault was, zeros after
+
+// How many reports each core's ring holds: the `console_reports` option.
+const CONSOLE_REPORTS: usize = option_console_reports
+private const REPORT_SLOTS: usize = option_console_reports + 1
+
+// One core's reports, written by that core (`tail`, `dropped`, the slots) and read by the one service
+// that writes them (`head`, `told`). Both indices run from 0 to `REPORT_SLOTS - 1` and wrap; `head ==
+// tail` is empty, and one slot stays empty so that full differs from it.
+struct ReportRing
+    head: Atomic[u32]
+    tail: Atomic[u32]
+    dropped: Atomic[u32]    // the reports a full ring refused, wrapping
+    told: u32               // of them, how many the service has said were dropped
+    slots: [REPORT_SLOTS]Report
+
+// The machine's consoles, in `.shared`: the console core the board chose, each core's service and each
+// core's ring.
+struct Consoles
+    console: Atomic[u32]                    // the console core, plus one: 0 while each core is its own
+    services: [option_cores]Atomic[u32]     // each core's console service, as its handle's bits: 0 for none
+    rings: [option_cores]ReportRing
+
+// Make core `core`'s console the machine's: every core's reports go to its service while it runs. Core 0
+// calls it before it releases the other cores; until then each core's reports go to its own service.
+console_on(core: u32)
+    consoles().console.store(core + 1, Ordering.Release)
+
+// The core whose console service writes the reports of core `from` now, or None if they are to be
+// written at once, from where they are made: the console core's service while that core runs and has
+// one, else `from`'s own, unless `from` is stopping, when its own never runs again.
+private serving(from: u32, stopping: bool) -> Option[u32]
+    val k = consoles()
+    val chosen = k.console.load(Ordering.Acquire)
+    if chosen != 0 && chosen - 1 != from
+        val core = chosen - 1
+        if core_state(core) == CORE_READY && k.services[core].load(Ordering.Acquire) != 0 then return Some(core)
+    if !stopping && k.services[from].load(Ordering.Acquire) != 0 then return Some(from)
+    None
+
+// Report `kind` on the running core, a fault's `name` with it: give it to the console service that
+// writes the core's reports, or, with none, write it at once, after whatever the core's ring still
+// holds. A fault handler calls it; a `Fault` is the report of a core that is stopping.
+private[kernel] report[P: Port](p: *P, kind: ReportKind, name: string)
+    val me = here_id(p)
+    val r = Report(kind, kept_name(name))
+    serving(me, kind == ReportKind.Fault) match
+        Some(core) ->
+            append(p, me, r)
+            val k = consoles()
+            if notify_give(p, Task(k.services[core].load(Ordering.Acquire))).is_ok() then return
+            // The service was deleted: nobody writes the ring now, so the running core does.
+            k.services[core].store(0, Ordering.Release)
+            while say_next(p, me) do ()
+        None ->
+            while say_next(p, me) do ()
+            say(p, me, r)
+
+// Take the running task off as its core's console service, if it is: a fault is stopping it, and its
+// own report must go elsewhere.
+private[kernel] retire_console_service[P: Port](p: *P)
+    val k = consoles()
+    val me = here_id(p)
+    if k.services[me].load(Ordering.Acquire) == current(p).bits then k.services[me].store(0, Ordering.Release)
+
+// Put `r` in core `from`'s ring, under the core's mask. A full ring keeps what it holds, and the report
+// is counted as dropped.
+private append[P: Port](p: *P, from: u32, r: Report)
+    val ring = &consoles().rings[from]
+    val mask = p.mask()
+    val tail = ring.tail.load(Ordering.Relaxed)
+    val next = report_after(tail)
+    if next == ring.head.load(Ordering.Acquire)
+        ring.dropped.store(ring.dropped.load(Ordering.Relaxed) +% 1, Ordering.Release)
+    else
+        ring.slots[tail] = r
+        ring.tail.store(next, Ordering.Release)
+    p.restore(mask)
+
+// The slot after `at`, wrapping.
+private report_after(at: u32) -> u32 = if usize(at) + 1 == REPORT_SLOTS then 0 else at + 1
+
+// Write the oldest report in core `from`'s ring, or, once it is empty, how many reports it dropped since
+// the service last said; answers whether a line was written.
+private say_next[P: Port](p: *P, from: u32) -> bool
+    val ring = &consoles().rings[from]
+    val head = ring.head.load(Ordering.Relaxed)
+    if head != ring.tail.load(Ordering.Acquire)
+        val r = ring.slots[head]
+        ring.head.store(report_after(head), Ordering.Release)
+        say(p, from, r)
+        return true
+    val dropped = ring.dropped.load(Ordering.Acquire)
+    if dropped == ring.told then return false
+    p.write("skiff: core ".bytes)
+    write_dec(p, from)
+    p.write(" dropped ".bytes)
+    write_dec(p, dropped -% ring.told)
+    p.write(" reports\n".bytes)
+    ring.told = dropped
+    true
+
+// Write report `r` of core `from` as the line it is.
+private say[P: Port](p: *P, from: u32, r: Report)
+    p.write("skiff: core ".bytes)
+    write_dec(p, from)
+    if r.kind == ReportKind.Fault
+        p.write(" fault ".bytes)
+        var n: usize = 0
+        while n < NAME_BYTES && r.name[n] != 0 do n += 1
+        p.write(r.name[0..<n])
+    else
+        p.write(" stopped a task that ".bytes)
+        p.write(stopped_text(r.kind).bytes)
+    p.write("\n".bytes)
+
+// What a stopped task did, as its report says it.
+private stopped_text(kind: ReportKind) -> string = kind match
+    ReportKind.Overflow -> "overflowed its stack"
+    ReportKind.Breach -> "broke its memory protection"
+    ReportKind.Trap -> "made a trap the kernel does not take"
+    _ -> "did something no report names"
+
+// Write one line of the reports the running core's service writes: every core's whose reports come here,
+// lowest core first, each oldest first. Answers whether there was one.
+private[kernel] console_line[P: Port](p: *P) -> bool
+    val me = here_id(p)
+    for from in 0u32..<u32(option_cores)
+        if serves(me, from) && say_next(p, from) then return true
+    false
+
+// Whether core `me`'s service writes the reports of core `from` now.
+private serves(me: u32, from: u32) -> bool = serving(from, false) match
+    Some(core) -> core == me
+    None -> false
+
+// Write every line the running core's service has waiting, without waiting for more; answers how many.
+console_turn[P: Port](p: *P) -> u32
+    var lines: u32 = 0
+    while console_line(p) do lines += 1
+    lines
+
+// Write every report still queued, every core's, on the running core's console at once: what a board
+// does before it stops the machine, when no service will run again.
+console_flush[P: Port](p: *P)
+    for from in 0u32..<u32(option_cores)
+        while say_next(p, from) do ()
+
+// The body of the running core's console service, which the board creates at the priority it chooses:
+// record the running task as the core's service, then wait for a report and write each line raised to
+// the top priority, so that no task cuts a line in two, lowering itself again between lines.
+serve_console[P: Port](p: *P) -> never
+    val me = start_console(p)
+    val base = priority(p, me) match
+        Ok(b) -> b
+        Err(_) -> 1
+    loop
+        val _ = notify_take(p, true, FOREVER)
+        loop
+            val _ = set_priority(p, me, TOP_PRIORITY)
+            val wrote = console_line(p)
+            val _ = set_priority(p, me, base)
+            if !wrote then break
+
+// Record the running task as the running core's console service; answers its handle. `serve_console`
+// begins with it; a board whose service does more than write reports may call it and `console_turn`
+// itself.
+start_console[P: Port](p: *P) -> Task
+    val me = current(p)
+    consoles().services[here_id(p)].store(me.bits, Ordering.Release)
+    me
+
+// The highest priority a task may have, which the service writes its lines at.
+private const TOP_PRIORITY: u8 = u8(PRIORITIES - 1)

@@ -125,19 +125,18 @@ await_tick[P: Port](p: *P) -> u32
     while c.own_ticks() == seen do p.idle()
     c.own_ticks()
 
-// Report a fault on the running core's console, naming the core and `kind`, and mark the core stopped in
-// `.shared`, where the other cores can see it. The caller then stops this core; the others run on.
+// Report a fault, naming the core and `kind` (up to `NAME_BYTES` bytes of it), and mark the core stopped
+// in `.shared`, where the other cores can see it. The report goes to the console core's service when
+// that is another core's and runs; else it is written at once on the running core's console, after the
+// reports its ring still holds, since this core's own service never runs again (DESIGN "The console
+// service"). The caller then stops this core; the others run on.
 fault[P: Port](p: *P, kind: string)
     val c = here(p)
 #if option_trace
     trace_running(p, TraceKind.Fault, TraceObject.Nothing, 0, 0)
 #endif
     c.stopped = true
-    p.write("skiff: core ".bytes)
-    write_dec(p, c.id)
-    p.write(" fault ".bytes)
-    p.write(kind.bytes)
-    p.write("\n".bytes)
+    report(p, ReportKind.Fault, kind)
     announce(c.id, CORE_STOPPED)
 
 // Whether core `n` has started and not stopped.
