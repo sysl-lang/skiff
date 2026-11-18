@@ -6,7 +6,9 @@
 #
 #   SKIFF_SYSL      the compiler (default: sysl)
 #   SKIFF_OPT       passed to the build (e.g. -O0)
-#   SKIFF_TIMEOUT   seconds per boot (default 10)
+#   SKIFF_TIMEOUT   seconds per boot (default 20: the AN521's run ends with about 3 s of watchdog
+#                   waits, a hardware stage's warning and core 0 outliving its reset, and took 9-10 s on
+#                   a loaded host)
 #   SKIFF_BENCHTOP  the benchtop emulator that boots the Pico 2 (default: ../benchtop/benchtop beside
 #                   the repository)
 #   SKIFF_BOARD_TIME  the Pico 2's boot limit in the board's own emulated time (default 300s: through the
@@ -16,7 +18,7 @@ set -u
 root=$(cd "$(dirname "$0")/.." && pwd)
 compiler=${SKIFF_SYSL:-sysl}
 opt=${SKIFF_OPT:-}
-limit=${SKIFF_TIMEOUT:-10}
+limit=${SKIFF_TIMEOUT:-20}
 benchtop=${SKIFF_BENCHTOP:-$root/../benchtop/benchtop}
 board_time=${SKIFF_BOARD_TIME:-300s}
 scratch="$root/scratch"
