@@ -20,6 +20,11 @@ private const NVIC_IPR: usize = 0xE000_E400     // a priority byte per interrupt
 // The priority an interrupt that calls the kernel runs at: one `mask` holds off.
 const KERNEL_IRQ_PRIORITY: u8 = 0xc0
 
+// The priority a hardware watchdog's warning runs at where it is an interrupt rather than the NMI: above
+// what `mask` holds off (0x80), so it is taken from a core spinning with the kernel's handlers masked, and
+// below the faults' 0.
+const WATCHDOG_IRQ_PRIORITY: u8 = 0x40
+
 // The word of the register array at `base` that holds interrupt `irq`'s bit, and the bit.
 private nvic_word(base: usize, irq: u32) -> *Word = ptr_cast(base + 4 * usize(irq / 32))
 private nvic_bit(irq: u32) -> u32 = 1 << (irq % 32)

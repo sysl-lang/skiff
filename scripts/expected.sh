@@ -146,6 +146,17 @@ skiff: core $1 an unprivileged task that wrote a buffer it had passed on was sto
 watchdog_expected() {
     echo "skiff: core $1 a watched task checked in for 60 ticks, and its core's watchdog held off"
 }
+# hang_expected <core> masked|open: the core's hang, which says how it hangs, and the bite that stops it.
+# Masked, the tick stops and only the hardware watchdog's warning can bite (the MPS2's NMI, the AN521's
+# core 1's interrupt 1 above the kernel's mask); open, the core's own tick does.
+hang_expected() {
+    if [ "$2" = masked ]; then
+        echo "skiff: core $1 hangs with the kernel's interrupts masked"
+    else
+        echo "skiff: core $1 hangs above its watched task with interrupts open"
+    fi
+    echo "skiff: core $1 fault watchdog"
+}
 # Tickless idle, every core (boards/scenarios, tickless.sysl): with only its idle task to run, the core
 # stops its tick, and a timed wait and a sleep still end on their deadlines.
 tickless_expected() {
@@ -172,7 +183,7 @@ $(protection_expected 0)
 $(grants_expected 0)
 $(tickless_expected 0)
 $(watchdog_expected 0)
-skiff: core 0 fault watchdog"
+$(hang_expected 0 masked)"
 
 # The AN521's two cores run one image, each greeting and ticking on the UART of its own number, then
 # running its own tasks at once with the other. Core 0 has no FPU (the SSE-200's CPU0, in QEMU as on
@@ -195,8 +206,12 @@ skiff: core 0 fault watchdog"
 # no tick, while core 1 alone moves the time base on and sleeps on it. Each core's watchdog holds off
 # while a watched task checks in; then a task on core 1 spins above it, and core 1's watchdog, checked
 # on its own tick, reports on core 1's console and stops core 1 alone. Core 0 sees it stopped, takes
-# more ticks, finds that the time base moves a period for each of its own ticks without core 1, and
-# stops the machine with status 0.
+# more ticks, finds that the time base moves a period for each of its own ticks without core 1, runs on
+# 200 of its ticks, past when core 1's hardware watchdog would have reset the machine had the bite not
+# stopped it, and stops the machine with status 0.
+# Core 0's last line on the AN521: it ran on long enough after core 1 stopped for core 1's hardware
+# watchdog to have reset the machine (the run starting again) had the bite not stopped it.
+an521_outlived="skiff: core 0 ran on 200 ticks after core 1 stopped, and no watchdog reset the machine"
 an521_core0_greeting="skiff: hello from core 0
 skiff: .shared holds the shared state"
 # dual_core0_run [<line the FPU tasks print>]: core 0's run on a machine of two cores in one image.
@@ -235,7 +250,8 @@ $(tickless_expected 0)
 $(watchdog_expected 0)
 skiff: core 0 sees core 1 stopped
 skiff: core 0 ticks on
-skiff: core 0 keeps the time base alone"
+skiff: core 0 keeps the time base alone
+$an521_outlived"
 }
 an521_core0_run=$(dual_core0_run)
 an521_core0_expected="$an521_core0_greeting
@@ -273,18 +289,19 @@ $(grants_expected 1)
 skiff: core 1 an unprivileged task received notes and a filled buffer an unprivileged task of core 0 sent, through its grants
 skiff: core 1 kept the time base moving while core 0 took no tick
 $(tickless_expected 1)
-$(watchdog_expected 1)
-skiff: core 1 fault watchdog"
+$(watchdog_expected 1)"
 an521_core1_expected="skiff: hello from core 1
 $an521_core1_ticks
 $(tasks_expected 1)
-$an521_core1_run"
+$an521_core1_run
+$(hang_expected 1 open)"
 
 # The AN521 as two images (boards/qemu-an521 with `--features core0` and `--features core1`): each core
 # runs its own, built from the one board program, and the two meet at the handshake, agreeing on the
 # layout of `.shared`, before either creates a task. Then the run is the one image's, except that core
-# 1's image uses its FPU, so its floating-point tasks run too, and that core 0 cannot name core 1's
-# timers or work at all, which are core 1's own.
+# 1's image uses its FPU, so its floating-point tasks run too, that core 0 cannot name core 1's
+# timers or work at all, which are core 1's own, and that core 1 hangs with the kernel's interrupts
+# masked: its tick stops, and its hardware watchdog's interrupt 1, above the mask, is what bites.
 split_core0_expected="$an521_core0_greeting
 skiff: core 0 and core 1 agree on the layout of .shared
 $(echo "$an521_core0_run" | grep -v -x -F -e "skiff: core 0 may not command a timer of core 1" -e "skiff: core 0 may not post work of core 1")"
@@ -292,7 +309,8 @@ split_core1_expected="skiff: hello from core 1
 skiff: core 1 agrees with core 0 on the layout of .shared
 $an521_core1_ticks
 $(tasks_expected 1 "f32 registers survived the switches")
-$an521_core1_run"
+$an521_core1_run
+$(hang_expected 1 masked)"
 
 
 # check <label> <log> <expected>: every expected line must appear in the log after the one before it.
@@ -325,10 +343,11 @@ before_line() {
     awk -v at="$1" -v line="$2" '$0 == at { print line } { print }'
 }
 pico2_core0_expected="$an521_core0_greeting
-$(dual_core0_run "f32 registers survived the switches" | grep -v -x -F "$(tickless_expected 0)" \
+$(dual_core0_run "f32 registers survived the switches" | grep -v -x -F -e "$(tickless_expected 0)" -e "$an521_outlived" \
     | before_line "skiff: core 0 took no tick while masked, and the time base moved on without it" "$(stop_expected 0)")"
 pico2_core1_expected="skiff: hello from core 1
 $an521_core1_ticks
 $(tasks_expected 1 "f32 registers survived the switches")
 $(echo "$an521_core1_run" | grep -v -x -F "$(tickless_expected 1)" \
-    | before_line "skiff: core 1 kept the time base moving while core 0 took no tick" "$(stop_expected 1)")"
+    | before_line "skiff: core 1 kept the time base moving while core 0 took no tick" "$(stop_expected 1)")
+$(hang_expected 1 open)"

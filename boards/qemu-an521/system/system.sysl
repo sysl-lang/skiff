@@ -48,21 +48,25 @@ enum Resource: u8
     Doorbell0 = 4   // MHU0's interrupt as core 0's NVIC takes it: the doorbell rung for core 0
     Doorbell1 = 5   // the same, for core 1
     Security = 6    // the SSE-200's system control and peripheral protection: core 1's release, the UARTs' access
+    SecureWatchdog = 8      // the Secure CMSDK watchdog, whose warning is CPU 0's NMI: core 0's hardware stage
+    NonSecureWatchdog = 9   // the Non-secure one, whose warning is interrupt 1: core 1's hardware stage
 
 struct Owned
     what: Resource
     core: u32
 
 // Which core owns what.
-val OWNERS: [8]Owned = [
+val OWNERS: [10]Owned = [
     Owned(Resource.Uart0, 0),
     Owned(Resource.Timer0, 0),
     Owned(Resource.Timer1, 0),
     Owned(Resource.Doorbell0, 0),
     Owned(Resource.Security, 0),
+    Owned(Resource.SecureWatchdog, 0),
     Owned(Resource.Uart1, 1),
     Owned(Resource.DualTimer, 1),
     Owned(Resource.Doorbell1, 1),
+    Owned(Resource.NonSecureWatchdog, 1),
 ]
 
 // Whether every resource in `OWNERS` has one owner.
