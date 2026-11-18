@@ -1,0 +1,95 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+import skiff.kernel.{FOREVER, Task, TaskState}
+
+// A task's note holds room for one waiter, its own task: on the host machine of three cores
+// (machine.sysl), a notification from another core still ends that wait through the task's inbox, and the
+// wait, its wake and its timeout each leave the note empty for the next.
+
+// `t`'s state, asked on its own core.
+private state_of(m: *Machine, t: Task) -> TaskState
+    on(m, t.core())
+    kernel.state(m, t).unwrap()
+
+@test("ns: notifications from another core wake a task waiting on its note through its inbox, round after round")
+ns_notify_across_rounds()
+    var m = machine()
+    val w = task_on(&m, 1, 0, 2)
+    val _ = task_on(&m, 1, 1, 1)
+    val _ = task_on(&m, 0, 2, 1)
+    begin(&m)
+    for _ in 0..<3
+        on(&m, 1)
+        assert_eq(kernel.notify_take(&m, true, FOREVER), 0)
+        assert(state_of(&m, w) == TaskState.Blocked, "waits on its note")
+        switch_now(&m)
+        on(&m, 0)
+        val rung = m.rung[1]
+        assert(kernel.notify_give(&m, w) == Ok(true), "given")
+        assert_eq(m.rung[1], rung + 1)
+        assert(state_of(&m, w) == TaskState.Blocked, "until its core answers")
+        on(&m, 1)
+        kernel.answer_doorbell(&m)
+        assert(state_of(&m, w) == TaskState.Ready, "woken")
+        switch_now(&m)
+        assert_eq(kernel.notify_take(&m, true, 0), 1)
+    assert_eq(m.masked, 0)
+
+@test("ns: a notification from another core that lands between the deadline's tick and the timeout wins, and the next wait times out alone")
+ns_notify_beats_timeout_across()
+    var m = machine()
+    val w = task_on(&m, 1, 0, 2)
+    val _ = task_on(&m, 1, 1, 1)
+    val _ = task_on(&m, 0, 2, 1)
+    begin(&m)
+    on(&m, 1)
+    assert_eq(kernel.notify_take(&m, true, 1), 0)
+    switch_now(&m)
+    on(&m, 0)
+    kernel.tick(&m)
+    on(&m, 1)
+    val _ = kernel.here(&m).sched.tick(kernel.ticks())
+    assert_eq(kernel.here(&m).sched.expiring, u16(w.slot()))
+    on(&m, 0)
+    assert(kernel.notify_give(&m, w) == Ok(true), "the wake")
+    on(&m, 1)
+    kernel.tick(&m)
+    assert(state_of(&m, w) == TaskState.Blocked, "the timeout did not end the wait")
+    kernel.answer_doorbell(&m)
+    assert(state_of(&m, w) == TaskState.Ready, "the wake did")
+    switch_now(&m)
+    assert_eq(kernel.notify_take(&m, true, 0), 1)
+    // The note is empty again: the next timed wait blocks and times out on its own.
+    assert_eq(kernel.notify_take(&m, true, 1), 0)
+    assert(state_of(&m, w) == TaskState.Blocked, "waits again")
+    switch_now(&m)
+    on(&m, 0)
+    kernel.tick(&m)
+    on(&m, 1)
+    kernel.tick(&m)
+    assert(state_of(&m, w) == TaskState.Ready, "timed out")
+
+@test("ns: a timeout that ends a note's wait first leaves a notification from another core pending, and posts nothing")
+ns_timeout_beats_notify_across()
+    var m = machine()
+    val w = task_on(&m, 1, 0, 2)
+    val _ = task_on(&m, 1, 1, 1)
+    val _ = task_on(&m, 0, 2, 1)
+    begin(&m)
+    on(&m, 1)
+    assert(kernel.notify_wait(&m, 0, 0, 1) == None, "waits")
+    switch_now(&m)
+    on(&m, 0)
+    kernel.tick(&m)
+    on(&m, 1)
+    kernel.tick(&m)
+    assert(state_of(&m, w) == TaskState.Ready, "timed out")
+    on(&m, 0)
+    val rung = m.rung[1]
+    assert(kernel.notify(&m, w, 9, kernel.Action.SetBits) == Ok(true), "sent")
+    assert_eq(m.rung[1], rung)
+    on(&m, 1)
+    switch_now(&m)
+    assert(kernel.notify_wait(&m, 0, 0, FOREVER) == Some(9), "pending, so answered at once")
