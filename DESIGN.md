@@ -218,6 +218,12 @@ whatever the length and whatever `N`**; the copy is the caller's own time, preem
   the next on its side if what is left still meets the level or that writer's need, so the wakes go on
   one per hold instead of a walk over the waiters. A woken task that is stopped before it claims breaks
   that chain; the next commit or room given back starts it again.
+- **A task waits only under the hold that found nothing.** Room given back while a writer copies wakes
+  nobody, since that writer is not waiting yet; so a stream writer with bytes left takes the lock again
+  after its commit and claims anew, and waits only if that claim finds no room. A writer that went on to
+  wait in the commit's hold instead slept through the room a reader gave back during its copy, and
+  the 3000-byte pour between the Pico 2's cores hung (seeded boots, 7 of 24). Every other wait (a
+  reader below the level, a message writer without the whole room) is decided in the hold that looked.
 - **What it costs.** Bytes are not visible, and room not given back, until the slowest copier then
   under way finishes. A task preempted, suspended or stopped in the middle of a copy holds them back
   that long: a stream behaves as if its writers (or readers) shared a lock that has no priority

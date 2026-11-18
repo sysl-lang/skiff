@@ -110,11 +110,16 @@ impl[const N: usize] StreamBuffer[N]
             l.acquire()
             val room = self.claim_write(p, data.len - sent)
             if room.n > 0
+                // Room given back while this copy ran woke nobody (this writer was not waiting), so
+                // after the commit it looks again, under a new hold, before it may wait.
                 l.release()
                 self.write_at(room.at, data[sent..<sent + room.n])
                 l.acquire()
                 self.commit_write(p)
                 sent += room.n
+                l.release()
+                if sent == data.len then return sent
+                continue
             val left = ticks_left(timeout, deadline)
             if sent == data.len || last || left == 0
                 l.release()
