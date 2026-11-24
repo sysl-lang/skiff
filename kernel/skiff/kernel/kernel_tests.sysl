@@ -44,6 +44,9 @@ private[kernel] struct Recorder
     stop_most: u32          // the most ticks one may span
     stop_asked: u32         // the ticks the last stop was asked to span (0: none was)
     holds: u32              // how many times the core held for a stop
+    stream: *StreamBuffer[64]   // a stream whose ring is looked at as each outermost mask begins and ends (null: none)
+    ring_then: [64]u8           // its ring as the outermost mask began
+    written_masked: u32         // how many outermost masks ended with its ring changed
     events: TraceRing[64]   // the events the kernel emitted, once a test starts it
 
 // A hardware watchdog that counts what it is asked.
@@ -134,11 +137,13 @@ impl Port for Recorder
     start_first(*self, sp: usize) -> never = panic("the host runs no task")
 
     mask(*self) -> u32
+        if self.masked == 0 && self.stream != null then self.ring_then = self.stream.bytes
         self.masked += 1
         self.masks += 1
         self.masked - 1
 
     restore(*self, state: u32)
+        if state == 0 && self.stream != null && self.ring_then != self.stream.bytes then self.written_masked += 1
         self.masked = state
 
     // One core: the kernel never spins, so these are never asked.
@@ -172,7 +177,7 @@ impl Doorbell for Recorder
     ring(*self, core: u32) = panic("one core never rings")
     clear(*self) = panic("one core never rings")
 
-private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, 0, 0, 0, 0, null, null, 0, 0, 0, 0, 0, 0, false, 8, 0, 0, 0, 0, 0, 0, 0, 0, FOREVER, 0, 0, 0, 0, 0, TraceRing.new())
+private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, 0, 0, 0, 0, null, null, 0, 0, 0, 0, 0, 0, false, 8, 0, 0, 0, 0, 0, 0, 0, 0, FOREVER, 0, 0, 0, 0, 0, null, [0; 64], 0, TraceRing.new())
 
 // Whether `r` recorded exactly `want`.
 private[kernel] recorded(r: *Recorder, want: string) -> bool

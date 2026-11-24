@@ -657,3 +657,26 @@ sc_message_claims_whole()
     m.s.release_read(&r)
     assert(counts(a[..], 1) && counts(b[..], 7), "each its own message")
     assert_eq(m.space(&r), 12)
+
+@test("no byte is written into the ring while the core is masked: a stream's and a message buffer's sends copy between holds")
+sc_no_byte_copied_while_masked()
+    var r = recorder(1, 0)
+    var s: StreamBuffer[64] = StreamBuffer.new("s", 1)
+    r.stream = &s
+    var data: [64]u8 = [0; 64]
+    count_into(data[..], 1)
+    assert_eq(s.try_send(&r, data[..]), 64)
+    var got: [64]u8 = [0; 64]
+    assert_eq(s.try_receive(&r, got[..]), 64)
+    assert(counts(got[..], 1), "1 to 64")
+    assert_eq(s.try_send(&r, data[..<40]), 40)
+    assert(r.masks > 0, "the stream took its lock")
+    assert_eq(r.written_masked, 0)
+    var m: MessageBuffer[64] = MessageBuffer.new("m")
+    r.stream = &m.s
+    count_into(data[..], 100)
+    assert(m.try_send(&r, data[..<60]), "sent")
+    assert_eq(m.try_receive(&r, got[..]), 60)
+    assert(counts(got[..<60], 100), "the message whole")
+    assert_eq(r.written_masked, 0)
+    assert_eq(r.masked, 0)

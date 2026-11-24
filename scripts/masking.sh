@@ -14,29 +14,32 @@
 # What is bounded, per core:
 #
 #   - The longest masked interval the kernel makes, from the instruction that masked to the one that
-#     unmasked, the chip lock's ticket wait inside it. Measured on dev 482f717 with streams copying
-#     outside the lock: core 0 1084, core 1 1135. Every hold is a constant amount of work plus the ticket
-#     wait: a stream buffer copies its bytes with the lock let go (DESIGN "Stream buffers copy with the
-#     lock let go"); when it copied under the lock its StreamBuffer[64] sends and receives were the
-#     longest (1224-1360 and 1524-1534). The longest now are MessageBuffer[64] sends and receives behind
-#     the other core's hold of the same lock (~1084-1135), then a semaphore's give behind the other
-#     core's hammer and the queue holds (~1041-1077). Most of each is that ticket wait: a 64-byte copy
-#     under the lock adds only ~200 cycles (control m7sc1: core 1 1339, a StreamBuffer[64] receive), so
-#     the bound sits between, about 10% over the worst, and a change that moves the constant holds by
-#     ~100 cycles may need it moved.
-#   - How many masked intervals reach 1024 cycles: measured 343 on core 0, 81 on core 1 (1573 and 158
-#     while streams copied under the lock), of ~667,000
-#     each. Almost every hold is under 1024 (the hammers' 267,000 gives and takes per core, behind each
-#     other's, are 512-1023; the ~2,800 ticks and ~10,000 switches are shorter). A path the boot takes
-#     often that grows past 1024 cycles, as a scan over the tasks or the waiters would make it, moves
-#     thousands of intervals past it, though its longest may stay under the first bound. The count moves
-#     with the interleaving (the hammers' holds sit near 1024): core 0's was 382 in a run whose only
-#     change was a few hundred cycles more in each tick, so the bound leaves room for that.
+#     unmasked, the chip lock's ticket wait inside it. Measured on dev b642345 + streamcopy: 1257 on
+#     core 0 (a MessageBuffer[64] send behind the other core's hold of its lock) and 1158 on core 1 (a
+#     StreamBuffer[64] receive) under sysl 0.13.5, 1251 and 1206 under 0.11.12. Almost every long hold
+#     opens at `Locking.acquire`: the object lock's own constant work plus the wait for the other core's
+#     hold of the same lock, so its length moves with the interleaving by tens of cycles from one build
+#     to the next. The bound is about 20% over the worst; what catches a hold that grows is the next two
+#     checks, by its site.
+#   - Every site (benchtop's `--masking-sites`: a pair of the instruction that masked and the one that
+#     unmasked) that closes 10,000 intervals or more, its longest. Those are the paths every scenario
+#     leans on, the hammers' semaphore gives and takes (~200,000 and ~100,000 per core, 1032-1053
+#     longest) and the context switch (~10,000, 754-822): measured 1053 at most, bound 1200. A scan
+#     added to one of them (control mk2: every slot looked at in each give, 1326 and 1404) shows on that
+#     site. This replaces a count of the intervals of 1024 cycles or more, which the hammers' holds sit
+#     right at: sysl 0.13.5 inlined a 27-cycle trace emit into `Semaphore.take`, its longest went from
+#     1008 to 1032 with nothing grown, and ~2,800 of its ~100,000 holds crossed the line. A site's
+#     longest moves with such an inlining by the cycles it adds, a count by however many holds sat
+#     below the line.
+#   - The tick handler's site (`board_tick`, ~2,900 a core), its longest: measured 762-843, bound 960.
+#     It runs no lock (it masks its core alone), so its length is its own work; a scan over the task
+#     slots in the tick (control mk1, ~290 cycles more, 1074 and 1136) shows on it. The bound is about
+#     14% over the worst and 12% under mk1's.
 #
-# What it cannot see: a path that grows but stays under 1024 cycles and under the longest. A scan of
-# every task slot in the tick (~250 cycles more on each of ~2,800 ticks) passes both: benchtop's report
-# names only the eight longest intervals and buckets by powers of two, so a short path's own hold is not
-# in it.
+# What it cannot see: a path neither frequent nor the tick that grows but stays under the first bound.
+# Whether a stream copies its bytes under the lock is not judged here (a 64-byte copy adds ~200 cycles,
+# within the interleaving's spread of the lock holds): the host test `sc_no_byte_copied_while_masked`
+# checks that no byte of the ring is written while the core is masked (control m7sc1).
 #   - The worst latency of the interrupts at the kernel's priority (KERNEL_IRQ_PRIORITY, below the mask):
 #     the doorbell (irq26) and the software-raised interrupt (irq46). Such an interrupt waits for the
 #     masked remainder and for any handler above it, so its bound is the masked one. Measured: irq26 214
@@ -65,9 +68,11 @@ addr2line=${SKIFF_ADDR2LINE:-arm-none-eabi-addr2line}
 scratch="$root/scratch"
 mkdir -p "$scratch"
 
-masked_bound=1250
-tail_from=1024
-tail_bound=2500
+masked_bound=1500
+frequent_from=10000
+frequent_bound=1200
+tick_site='board_tick$$sysl'
+tick_bound=960
 irq_bound=$masked_bound
 irqs="irq26 irq46"
 lowest_bound=4000
@@ -131,7 +136,6 @@ for core in 0 1; do
 
     # The longest interval the kernel makes: the first of the ranked eight not left out.
     longest=""
-    left_out_tail=0
     ranks=$(grep -E "^masking core=$core rank=" "$report")
     old_ifs=$IFS
     IFS='
@@ -143,7 +147,6 @@ for core in 0 1; do
         case "$from" in *"$deliberate"*)
             case "$to" in *"$deliberate"*)
                 echo "  left out: $cycles cycles in $from, the time scenario's own mask"
-                if [ "$cycles" -ge "$tail_from" ]; then left_out_tail=$((left_out_tail + 1)); fi
                 continue ;;
             esac ;;
         esac
@@ -160,14 +163,41 @@ for core in 0 1; do
         echo "  longest kernel interval: $longest cycles (bound $masked_bound), $where"
     fi
 
-    # Intervals of `tail_from` cycles or more, from the histogram's buckets.
-    tail=$(grep -E "^masking core=$core bucket=" "$report" | sed 's/.*bucket=\([0-9]*\)-[0-9]* count=\([0-9]*\)/\1 \2/' |
-        awk -v from="$tail_from" '$1 >= from { n += $2 } END { print n + 0 }')
-    tail=$((tail - left_out_tail))
-    if [ "$tail" -gt "$tail_bound" ]; then
-        fail "core $core: $tail intervals of $tail_from cycles or more, over the bound of $tail_bound"
+    # The sites: each line read as "longest count from to", the names without their offsets.
+    sites=$(grep -E "^masking core=$core site " "$report" |
+        sed -E 's/.* from=[^ ]+( \(([^)+]*)[^)]*\))? to=([^ ]+)( \(([^)+]*)[^)]*\))? longest=([0-9]+) count=([0-9]+).*/\6 \7 \2 \5/')
+    if [ -z "$sites" ]; then
+        fail "core $core: the report has no site table"
+    fi
+    worst_frequent=0
+    frequent_where=""
+    tick_longest=""
+    IFS='
+'
+    for line in $sites; do
+        IFS=' ' read -r cycles count from to <<EOF
+$line
+EOF
+        if [ "$count" -ge "$frequent_from" ] && [ "$cycles" -gt "$worst_frequent" ]; then
+            worst_frequent=$cycles
+            frequent_where="$from -> $to, $count intervals"
+        fi
+        if [ "$from" = "$tick_site" ] && [ -z "$tick_longest" ]; then tick_longest=$cycles; fi
+    done
+    IFS=$old_ifs
+    if [ -z "$frequent_where" ]; then
+        fail "core $core: no site closed $frequent_from intervals, so the hammers' paths were not measured"
+    elif [ "$worst_frequent" -gt "$frequent_bound" ]; then
+        fail "core $core: a site of $frequent_from intervals or more masked for $worst_frequent cycles, over the bound of $frequent_bound ($frequent_where)"
     else
-        echo "  intervals of $tail_from cycles or more: $tail (bound $tail_bound)"
+        echo "  longest of a site of $frequent_from intervals or more: $worst_frequent cycles (bound $frequent_bound), $frequent_where"
+    fi
+    if [ -z "$tick_longest" ]; then
+        fail "core $core: no site begins in $tick_site, so the tick was not measured"
+    elif [ "$tick_longest" -gt "$tick_bound" ]; then
+        fail "core $core: the tick masked for $tick_longest cycles, over the bound of $tick_bound"
+    else
+        echo "  longest tick: $tick_longest cycles (bound $tick_bound)"
     fi
 
     for irq in $irqs; do
