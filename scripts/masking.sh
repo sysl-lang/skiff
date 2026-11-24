@@ -96,7 +96,7 @@ if ! "$compiler" build --target thumb-freestanding -o "$image" "$root/boards/pic
 fi
 rm -f "$report"
 "$benchtop" run --board pico2 --boot debugger --deterministic --semihosting \
-    --serial uart1=file:"$scratch/pico2-masking-core1.log" --timeout 300s --report-masking "$report" \
+    --serial uart1=file:"$scratch/pico2-masking-core1.log" --timeout 300s --report-masking "$report" --masking-sites \
     "$image" > "$scratch/pico2-masking-core0.log" 2>&1 < /dev/null
 code=$?
 if [ "$code" -ne 0 ]; then
