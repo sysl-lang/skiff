@@ -1,0 +1,274 @@
+module skiff.cores
+@tests
+
+import skiff.kernel
+import skiff.kernel.{Core, Semaphore, Task, TaskState}
+
+// Stopping the machine with three cores (DESIGN "Stopping the machine"). One core acts at a time, so what
+// the others do while a core holds, while the leader is stopped, or while a core waits in its idle step
+// is the test's plays (machine.sysl): each core's idle step, tick, doorbell answer, switch or device
+// interrupt, in the order the test gives. A hold ends once the plays have run; if no one released the
+// core by then, that is a wake of its own.
+
+private var cs_idle_stacks: [kernel.CORES][128]u32
+
+private cs_core(m: *Machine, core: u32) -> *Core
+    on(m, core)
+    kernel.here(m)
+
+private cs_state(m: *Machine, t: Task) -> TaskState
+    on(m, t.core())
+    kernel.state(m, t).unwrap()
+
+// Every core with a task at priority 2 and its idle task, every core's view of the time base settled, then
+// each task asleep for `counts[core]` ticks (0: it runs on, and its core is busy) and each core allowing
+// the stop, which is worth 4 ticks and spans up to 1000.
+private cs_cores(m: *Machine, counts: []const u32) -> [kernel.CORES]Task
+    var tasks: [kernel.CORES]Task = [kernel.NO_TASK; kernel.CORES]
+    for core in 0u32..<u32(kernel.CORES)
+        tasks[core] = task_on(m, core, usize(core), 2)
+        on(m, core)
+        val c = kernel.here(m)
+        val i = c.sched.free_slot().unwrap()
+        c.sched.add_on(i, cs_idle_stacks[core], 0, kernel.IDLE_PRIORITY)
+    begin(m)
+    on(m, 0)
+    kernel.tick(m)
+    on(m, 0)
+    kernel.tick(m)
+    for core in 1u32..<u32(kernel.CORES)
+        on(m, core)
+        kernel.tick(m)
+    for core in 0u32..<u32(kernel.CORES)
+        on(m, core)
+        if counts[usize(core)] > 0
+            kernel.sleep(m, counts[usize(core)])
+            switch_now(m)
+        kernel.allow_stop(m, true)
+    m.stop_min = 4
+    m.stop_most = 1000
+    tasks
+
+// The plays of a gathering that every core joins: core 0 goes idle first, then 1, then 2, which leads;
+// 0 and 1 answer its ring and hold, and 2 enters the stop.
+private val GATHER_ALL: [7]u32 = [play(1, PLAY_REST), play(2, PLAY_REST), play(0, PLAY_ANSWER), play(0, PLAY_REST), play(1, PLAY_ANSWER), play(1, PLAY_REST), play(2, PLAY_REST)]
+
+@test("with every core idle, the last to go idle leads, the others hold, and the machine stops until the soonest deadline; the time base moves once, by the time slept")
+cs_cores_stop_together()
+    var m = machine()
+    val tasks = cs_cores(&m, [30, 20, 40])
+    val from = kernel.ticks()
+    var own: [kernel.CORES]u32 = [0; kernel.CORES]
+    for core in 0u32..<u32(kernel.CORES) do own[core] = cs_core(&m, core).own_ticks()
+    plan(&m, GATHER_ALL)
+    on(&m, 0)
+    kernel.rest(&m)
+    assert_eq(m.stops_entered, 1)
+    assert_eq(m.stop_asked, 20)
+    assert_eq(m.held_at_entry, 0b011)
+    assert_eq(kernel.ticks() -% from, 20)
+    for core in 0u32..<u32(kernel.CORES)
+        assert_eq(cs_core(&m, core).own_ticks() -% own[core], 20)
+        on(&m, core)
+        assert_eq(kernel.stopped_ticks(&m), 20)
+        assert_eq(kernel.machine_stops(&m), 1)
+    assert(cs_state(&m, tasks[1]) == TaskState.Ready, "core 1's sleeper woke on its deadline")
+    assert(cs_state(&m, tasks[0]) == TaskState.Sleeping, "core 0's sleeps on")
+    assert(cs_state(&m, tasks[2]) == TaskState.Sleeping, "core 2's sleeps on")
+    assert_eq(m.holds[0], 1)
+    assert_eq(m.holds[1], 1)
+    assert_eq(m.holds[2], 0)
+    // Asked to hold, then released.
+    assert_eq(m.rung[0], 2)
+    assert_eq(m.rung[1], 2)
+    assert(!kernel.stop_under_way(), "no stop under way")
+    assert_eq(kernel.stop_idle_cores(), 0)
+
+@test("a core busy with a task keeps the machine from stopping, however long the others are idle")
+cs_cores_busy_core_blocks()
+    var m = machine()
+    val _ = cs_cores(&m, [30, 30, 0])
+    plan(&m, [play(1, PLAY_REST)])
+    on(&m, 0)
+    kernel.rest(&m)
+    assert_eq(m.stops_entered, 0)
+    for core in 0u32..<u32(kernel.CORES)
+        assert_eq(m.holds[core], 0)
+        assert_eq(m.rung[core], 0)
+    assert(!kernel.stop_under_way(), "no stop under way")
+
+@test("a core whose application has not allowed the stop keeps the machine from stopping")
+cs_cores_one_not_allowed()
+    var m = machine()
+    val _ = cs_cores(&m, [30, 30, 30])
+    on(&m, 1)
+    kernel.allow_stop(&m, false)
+    plan(&m, GATHER_ALL)
+    on(&m, 0)
+    kernel.rest(&m)
+    assert_eq(m.stops_entered, 0)
+    assert_eq(m.holds[0], 0)
+    assert_eq(m.holds[1], 0)
+
+@test("a held core woken by an interrupt of its own while the others gather cancels the stop, and every held core is released")
+cs_cores_holder_woken_cancels()
+    var m = machine()
+    val _ = cs_cores(&m, [30, 30, 30])
+    val from = kernel.ticks()
+    val own = cs_core(&m, 0).own_ticks()
+    plan(&m, [play(1, PLAY_REST), play(2, PLAY_REST), play(0, PLAY_ANSWER), play(0, PLAY_REST), play(1, PLAY_ANSWER), play(1, PLAY_WAKE), play(1, PLAY_REST)])
+    on(&m, 0)
+    kernel.rest(&m)
+    assert_eq(m.stops_entered, 0)
+    assert_eq(m.holds[0], 1)
+    assert_eq(m.holds[1], 1)
+    // Core 0: asked, then released by core 1's cancel.
+    assert_eq(m.rung[0], 2)
+    assert(!kernel.stop_under_way(), "no stop under way")
+    assert_eq(kernel.stop_held_cores(), 0)
+    assert_eq(kernel.ticks(), from)
+    assert_eq(cs_core(&m, 0).own_ticks(), own)
+    on(&m, 0)
+    assert_eq(kernel.machine_stops(&m), 0)
+
+@test("a post to a held core's inbox wakes it, which cancels the stop, and the message is applied once its doorbell is answered")
+cs_cores_post_to_held_core()
+    var m = machine()
+    var s = Semaphore.new("s", 0, 1)
+    val tasks = cs_cores(&m, [0, 30, 30])
+    on(&m, 0)
+    val _ = s.take(&m, 30)
+    switch_now(&m)
+    m.given = &s
+    // Core 0 holds; core 2's interrupt handler gives what core 0's task waits for.
+    plan(&m, [play(1, PLAY_REST), play(2, PLAY_REST), play(0, PLAY_ANSWER), play(0, PLAY_REST), play(2, PLAY_GIVE)])
+    on(&m, 0)
+    kernel.rest(&m)
+    assert_eq(m.stops_entered, 0)
+    assert_eq(m.holds[0], 1)
+    assert(!kernel.stop_under_way(), "no stop under way")
+    assert(m.pending[0], "the post rang core 0")
+    assert(cs_state(&m, tasks[0]) == TaskState.Blocked, "not applied before the doorbell is answered")
+    on(&m, 0)
+    kernel.answer_doorbell(&m)
+    assert(cs_state(&m, tasks[0]) == TaskState.Ready, "given")
+
+@test("a deadline coming within the threshold while the leader gathers cancels the stop, and the held core takes the ticks it missed, waking on its deadline")
+cs_cores_deadline_during_gathering()
+    var m = machine()
+    val tasks = cs_cores(&m, [5, 40, 40])
+    val from = kernel.ticks()
+    val own = cs_core(&m, 0).own_ticks()
+    // Core 0 holds while core 2 ticks twice, within the gathering's bound; core 1 has not held yet, and core
+    // 0's deadline is 3 ticks away when the leader looks, so the leader cancels and rings core 0.
+    plan(&m, [play(1, PLAY_REST), play(2, PLAY_REST), play(0, PLAY_ANSWER), play(0, PLAY_REST), play(2, PLAY_TICK), play(2, PLAY_TICK), play(2, PLAY_REST)])
+    on(&m, 0)
+    kernel.rest(&m)
+    assert_eq(m.stops_entered, 0)
+    assert(!kernel.stop_under_way(), "no stop under way")
+    // The leader's idle step then ticked once more.
+    assert_eq(m.rung[0], 2)
+    assert_eq(kernel.ticks() -% from, 3)
+    assert_eq(cs_core(&m, 0).own_ticks() -% own, 3)
+    on(&m, 0)
+    assert_eq(kernel.stopped_ticks(&m), 3)
+    assert(cs_state(&m, tasks[0]) == TaskState.Sleeping, "3 of 5")
+    on(&m, 0)
+    kernel.tick(&m)
+    assert(cs_state(&m, tasks[0]) == TaskState.Sleeping, "4 of 5")
+    on(&m, 0)
+    kernel.tick(&m)
+    assert(cs_state(&m, tasks[0]) == TaskState.Ready, "woke on its deadline")
+    assert_eq(kernel.ticks() -% from, 5)
+
+@test("a leader whose asked cores do not all hold within its gathering's bound gives up, and the held core takes what it missed")
+cs_cores_gathering_gives_up()
+    var m = machine()
+    val _ = cs_cores(&m, [40, 40, 40])
+    val own = cs_core(&m, 0).own_ticks()
+    plan(&m, [play(1, PLAY_REST), play(2, PLAY_REST), play(0, PLAY_ANSWER), play(0, PLAY_REST), play(2, PLAY_TICK), play(2, PLAY_TICK), play(2, PLAY_TICK), play(2, PLAY_REST)])
+    on(&m, 0)
+    kernel.rest(&m)
+    assert_eq(m.stops_entered, 0)
+    assert_eq(m.holds[1], 0)
+    assert(!kernel.stop_under_way(), "no stop under way")
+    assert_eq(cs_core(&m, 0).own_ticks() -% own, 4)
+
+@test("a leader that leaves its idle task for a task of its own cancels the gathering, and the held core is released")
+cs_cores_leader_leaves_idle()
+    var m = machine()
+    val tasks = cs_cores(&m, [40, 40, 5])
+    val own = cs_core(&m, 0).own_ticks()
+    plan(&m, [play(1, PLAY_REST), play(2, PLAY_REST), play(0, PLAY_ANSWER), play(0, PLAY_REST), play(2, PLAY_TICK), play(2, PLAY_TICK), play(2, PLAY_TICK), play(2, PLAY_TICK), play(2, PLAY_TICK), play(2, PLAY_SWITCH)])
+    on(&m, 0)
+    kernel.rest(&m)
+    assert_eq(m.stops_entered, 0)
+    assert(cs_state(&m, tasks[2]) == TaskState.Ready, "core 2's task woke")
+    on(&m, 2)
+    assert(kernel.current(&m) == tasks[2], "and runs")
+    assert(!kernel.stop_under_way(), "no stop under way")
+    assert_eq(m.rung[0], 2)
+    assert_eq(cs_core(&m, 0).own_ticks() -% own, 5)
+
+@test("a stopped core is left out of the agreement, and a stop an interrupt ends early takes only what the wake timer measured, on every core")
+cs_cores_stopped_core_left_out()
+    var m = machine()
+    val tasks = cs_cores(&m, [30, 20, 40])
+    on(&m, 2)
+    kernel.fault(&m, "test")
+    val from = kernel.ticks()
+    val own = cs_core(&m, 0).own_ticks()
+    m.wake_after = 5
+    // Core 1 leads with core 0 alone held.
+    plan(&m, [play(1, PLAY_REST), play(0, PLAY_ANSWER), play(0, PLAY_REST), play(1, PLAY_REST)])
+    on(&m, 0)
+    kernel.rest(&m)
+    assert_eq(m.stops_entered, 1)
+    assert_eq(m.held_at_entry, 0b001)
+    assert_eq(m.stop_asked, 20)
+    assert_eq(m.rung[2], 0)
+    assert_eq(kernel.ticks() -% from, 5)
+    assert_eq(cs_core(&m, 0).own_ticks() -% own, 5)
+    on(&m, 0)
+    assert_eq(kernel.machine_stops(&m), 1)
+    assert_eq(kernel.stopped_ticks(&m), 5)
+    on(&m, 1)
+    assert_eq(kernel.stopped_ticks(&m), 5)
+    assert(cs_state(&m, tasks[1]) == TaskState.Sleeping, "5 of 20")
+    assert(!kernel.stop_under_way(), "no stop under way")
+
+@test("a core that was idle and left its idle task for a task of its own keeps the machine from stopping, however far its published deadline")
+cs_cores_core_gone_busy_blocks()
+    var m = machine()
+    var s = Semaphore.new("s", 0, 1)
+    val tasks = cs_cores(&m, [30, 30, 0])
+    // Core 2's task waits for ever, so core 2 publishes itself idle with no deadline; then an interrupt on
+    // core 2 gives what it waits for, and core 2 switches to it.
+    on(&m, 2)
+    val _ = s.take(&m, kernel.FOREVER)
+    switch_now(&m)
+    m.given = &s
+    plan(&m, [play(2, PLAY_REST), play(2, PLAY_GIVE), play(2, PLAY_SWITCH), play(1, PLAY_REST)])
+    on(&m, 0)
+    kernel.rest(&m)
+    assert(cs_state(&m, tasks[2]) == TaskState.Ready, "core 2's task was given what it waited for")
+    on(&m, 2)
+    assert(kernel.current(&m) == tasks[2], "and runs")
+    assert_eq(m.stops_entered, 0)
+    assert_eq(m.holds[0], 0)
+    assert_eq(m.holds[1], 0)
+    assert(!kernel.stop_under_way(), "no stop under way")
+    assert_eq(kernel.stop_idle_cores() & 0b100, 0)
+
+@test("a leader that looks while only some of the cores it asked hold waits, and enters only once every one holds")
+cs_cores_leader_waits_for_every_hold()
+    var m = machine()
+    val _ = cs_cores(&m, [30, 20, 40])
+    // Core 0 holds, the leader looks, then core 1 holds and the leader looks again.
+    plan(&m, [play(1, PLAY_REST), play(2, PLAY_REST), play(0, PLAY_ANSWER), play(0, PLAY_REST), play(2, PLAY_REST), play(1, PLAY_ANSWER), play(1, PLAY_REST), play(2, PLAY_REST)])
+    on(&m, 0)
+    kernel.rest(&m)
+    assert_eq(m.stops_entered, 1)
+    assert_eq(m.held_at_entry, 0b011)
+    assert_eq(m.stop_asked, 20)
+    assert(!kernel.stop_under_way(), "no stop under way")

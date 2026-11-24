@@ -143,3 +143,77 @@ private open_mask() -> u32
             in open : reg
         [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
     old
+
+// Stopping the machine (DESIGN "Stopping the machine"): the tick frozen, its count kept, while the core
+// sleeps in the chip's deep wait.
+
+private const SCR: usize = 0xE000_ED10          // the System Control Register
+private const SLEEPDEEP: u32 = 1 << 2           // a WFI asks for the chip's deep sleep
+
+// With the kernel's handlers masked, while another core gathers the machine for a stop: freeze the tick
+// where it is, sleep in the deep wait until any interrupt is pending, and let the tick go on from the
+// count it froze at. The time held is the kernel's to take, from the time base.
+systick_hold()
+    val t: *SysTick = ptr_cast(SYSTICK)
+    disable_interrupts()
+    t.csr = CSR_STOPPED
+    deep_wait()
+    t.csr = CSR_RUNNING
+    enable_interrupts()
+
+// With the kernel's handlers masked: freeze the tick for a stop of the machine and hold off every
+// interrupt (PRIMASK) until `systick_thaw`. Answers the cycles left of the current period, or 0, with the
+// tick left running and nothing held off, when a tick is already pending: that is the kernel's to take.
+systick_freeze() -> u32
+    val t: *SysTick = ptr_cast(SYSTICK)
+    val icsr: *Register = ptr_cast(ICSR)
+    disable_interrupts()
+    t.csr = CSR_STOPPED
+    if icsr.v & PENDSTSET != 0
+        t.csr = CSR_RUNNING
+        enable_interrupts()
+        return 0
+    t.cvr + 1
+
+// The cycles of one tick period.
+systick_period() -> u32
+    val t: *SysTick = ptr_cast(SYSTICK)
+    t.rvr + 1
+
+// Sleep in the chip's deep wait (SLEEPDEEP) until any enabled interrupt is pending, with PRIMASK set and
+// BASEPRI open: the kernel's own interrupts end the wait too, and none is taken until PRIMASK is cleared.
+deep_wait()
+    val scr: *Register = ptr_cast(SCR)
+    scr.v = scr.v | SLEEPDEEP
+    val level = open_mask()
+    wait_for_interrupt()
+    restore(level)
+    scr.v = scr.v & ~SLEEPDEEP
+
+// After a frozen tick with `first` cycles left of its period, `elapsed` cycles slept as another clock
+// measured them: restart the tick in step and let interrupts through again. Answers the tick periods that
+// ended, whose interrupts are never delivered. 32-bit arithmetic: the hardware divides it in a few cycles
+// with the kernel masked, and 2^32 cycles is minutes at any clock a stop is armed against.
+systick_thaw(first: u32, elapsed: u32) -> u32
+    val t: *SysTick = ptr_cast(SYSTICK)
+    val icsr: *Register = ptr_cast(ICSR)
+    val period = t.rvr + 1
+    var ended: u32 = 0
+    var next: u32 = 0
+    if elapsed >= first
+        val past = elapsed - first
+        ended = 1 + past / period
+        next = period - past % period
+    else
+        next = first - elapsed
+    if next < SHORTEST && next + period <= RELOAD_LIMIT
+        ended += 1
+        next += period
+    if ended > 0 then icsr.v = PENDSTCLR
+    t.rvr = next - 1
+    t.cvr = 0
+    t.csr = CSR_RUNNING
+    while t.cvr == 0 do ()
+    t.rvr = period - 1
+    enable_interrupts()
+    ended

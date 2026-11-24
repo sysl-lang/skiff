@@ -42,6 +42,13 @@ impl Port for Board
     spin_unlock(*self, word: *Atomic[u32]) = armv7m.spin_unlock(word)
     override trace(*self, event: kernel.TraceEvent) = scenarios.keep_event(self, event)
 
+    // The machine stops in the chip's sleep, woken by the always-on timer (DESIGN "Stopping the
+    // machine"): worth it from 4 ticks, for up to a minute at 100 Hz.
+    override stop_threshold(*self) -> u32 = 4
+    override stop_limit(*self) -> u32 = 6000
+    override hold(*self) = armv7m.systick_hold()
+    override stop_machine(*self, count: u32) -> u32 = rp2350.stop_machine(count)
+
 // The doorbells are SIO's, one each way.
 impl Doorbell for Board
     ring(*self, core: u32) = rp2350.ring_doorbell(core)
@@ -94,7 +101,9 @@ private var entries: scenarios.Entries = scenarios.Entries(&task_a, &task_b, &ta
 skiff_main() -> never
     val me = rp2350.core_id()
     var board = Board()
-    if me == 0 then rp2350.start_clocks()
+    if me == 0
+        rp2350.start_clocks()
+        rp2350.start_wake_timer()
     rp2350.console_init(me)
     armv7m.enable_faults()
     val answer = kernel.boot(&board)
@@ -162,6 +171,9 @@ private task_selector() -> never = scenarios.selector_task(&Board())
 private task_console() -> never = kernel.serve_console(&Board())
 
 // Raise the running core's spare interrupt from software.
+// The always-on timer, in milliseconds: the clock the stop scenario checks the time base against.
+private wake_clock() -> u64 = rp2350.wake_timer_now()
+
 private raise() = armv7m.pend_irq(rp2350.SPARE_IRQ)
 
 // The spare interrupt, on either core: the scenarios' give on that core.
@@ -170,11 +182,12 @@ board_spare()
     scenarios.interrupt(&Board())
 
 private task_idle() -> never
+    var board = Board()
     loop
-        armv7m.wait_for_interrupt()
+        kernel.rest(&board)
 
 // R: the handle checks, then the waits, the timers, deferred work, task control, the statistics, the
-// mutex options, the queue sets, the kernel's trace, the error traces, the protection, the grants, the time base without
+// mutex options, the queue sets, the kernel's trace, the error traces, the protection, the grants, a stop of the machine, the time base without
 // core 0 and the watchdog, then the end
 // of the run. Core 1 hangs, and its watchdog stops it; core 0, its own watch still fed, waits until it
 // sees core 1 stopped, ticks on, and stops the machine.
@@ -194,6 +207,7 @@ private task_r() -> never
     scenarios.traces(&board, &entries, code)
     scenarios.protection(&board, &entries, code, scenarios.Console(Region(rp2350.uart_base(me), rp2350.UART_BYTES, Access.Device), rp2350.UART_FLAGS, rp2350.UART_TX_FULL))
     scenarios.grants(&board, code)
+    scenarios.deep_stop(&board, &wake_clock)
     scenarios.time_alone(&board)
     scenarios.watchdog(&board, &entries, me == 1)
     while !kernel.stopped(1) do kernel.sleep(&board, 1)

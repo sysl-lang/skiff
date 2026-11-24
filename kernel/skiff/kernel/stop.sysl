@@ -1,0 +1,346 @@
+module skiff.kernel
+
+import sysl.sync.Atomic
+
+// Stopping the machine (DESIGN "Stopping the machine").
+//
+// A chip's deep state stops the clocks every core and the time base run on, so it is entered only when
+// every core has nothing to do for long enough, and every core agrees. Each core's idle step publishes how
+// long it needs nothing; the last to go idle leads: it asks the others to hold (their ticks frozen, asleep
+// in the chip's deep wait), and once all hold it enters the deep state through the port until the soonest
+// deadline among them. On waking it takes the periods the wake timer measured, then releases the others,
+// which take what the time base moved while they held. Any core leaving idle, a held core waking, or a
+// deadline coming near cancels the gathering, and every held core takes the ticks it missed.
+
+// The phases of a stop.
+private[kernel] const STOP_OFF: u32 = 0        // no stop under way
+private[kernel] const STOP_GATHERING: u32 = 1  // a leader has asked the others to hold
+private[kernel] const STOP_ENTERED: u32 = 2    // every core asked holds, and the leader is in the deep state
+
+// How many ticks of the time base a leader waits for the cores it asked to hold before giving up.
+const GATHER_TICKS: u32 = 3
+
+// The furthest ahead a core publishes itself idle: half the time base's span, so a deadline read against
+// the time base never wraps into the past.
+private const FURTHEST: u32 = 0x7fff_ffff
+
+// What the idle step does next (`take_part`).
+private[kernel] const STEP_SLEEP: u32 = 0      // sleep as tickless idle does
+private[kernel] const STEP_WAIT: u32 = 1       // sleep until the next interrupt: the core leads a gathering
+private[kernel] const STEP_HOLD: u32 = 2       // hold for the leader (`hold_step`)
+private[kernel] const STEP_STOP: u32 = 3       // every core asked holds: stop the machine (`stop_step`)
+
+// The cores' agreement, in `.shared`, read and written holding `lock` (with several cores). Bit n of a
+// mask is core n.
+struct Stop
+    lock: Atomic[u32]
+    allowed: u32                // the cores whose application allows the machine to stop
+    idle: u32                   // the cores in their idle step with nothing to do before `until`
+    until: [option_cores]u32    // each idle core's soonest deadline, on the time base
+    phase: u32                  // STOP_OFF, STOP_GATHERING or STOP_ENTERED
+    leader: u32                 // the core gathering, or in the deep state
+    asked: u32                  // the cores the leader asked to hold
+    held: u32                   // of them, those holding
+    gathered_at: u32            // the time base when the gathering began
+    entered: u32                // how many stops have been entered
+
+// Allow the machine to stop while the running core is idle, or forbid it. Every started core that has
+// not stopped must allow it, and starts forbidding it: only the application knows whether a peripheral
+// still needs its clocks.
+allow_stop[P: Port](p: *P, allowed: bool)
+    val c = here(p)
+    val s = machine_stop()
+    val bit = u32(1) << c.id
+    val state = p.mask()
+    lock_stop(p)
+    var ringing: u32 = 0
+    if allowed
+        s.allowed |= bit
+    else
+        s.allowed &= ~bit
+        ringing = withdraw(s, c.id)
+    unlock_stop(p)
+    p.restore(state)
+    ring_cores(p, c.id, ringing)
+
+// How many of the running core's ticks passed while it held for a stop of the machine or led one, taken
+// at once when it went on.
+stopped_ticks[P: Port](p: *P) -> u32 = here(p).stopped_ticks
+
+// How many stops of the machine the running core has been part of.
+machine_stops[P: Port](p: *P) -> u32 = here(p).stops
+
+// Whether a stop is under way: gathering, or entered.
+stop_under_way() -> bool = machine_stop().phase != STOP_OFF
+
+// The cores published idle (bit n: core n).
+stop_idle_cores() -> u32 = machine_stop().idle
+
+// The cores holding for a stop.
+stop_held_cores() -> u32 = machine_stop().held
+
+// The running core's part in a stop, from its idle step with its interrupts masked: publish whether it is
+// idle long enough, lead a gathering or join one, and answer what the idle step does next. Only the
+// decision is made here; the hold and the stop are the idle step's, each in masked pieces of its own, so
+// no masked stretch spans the decision, the stop and the ticks taken after it. A port with no deep state
+// answers `STEP_SLEEP` at once.
+private[kernel] take_part[P: Port](p: *P, c: *Core) -> u32
+    val threshold = p.stop_threshold()
+    if threshold < 2 then return STEP_SLEEP
+    val reach = idle_reach(p, c)
+    val s = machine_stop()
+    val me = c.id
+    val bit = u32(1) << me
+    lock_stop(p)
+    val now = ticks()
+    val idle = s.allowed & bit != 0 && reach >= threshold
+    if s.phase == STOP_GATHERING
+        if s.leader == me then return lead(p, c, idle, reach, now)
+        if s.asked & bit == 0 || s.held & bit != 0
+            unlock_stop(p)
+            return STEP_SLEEP
+        if !idle
+            val ringing = cancel(s)
+            unlock_stop(p)
+            ring_cores(p, me, ringing)
+            return STEP_SLEEP
+        s.idle |= bit
+        s.until[me] = now +% reach
+        s.held |= bit
+        c.held_from = now
+        c.held_count = s.entered
+        unlock_stop(p)
+        return STEP_HOLD
+    if s.phase == STOP_ENTERED
+        // A core woken out of the stop sleeps as usual until the leader has ended it.
+        unlock_stop(p)
+        return STEP_SLEEP
+    if !idle
+        s.idle &= ~bit
+        unlock_stop(p)
+        return STEP_SLEEP
+    s.idle |= bit
+    s.until[me] = now +% reach
+    val others = all_idle(s, me, now, threshold)
+    if others == NOT_ALL
+        unlock_stop(p)
+        return STEP_SLEEP
+    s.phase = STOP_GATHERING
+    s.leader = me
+    s.asked = others
+    s.held = 0
+    s.gathered_at = now
+    if others == 0 then return lead(p, c, idle, reach, now)
+    unlock_stop(p)
+    ring_cores(p, me, others)
+    STEP_WAIT
+
+// The leader's look at its gathering, holding the stop's lock, which it lets go: mark the stop entered once
+// every core asked holds (`STEP_STOP`, with the ticks to stop for in `Core.stop_count`), keep waiting, or
+// give up.
+private lead[P: Port](p: *P, c: *Core, idle: bool, reach: u32, now: u32) -> u32
+    val s = machine_stop()
+    val me = c.id
+    val bit = u32(1) << me
+    val threshold = p.stop_threshold()
+    if idle
+        s.until[me] = now +% reach
+    val soonest = soonest_left(s, s.asked | bit, now)
+    if !idle || soonest < threshold || (s.held != s.asked && now -% s.gathered_at >= GATHER_TICKS)
+        val ringing = cancel(s)
+        unlock_stop(p)
+        ring_cores(p, me, ringing)
+        return STEP_SLEEP
+    if s.held != s.asked
+        unlock_stop(p)
+        return STEP_WAIT
+    val limit = p.stop_limit()
+    val count = if soonest < limit then soonest else limit
+    if count < threshold
+        val ringing = cancel(s)
+        unlock_stop(p)
+        ring_cores(p, me, ringing)
+        return STEP_SLEEP
+    s.phase = STOP_ENTERED
+    s.entered = s.entered +% 1
+    c.held_count = s.entered
+    c.stop_count = count
+    unlock_stop(p)
+    STEP_STOP
+
+// The leader's stop, from its idle step with its interrupts unmasked, in three masked pieces: the stop
+// itself, the ticks it slept, and the release of the held cores. A leader that left its idle task between
+// the decision and here has ended the stop already (`withdraw`); one that finds something to run ends it.
+private[kernel] stop_step[P: Port](p: *P, c: *Core)
+    val s = machine_stop()
+    val me = c.id
+    var state = p.mask()
+    lock_stop(p)
+    var go = entered_by(s, c)
+    var released: u32 = 0
+    if go && idle_reach(p, c) == 0
+        released = cancel(s)
+        go = false
+    unlock_stop(p)
+    if !go
+        p.restore(state)
+        ring_cores(p, me, released)
+        return
+    val from = c.own_ticks()
+    val slept = p.stop_machine(c.stop_count)
+    p.restore(state)
+    if slept > 0
+        state = p.mask()
+        take_stopped(p, c, from, slept)
+        p.restore(state)
+    c.stops = c.stops +% 1
+    state = p.mask()
+    lock_stop(p)
+    // Unless the leader left its idle task meanwhile, which released the held cores already.
+    if entered_by(s, c)
+        released = s.held
+        clear_stop(s)
+    unlock_stop(p)
+    p.restore(state)
+    ring_cores(p, me, released)
+    if end_expired_waits(p, c) then p.request_switch()
+
+// Whether the stop entered is still the one core `c` entered, holding the lock.
+private entered_by(s: *Stop, c: *Core) -> bool = s.phase == STOP_ENTERED && s.leader == c.id && s.entered == c.held_count
+
+// A held core's hold, from its idle step with its interrupts masked, which it restores: hold, then see why
+// the hold ended, then take what it missed in a masked piece of its own.
+private[kernel] hold_step[P: Port](p: *P, c: *Core, state: u32)
+    p.hold()
+    val owed = after_hold(p, c)
+    p.restore(state)
+    if owed > 0
+        val again = p.mask()
+        take_stopped(p, c, c.own_ticks(), owed)
+        p.restore(again)
+    if end_expired_waits(p, c) then p.request_switch()
+
+// Take `count` ticks that passed while the running core held or the machine was stopped, with its
+// interrupts masked, its own count having been `from`; and feed its watch as those ticks would have.
+private[kernel] take_stopped[P: Port](p: *P, c: *Core, from: u32, count: u32)
+    take_ticks(p, c, count)
+    supervise_skipped(p, from, count)
+    c.stopped_ticks = c.stopped_ticks +% count
+
+// A held core's return from its hold, with its interrupts masked: released, by the leader at the stop's
+// end or by a cancel, or woken by something of its own, which cancels a gathering or, in a stop already
+// entered, leaves it and has the leader end it. Answers the ticks the time base moved while it held, for
+// the core to take.
+private[kernel] after_hold[P: Port](p: *P, c: *Core) -> u32
+    val s = machine_stop()
+    val me = c.id
+    val bit = u32(1) << me
+    lock_stop(p)
+    var ringing: u32 = 0
+    if s.held & bit != 0
+        if s.phase == STOP_ENTERED
+            s.held &= ~bit
+            s.idle &= ~bit
+            ringing = u32(1) << s.leader
+        else
+            ringing = cancel(s)
+    val stopped = s.entered != c.held_count
+    c.held_count = s.entered
+    unlock_stop(p)
+    ring_cores(p, me, ringing)
+    if stopped then c.stops = c.stops +% 1
+    val now = ticks()
+    val owed = now -% c.held_from
+    c.held_from = now
+    owed
+
+// The running core leaves its idle task, with its interrupts masked: it is no longer idle, and a gathering
+// it leads or was asked into is cancelled. A port with no deep state does nothing.
+private[kernel] leave_idle[P: Port](p: *P, c: *Core)
+    if p.stop_threshold() < 2 then return
+    lock_stop(p)
+    val ringing = withdraw(machine_stop(), c.id)
+    unlock_stop(p)
+    ring_cores(p, c.id, ringing)
+
+// How many ticks the core `c` needs nothing for: 0 unless its idle task is all it has to run; else the
+// fewest of the ticks to its soonest deadline and what its watch allows, at most `FURTHEST`.
+private[kernel] idle_reach[P: Port](p: *P, c: *Core) -> u32
+    if c.stopped || !c.sched.started() then return 0
+    val r = usize(c.sched.running)
+    if c.sched.tasks[r].priority != IDLE_PRIORITY || c.sched.tasks[r].state != TaskState.Ready then return 0
+    // Anything ready above the idle task, or a wait whose deadline came and is not yet ended, runs first.
+    if c.sched.ready & ~1 != 0 || c.sched.expiring != NONE then return 0
+    var count = FURTHEST
+    if c.sched.timeouts != NONE
+        val left = c.sched.tasks[usize(c.sched.timeouts)].deadline -% ticks()
+        if i32.wrap(left) <= 0 then return 0
+        if left < count then count = left
+    val watched = watch_allows(p, c.own_ticks())
+    if watched < count then count = watched
+    count
+
+// Not every other core is idle.
+private const NOT_ALL: u32 = 0xffff_ffff
+
+// The other cores a stop led by core `me` would hold, holding the lock: every started core that has not
+// stopped, each allowing the stop and idle for `threshold` ticks or more; `NOT_ALL` when one is not, or
+// when a core has never started.
+private all_idle(s: *Stop, me: u32, now: u32, threshold: u32) -> u32
+    var others: u32 = 0
+    for n in 0u32..<u32(option_cores)
+        if n == me then continue
+        val state = core_state(n)
+        if state == CORE_STOPPED then continue
+        val bit = u32(1) << n
+        if state != CORE_READY || s.allowed & bit == 0 || s.idle & bit == 0 then return NOT_ALL
+        if left(s.until[n], now) < threshold then return NOT_ALL
+        others |= bit
+    others
+
+// The fewest ticks left to the deadline of any core in `cores`.
+private soonest_left(s: *Stop, cores: u32, now: u32) -> u32
+    var soonest = FURTHEST
+    for n in 0u32..<u32(option_cores)
+        if cores & (u32(1) << n) != 0
+            val l = left(s.until[n], now)
+            if l < soonest then soonest = l
+    soonest
+
+// The ticks from `now` to `until`, 0 once it has come.
+private left(until: u32, now: u32) -> u32 = if i32.wrap(until -% now) <= 0 then 0 else until -% now
+
+// Core `me` is no longer idle, holding the lock: unmark it, and cancel the gathering it leads or was asked
+// into. Answers the cores to ring.
+private withdraw(s: *Stop, me: u32) -> u32
+    val bit = u32(1) << me
+    s.idle &= ~bit
+    // A leader leaving its idle task between deciding on the stop and entering it ends the stop too.
+    if s.phase != STOP_OFF && (s.leader == me || (s.phase == STOP_GATHERING && s.asked & bit != 0)) then cancel(s) else 0
+
+// End a gathering with no stop, holding the lock. Answers the cores to ring: those holding, which take
+// what they missed.
+private cancel(s: *Stop) -> u32
+    val held = s.held
+    clear_stop(s)
+    held
+
+// No stop under way, and every core to publish itself idle again.
+private[kernel] clear_stop(s: *Stop)
+    s.phase = STOP_OFF
+    s.asked = 0
+    s.held = 0
+    s.idle = 0
+
+// Ring every core in `cores` but `me`.
+private ring_cores[P: Port](p: *P, me: u32, cores: u32)
+    if cores == 0 then return
+    for n in 0u32..<u32(option_cores)
+        if n != me && cores & (u32(1) << n) != 0 then p.ring(n)
+
+// The stop's spin word, with the core's interrupts masked. One core has no other to agree with.
+private lock_stop[P: Port](p: *P)
+    if option_cores > 1 then p.spin_lock(&machine_stop().lock)
+
+private unlock_stop[P: Port](p: *P)
+    if option_cores > 1 then p.spin_unlock(&machine_stop().lock)

@@ -641,7 +641,10 @@ switch_context[P: Port](p: *P, sp: usize) -> usize
     val from = c.sched.running
     val leaving = c.sched.handle(c.id, usize(from))
 #endif
+    val was = c.sched.running
     val next = c.sched.switch(sp)
+    // A core leaving its idle task is no longer idle for a stop of the machine (stop.sysl).
+    if was != NONE && c.sched.running != was && c.sched.tasks[usize(was)].priority == IDLE_PRIORITY then leave_idle(p, c)
 #if option_trace
     if c.sched.running != from
         trace_task(p, TraceKind.SwitchOut, TraceObject.Nothing, 0, leaving, 0)

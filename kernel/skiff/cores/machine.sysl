@@ -30,6 +30,18 @@ struct Machine
     inside_count: usize             // how many of them there are
     inside_next: usize              // the next to take
     events: TraceRing[64]          // every core's events, in the order the cores emitted them, once started
+    stop_min: u32                   // the fewest ticks a stop of the machine is worth (0: no deep state)
+    stop_most: u32                  // the most ticks one may span
+    stop_asked: u32                 // the ticks the last stop was asked to span (0: none was)
+    stops_entered: u32              // how many stops were entered
+    held_at_entry: u32              // bit n: core n was holding when the last stop was entered
+    holding: u32                    // bit n: core n is inside its hold now
+    holds: [kernel.CORES]u32       // how many times each core held
+    woken: [kernel.CORES]bool      // a device interrupt is pending on the core, so its hold ends at once
+    plays: [16]u32                  // what the other cores do while one holds, stops or idles (`play`)
+    plays_count: usize              // how many there are
+    plays_next: usize               // the next to play
+    given: *Semaphore               // what a `PLAY_GIVE` gives (null: nothing)
     answering: bool                 // whether a rung core answers at once, inside the call that rang it
     watched: *Mutex                 // the mutex such a core's chosen task looks at (null: none)
     seen_running: [kernel.CORES]Task   // the task each answering core chose to run
@@ -62,7 +74,11 @@ impl Port for Machine
     cores(*self) -> u32 = u32(kernel.CORES)
     core_id(*self) -> u32 = self.me
     start_ticks(*self, hz: u32) = ()
-    idle(*self) = kernel.tick(self)
+    // An idle core wakes on its tick, unless the test has plays left: then they are what happens first.
+    idle(*self)
+        val sleeper = self.me
+        if self.plays_next < self.plays_count then self.run_plays() else kernel.tick(self)
+        self.me = sleeper
     new_context(*self, stack: []u32, entry: *extern() -> never) -> usize = usize(&stack[0])
 
     request_switch(*self)
@@ -115,6 +131,71 @@ impl Port for Machine
 
     // Every core's events go to the one ring, so a test reads the order across cores too.
     override trace(*self, event: TraceEvent) = self.events.record(event)
+
+    // A stop of the machine. While a core holds, or the leader is stopped, the plays run: the other cores
+    // act. A hold ends at once when the core's doorbell or a device interrupt is pending, and otherwise
+    // once the plays have run, which is a wake when no one released it. A stop spans what it was asked, or
+    // `wake_after` if an interrupt comes sooner.
+    override stop_threshold(*self) -> u32 = self.stop_min
+    override stop_limit(*self) -> u32 = self.stop_most
+
+    override hold(*self)
+        val holder = self.me
+        self.holds[holder] += 1
+        if !self.pending[holder] && !self.woken[holder]
+            self.holding |= 1 << holder
+            self.run_plays()
+            self.holding &= ~(1 << holder)
+        self.me = holder
+        self.woken[holder] = false
+
+    override stop_machine(*self, count: u32) -> u32
+        val leader = self.me
+        self.stop_asked = count
+        self.stops_entered += 1
+        self.held_at_entry = self.holding
+        self.run_plays()
+        self.me = leader
+        if self.wake_after < count then self.wake_after else count
+
+// What a play does, as its core.
+const PLAY_REST: u32 = 0      // take the core's idle step
+const PLAY_TICK: u32 = 1      // take its tick
+const PLAY_ANSWER: u32 = 2    // answer its doorbell
+const PLAY_WAKE: u32 = 3      // a device interrupt becomes pending on it
+const PLAY_SWITCH: u32 = 4    // the switch it asked for
+const PLAY_GIVE: u32 = 5      // an interrupt handler on it gives `given`
+
+// A play: core `core` does `what`.
+play(core: u32, what: u32) -> u32 = what << 8 | core
+
+// Queue plays, in order.
+plan(m: *Machine, plays: []const u32)
+    for e in plays
+        m.plays[m.plays_count] = e
+        m.plays_count += 1
+
+impl Machine
+    // Run the plays, ticks, answers and wakes in turn, up to and including the next idle step.
+    run_plays(*self)
+        while self.plays_next < self.plays_count
+            val e = self.plays[self.plays_next]
+            self.plays_next += 1
+            self.me = e & 0xff
+            val what = e >> 8
+            if what == PLAY_REST
+                kernel.rest(self)
+                return
+            elif what == PLAY_TICK
+                kernel.tick(self)
+            elif what == PLAY_ANSWER
+                kernel.answer_doorbell(self)
+            elif what == PLAY_WAKE
+                self.woken[self.me] = true
+            elif what == PLAY_SWITCH
+                switch_now(self)
+            else
+                val _ = self.given.give(self)
 
 impl Doorbell for Machine
     // With `answering` on, the rung core answers its doorbell at once and switches to its scheduler's
@@ -169,7 +250,7 @@ impl Isolation for Machine
 // every one of them may be used by two cores, so the whole address space counts as `.shared`.
 machine() -> Machine
     kernel.shared_bounds(0, 0xffff_ffff_ffff_ffff)
-    Machine(0, [0; kernel.CORES], [0; kernel.CORES], 0, [false; kernel.CORES], null, [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], 0, kernel.FOREVER, 0, 0, [0; kernel.CORES], 0, 0, TraceRing.new(), false, null, [kernel.NO_TASK; kernel.CORES], [kernel.NO_TASK; kernel.CORES], [0; kernel.CORES])
+    Machine(0, [0; kernel.CORES], [0; kernel.CORES], 0, [false; kernel.CORES], null, [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], [0; kernel.CORES], 0, kernel.FOREVER, 0, 0, [0; kernel.CORES], 0, 0, TraceRing.new(), 0, 0, 0, 0, 0, 0, [0; kernel.CORES], [false; kernel.CORES], [0; 16], 0, 0, null, false, null, [kernel.NO_TASK; kernel.CORES], [kernel.NO_TASK; kernel.CORES], [0; kernel.CORES])
 
 // Act as core `core` from now on.
 on(m: *Machine, core: u32)

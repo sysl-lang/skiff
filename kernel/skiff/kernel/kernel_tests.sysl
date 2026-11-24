@@ -40,6 +40,10 @@ private[kernel] struct Recorder
     skip_limit: u32         // the most ticks a sleep with the tick stopped may span (0: the tick never stops)
     wake_after: u32         // how many ticks such a sleep lasts before an interrupt ends it (FOREVER: none comes)
     asked: u32              // the ticks the last such sleep was asked to span (0: none was)
+    stop_min: u32           // the fewest ticks a stop of the machine is worth (0: the machine has no deep state)
+    stop_most: u32          // the most ticks one may span
+    stop_asked: u32         // the ticks the last stop was asked to span (0: none was)
+    holds: u32              // how many times the core held for a stop
     events: TraceRing[64]   // the events the kernel emitted, once a test starts it
 
 // A hardware watchdog that counts what it is asked.
@@ -150,6 +154,17 @@ impl Port for Recorder
         self.asked = count
         if self.wake_after < count then self.wake_after else count
 
+    // A stop of the machine spans what it was asked, or `wake_after` if an interrupt comes sooner.
+    override stop_threshold(*self) -> u32 = self.stop_min
+    override stop_limit(*self) -> u32 = self.stop_most
+
+    override hold(*self)
+        self.holds += 1
+
+    override stop_machine(*self, count: u32) -> u32
+        self.stop_asked = count
+        if self.wake_after < count then self.wake_after else count
+
     override trace(*self, event: TraceEvent) = self.events.record(event)
 
 // One core: the kernel has no other core to ring.
@@ -157,7 +172,7 @@ impl Doorbell for Recorder
     ring(*self, core: u32) = panic("one core never rings")
     clear(*self) = panic("one core never rings")
 
-private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, 0, 0, 0, 0, null, null, 0, 0, 0, 0, 0, 0, false, 8, 0, 0, 0, 0, 0, 0, 0, 0, FOREVER, 0, TraceRing.new())
+private[kernel] recorder(cores: u32, me: u32) -> Recorder = Recorder([0; 256], 0, cores, me, 0, 0, 0, 0, 0, 0, 0, 0, 0, null, null, 0, 0, 0, 0, 0, 0, false, 8, 0, 0, 0, 0, 0, 0, 0, 0, FOREVER, 0, 0, 0, 0, 0, TraceRing.new())
 
 // Whether `r` recorded exactly `want`.
 private[kernel] recorded(r: *Recorder, want: string) -> bool
@@ -211,7 +226,7 @@ deadline_across_wrap()
     assert(expired(5, 5), "the deadline, after the wrap")
     assert(expired(0xffff_ffff, 2), "a deadline before the wrap, seen after it")
 
-private[kernel] fresh_core(id: u32, own: u32, seen: u32) -> Core = Core(id, Atomic(own), seen, false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false, 0, 0, 0, 0)
+private[kernel] fresh_core(id: u32, own: u32, seen: u32) -> Core = Core(id, Atomic(own), seen, false, EMPTY_SCHEDULER, [NO_MAP; option_tasks], false, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
 @test("a tick advances the time base unless another core's has since this core's last, whichever core it is")
 a_tick_advances_time_unless_another_did()

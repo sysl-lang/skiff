@@ -764,6 +764,94 @@ kernel's side; the port's is two members of `Port` with defaults.
 - **Several cores**: each sleeps on its own; nothing is shared but the time base. A remote wake reaches a
   sleeping core as any message does, through its inbox and doorbell, which ends the sleep early.
 
+## Stopping the machine
+
+Tickless idle stops one core's tick. A chip's deep low-power state (the RP2350's SLEEP, an STM32's Stop)
+stops more: the clocks every core and the time base run on. It is safe only when **every** core has
+nothing to do for long enough, so the cores must agree, enter it together, and come out with the time
+base corrected by a timer that kept running. `kernel/skiff/kernel/stop.sysl` is the kernel's side.
+
+- **Where it can be shown.** QEMU models no power state, so the MPS2 and AN521 boards keep the port's
+  defaults and never stop. benchtop's Pico 2 models what the stop needs to be shown working: POWMAN's
+  always-on timer counting from the LPOSC through a sleep, its alarm latching POWMAN_IRQ_TIMER (45) into
+  the NVIC, and cores asleep in WFI skipping straight to that alarm. It does **not** model clock gating:
+  SCB.SLEEPDEEP and CLOCKS SLEEP_EN0/1 are stored and change nothing, so SysTick, TIMER0/1 and the UARTs
+  run on through what silicon would gate. The image does not rely on the gating either way: each core
+  freezes its own SysTick before it sleeps, and the time slept is read from the always-on timer, so the
+  same image is right on silicon and on benchtop. What benchtop cannot show is that the clocks did stop;
+  that is a benchtop request (model SLEEPDEEP + SLEEP_EN gating), not a skiff accommodation.
+- **The application votes.** A core takes part only once its application has said so
+  (`allow_stop(p, true)`); the kernel cannot know which peripherals still need their clocks (a DMA in
+  flight, a UART still shifting). The vote starts against.
+- **The agreement is in `.shared`** (`Shared.stop`, under its own spin word): each core's vote, whether
+  it is idle and until which tick of the time base (`until[n]`), the phase (off, gathering, entered), the
+  leader, the cores it asked to hold and those holding.
+- **Going idle.** The idle step (`rest`) computes how long the core needs nothing (`reach`: the same
+  conditions and bounds as tickless idle, the watch's among them, without the tick's limit). A core whose
+  reach is at least the port's `stop_threshold()` publishes itself idle until `now + reach`. A core whose
+  reach is shorter, or that has not voted for the stop, withdraws. Every idle step that ends in an ordinary
+  sleep withdraws again after it, so a core is published idle only while it sleeps in its idle step.
+- **The last core to go idle leads.** If every started core that has not stopped (a faulted core is left
+  out; one never started blocks the stop) has voted, is published idle, and the soonest of their
+  deadlines is at least the threshold away, the publishing core becomes the leader: phase gathering, the
+  others asked to hold and rung. Each, once its doorbell is answered and its next idle step finds itself
+  still idle long enough, republishes its deadline, records the time base (`held_from`), joins the held
+  set and calls the port's `hold()`: its tick frozen, asleep in the chip's deep wait until any interrupt.
+  The leader looks again on each of its idle steps (it waits tick by tick while gathering): once every
+  core asked is holding, it enters the stop for the soonest deadline less the time base, at most the
+  port's `stop_limit()`, through `stop_machine(count)`.
+- **Cancelling.** Gathering ends without a stop when any core asked, or the leader, finds itself no
+  longer idle long enough, when a held core wakes (an inbox post rings it, a device interrupts it), when a
+  deadline comes within the threshold, or after `GATHER_TICKS` (3) of the time base, so a core that went
+  busy instead of holding cannot keep the others held. The canceller clears the phase and every idle
+  mark and rings every held core; each takes the ticks the time base moved while it held
+  (`ticks() - held_from`), which its frozen tick did not take, so its own count and deadlines come out as
+  if it had ticked.
+- **The stop.** `stop_machine(count)` runs on the leader with the kernel's interrupts masked and every
+  other core held: freeze its tick, arm the wake timer for `count` ticks, enter the deep state until it
+  fires or any interrupt is pending, and answer the whole tick periods the wake timer measured, restarting
+  the tick in step with what remains of the current one. The leader takes them as one step of `n` ticks
+  (`take_ticks`, the "Time" rule: the time base comes to `n` past where it last saw it, unless others
+  moved it that far), feeds its watch as tickless idle does, clears the phase and the idle marks, and
+  rings every held core. Each held core then takes `ticks() - held_from` the same way. So the time base
+  moves once, by the time slept, and every core's own count moves with it.
+- **A held core woken while the machine is stopped** (its own device) does not wait for the leader: it
+  leaves the held set, rings the leader to end the stop, and runs on with its tick thawed. Until the
+  leader has taken its ticks the time base stands where the stop began, so for that core's own wake
+  latency of the leader its deadlines read early time; once the leader takes the slept periods, the
+  core's next tick finds the time base moved and records it (DESIGN "Time"), losing the stop's periods
+  from its own count only, as a masked core loses them.
+- **Masked time.** The idle step's decision is one masked stretch; the hold, the stop and the ticks taken
+  after each are masked pieces of their own (`hold_step`, `stop_step`), so the longest is the stop's own
+  entry and exit around the sleep (time asleep is not masked time), held to the gate's bound with 32-bit
+  arithmetic the hardware divides. Between the pieces interrupts are taken; a leader that leaves its idle
+  task between deciding and entering ends the stop as it leaves (`withdraw`), and one that finds something
+  to run when it comes to enter ends it there.
+- **Supervision.** A stop is bounded by every core's deadline, and each core's published deadline is
+  bounded by what its watch allows (`watch_allows`), so no watch can come due during a stop; on waking,
+  each core feeds its watch as of the last tick of the stop that every watched task was within its period
+  on (`supervise_skipped`). A hardware stage that keeps counting through the deep state is started at
+  twice the timeout and fed with the watch, so it outlasts any stop; a port whose watchdog would bite
+  across one pauses it in `stop_machine`. The RP2350's watchdog is the chip's, not a core's, and skiff
+  leaves it off.
+- **What is exact**: the time base moves by the periods the wake timer measured; each held core's own
+  count and deadlines; the watch. **Not**: the tick's phase moves by the wake timer's resolution (one
+  millisecond on the RP2350) and the cycles spent entering and leaving; a core woken during a stop loses
+  that stop's periods from its own count.
+- **The port.** Four members of `Port` with defaults: `stop_threshold()` (0: the machine has no deep
+  state, and the idle step is tickless idle's), `stop_limit()` (0), `hold()` (`idle()`) and
+  `stop_machine(count)` (0). A port that implements none behaves as before.
+- **The RP2350** (`chips/rp2350/stop.sysl`, `arch/armv7m/stop.sysl`): the always-on timer counts
+  milliseconds from the LPOSC from boot. `hold` freezes SysTick (ENABLE cleared, the count kept), sets
+  SLEEPDEEP and waits with PRIMASK set and BASEPRI open, then thaws it. `stop_machine` freezes SysTick,
+  arms the alarm for what the current period had left plus `count - 1` periods, rounded up to the timer's
+  millisecond, enables POWMAN_IRQ_TIMER in its
+  own NVIC, gates every clock but POWMAN's and the SIO's (SLEEP_EN0/1), sleeps deep, then restores them,
+  clears and disables the alarm and its pending interrupt, and thaws SysTick by the milliseconds read
+  from the timer. Threshold 4 ticks, limit 6000 (a minute at 100 Hz). The board scenario checks the time
+  base against the always-on timer over each core's wait, so a time base that stood still through a stop
+  is seen even though every deadline, read against that same time base, looks met.
+
 ## Software timers
 
 A software timer calls a function once a period has passed (one-shot), or every period (periodic).

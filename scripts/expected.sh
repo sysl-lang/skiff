@@ -342,6 +342,14 @@ check() {
     IFS=$old_ifs
 }
 
+# The Pico 2's port has a deep state, so after the grants both cores stop the machine (DESIGN "Stopping
+# the machine"), the line before each core's time-base line.
+stop_expected() {
+    echo "skiff: core $1 the machine stopped with every core idle, and the time base moved on by the time it slept"
+}
+before_line() {
+    awk -v at="$1" -v line="$2" '$0 == at { print line } { print }'
+}
 # check_forwarded <label> <core 0's log>: core 1's reports, in core 1's order, among the lines of core 0's
 # console that name core 1. Sets `missing` as `check` does.
 check_forwarded() {
@@ -350,9 +358,11 @@ check_forwarded() {
 }
 
 pico2_core0_expected="$an521_core0_greeting
-$(dual_core0_run "f32 registers survived the switches" | grep -v -x -F -e "$(tickless_expected 0)" -e "$an521_outlived")"
+$(dual_core0_run "f32 registers survived the switches" | grep -v -x -F -e "$(tickless_expected 0)" -e "$an521_outlived" \
+    | before_line "skiff: core 0 took no tick while masked, and the time base moved on without it" "$(stop_expected 0)")"
 pico2_core1_expected="skiff: hello from core 1
 $an521_core1_ticks
 $(tasks_expected 1 "f32 registers survived the switches")
-$(core1_own "$(echo "$an521_core1_run" | grep -v -x -F "$(tickless_expected 1)")
+$(core1_own "$(echo "$an521_core1_run" | grep -v -x -F "$(tickless_expected 1)" \
+    | before_line "skiff: core 1 kept the time base moving while core 0 took no tick" "$(stop_expected 1)")
 $(hang_expected 1 open)")"

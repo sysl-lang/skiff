@@ -53,3 +53,7 @@ pend_irq(irq: u32)
             "dsb"
             "isb"
         [x86_64, aarch64, riscv64, riscv32, craft, wasm32] unavailable "skiff.arch.armv7m is for Armv7-M cores"
+
+// Forget a request of interrupt `irq` that is pending and not yet taken.
+unpend_irq(irq: u32)
+    nvic_word(NVIC_ICPR, irq).v = nvic_bit(irq)

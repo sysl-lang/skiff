@@ -243,6 +243,8 @@ probe() -> i32
     kernel.await_tick(&m)
     kernel.rest(&m)
     if kernel.skipped_ticks(&m) != 0 then return 1
+    kernel.allow_stop(&m, true)
+    if kernel.stopped_ticks(&m) != 0 || kernel.machine_stops(&m) != 0 || kernel.stop_under_way() then return 1
     kernel.answer_doorbell(&m)
     kernel.fault(&m, "none")
     val here = kernel.here(&m)

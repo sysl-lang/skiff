@@ -10,12 +10,21 @@ module skiff.kernel
 // the time base, the deadlines, the statistics and the watch come out as if each tick had been taken. A
 // port that cannot stop its tick answers a limit of 0, and the idle task sleeps tick by tick as before.
 
-// One step of the running core's idle task: sleep, through as many ticks as nothing needs, or until the
-// next interrupt. The idle task's body is `loop kernel.rest(p)`.
+// One step of the running core's idle task: take part in a stop of the whole machine (stop.sysl), or
+// sleep, through as many ticks as nothing needs, or until the next interrupt. The idle task's body is
+// `loop kernel.rest(p)`.
 rest[P: Port](p: *P)
     val c = here(p)
     val state = p.mask()
-    val count = skippable(p, c)
+    val step = take_part(p, c)
+    if step == STEP_HOLD
+        hold_step(p, c, state)
+        return
+    if step == STEP_STOP
+        p.restore(state)
+        stop_step(p, c)
+        return
+    val count = if step == STEP_WAIT then 0 else skippable(p, c)
     if count < 2
         p.restore(state)
         p.idle()
@@ -40,19 +49,9 @@ rest[P: Port](p: *P)
 // ticks to its soonest deadline, and what its watch allows. Fewer than 2 is no reason to stop the tick.
 private[kernel] skippable[P: Port](p: *P, c: *Core) -> u32
     val limit = p.tickless_limit()
-    if limit < 2 || c.stopped || !c.sched.started() then return 0
-    val r = usize(c.sched.running)
-    if c.sched.tasks[r].priority != IDLE_PRIORITY || c.sched.tasks[r].state != TaskState.Ready then return 0
-    // Anything ready above the idle task, or a wait whose deadline came and is not yet ended, runs first.
-    if c.sched.ready & ~1 != 0 || c.sched.expiring != NONE then return 0
-    var count = limit
-    if c.sched.timeouts != NONE
-        val left = c.sched.tasks[usize(c.sched.timeouts)].deadline -% ticks()
-        if i32.wrap(left) <= 0 then return 0
-        if left < count then count = left
-    val watched = watch_allows(p, c.own_ticks())
-    if watched < count then count = watched
-    count
+    if limit < 2 then return 0
+    val reach = idle_reach(p, c)
+    if reach < limit then reach else limit
 
 // How many of the running core's ticks it has slept through with its tick stopped, taken at once on
 // waking. Each is also one of its own ticks (`own_ticks`).
