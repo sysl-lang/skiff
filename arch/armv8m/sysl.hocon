@@ -5,6 +5,7 @@
 package {
   name    = "armv8m"
   version = "0.0.1"
+  sysl    = "0.13.5"
 }
 
 dependencies {

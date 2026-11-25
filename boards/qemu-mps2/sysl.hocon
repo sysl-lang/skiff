@@ -5,6 +5,7 @@
 package {
   name    = "qemu-mps2"
   version = "0.0.1"
+  sysl    = "0.13.5"
 }
 
 dependencies {
