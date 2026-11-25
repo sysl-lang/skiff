@@ -5,7 +5,7 @@
 package {
   name    = "pico2"
   version = "0.0.1"
-  sysl    = "0.13.5"
+  sysl    = "0.13.6"
 }
 
 dependencies {
